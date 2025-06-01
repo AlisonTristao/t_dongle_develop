@@ -7,13 +7,19 @@ uint8_t test_function(int d, uint8_t f, String s) {
     return 0;
 }
 
-function_manager fm(1);
+uint8_t real_function() {
+    Serial.println("here");
+    return 0;
+}
+
+function_manager fm(2);
 void* args[3];
 
 void setup() {
     Serial.begin(921600);
 
-    fm.add(0, test_function);
+    fm.add(0, test_function, "teste", "testa a função");
+    fm.add(1, real_function, "real", "função real");
 }
 
 void loop() {
@@ -24,7 +30,7 @@ void loop() {
     args[1] = &b;
     args[2] = &text;
 
-    Serial.println(fm.call(0, args));
-    Serial.println(fm.get_expected_types_string(0));
+    Serial.println(fm.call("teste", args));
+    Serial.println(fm.call("real"));
     delay(1000);
 }
