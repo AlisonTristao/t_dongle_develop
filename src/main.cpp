@@ -2,35 +2,39 @@
 #include <TinyShell.h>
 #include <TableLinker/TableLinker.h>
 
-uint8_t test_function(int d, uint8_t f, String s) {
-    Serial.printf("%d %.2f %s\n", d, f, s.c_str());
+uint8_t test_function_0(int d, uint8_t f, String s) {
+    Serial.printf("teste_1: %d %.2f %s\n", d, f, s.c_str());
     return 0;
 }
 
-uint8_t real_function() {
-    Serial.println("here");
+uint8_t test_function_1(int d, uint8_t f, String s) {
+    Serial.printf("teste_2: %d %.2f %s\n", d, f, s.c_str());
     return 0;
 }
 
-function_manager fm(2);
-void* args[3];
+uint8_t real_function_0() {
+    Serial.println("here_1");
+    return 0;
+}
+
+uint8_t real_function_1() {
+    Serial.println("here_2");
+    return 0;
+}
+
+TableLinker tb(2);
 
 void setup() {
     Serial.begin(921600);
 
-    fm.add(0, test_function, "teste", "testa a função");
-    fm.add(1, real_function, "real", "função real");
+    tb.create_module(0, 2, "funcoes_texte", "funcoes para testar");
+    tb.create_module(1, 2, "funcoes_reais", "funcoes que funcionam");
+
+    tb.add_func_to_module(0, test_function_0, 0, "teste_1", "testa primeiro");
+    tb.add_func_to_module(0, test_function_1, 1, "teste_2", "testa segundo");
 }
 
 void loop() {
-    int a = 1;
-    int b = 2.0;
-    String text = "here";
-    args[0] = &a;
-    args[1] = &b;
-    args[2] = &text;
-
-    Serial.println(fm.call("teste", args));
-    Serial.println(fm.call("real"));
+    Serial.print(tb.get_all_module(0));
     delay(1000);
 }
