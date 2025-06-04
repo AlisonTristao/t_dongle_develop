@@ -1,56 +1,74 @@
 #include <Arduino.h>
 #include <TinyShell.h>
-#include <TableLinker/TableLinker.h>
 
-uint8_t test_function_0(int d, float f, string s) {
-    Serial.printf("teste_1: %d %.2f %s\n", d, f, s.c_str());
+TinyShell ts;
+
+// Example function to be added to the shell
+uint8_t teste_1(int a, int b, uint8_t c) {
+    Serial.print("Teste 1 called with args: ");
+    Serial.print(a);
+    Serial.print(", ");
+    Serial.print(b);
+    Serial.print(", ");
+    Serial.print(c);
+    Serial.println();
     return 0;
 }
 
-uint8_t test_function_1(int d, float f, string s) {
-    Serial.printf("teste_2: %d %.2f %s\n", d, f, s.c_str());
+uint8_t teste_2(int a, int b, uint8_t c) {
+    Serial.print("Teste 2 called with args: ");
+    Serial.print(a);
+    Serial.print(", ");
+    Serial.print(b);
+    Serial.print(", ");
+    Serial.print(c);
+    Serial.println();
     return 0;
 }
-
-uint8_t real_function_0() {
-    Serial.println("here_1");
-    return 0;
-}
-
-uint8_t real_function_1() {
-    Serial.println("here_2");
-    return 0;
-}
-
-TableLinker tb;
-
-int d = 10;
-float f = 2.5;
-string s = "testando";
-void* args[3] = {&d, &f, &s};
 
 void setup() {
     Serial.begin(921600);
     delay(1000);
 
-    tb.create_module("funcoes_texte", "funcoes para testar");
-    tb.create_module("funcoes_reais", "funcoes que funcionam");
-
-    tb.add_func_to_module("funcoes_texte", test_function_0, "teste_1", "testa primeiro");
-    tb.add_func_to_module("funcoes_texte", test_function_1, "teste_2", "testa segundo");
-
-    tb.add_func_to_module("funcoes_reais", real_function_0, "here_1", "funcao que funciona");
-    tb.add_func_to_module("funcoes_reais", real_function_1, "here_2", "funcao que funciona de novo");
-
-    Serial.println(tb.get_all().c_str());
-    Serial.println(tb.get_all_module("funcoes_texte").c_str());
-    Serial.println(tb.get_all_module("funcoes_reais").c_str());
+    ts.create_module("teste", "Funcoes de teste com texto");
+    ts.add(teste_1, "t1", "Teste de funcao com 3 parametros", "teste");
+    ts.add(teste_2, "t2", "Teste de funcao com 3 parametros", "teste");
 }
 
+String commandBuffer = "";
+
 void loop() {
-    //Serial.println(tb.get_all().c_str());
-    //Serial.println(tb.get_all_module("funcoes_texte").c_str());
-    //Serial.println("-> " + String(tb.call("funcoes_reais", "here_1")));
-    //Serial.println("-> " + String(tb.call("funcoes_texte", "teste_1", args)));
-    delay(1000);
+    while (Serial.available()) {
+        char c = Serial.read();
+
+        // Detecção de backspace/delete
+        if (c == 8 || c == 127) {  // backspace/delete
+            if (!commandBuffer.isEmpty()) {
+                commandBuffer.remove(commandBuffer.length() - 1);
+
+                // Apaga no terminal: volta cursor, escreve espaço, volta cursor
+                Serial.print("\b \b");
+            }
+            continue;
+        }
+
+        // Ecoa caractere normalmente
+        Serial.write(c);
+
+        // Fim do comando
+        if (c == '\n') {
+            commandBuffer.trim();  // Remove \r e espaços
+            Serial.println();      // Nova linha visual
+
+            //Serial.println("Received command: " + commandBuffer);
+            string response = ts.run_line_command(commandBuffer.c_str());
+            Serial.println(String(response.c_str()));
+
+            commandBuffer = "";
+        } else {
+            commandBuffer += c;
+        }
+    }
+
+    delay(10);
 }
