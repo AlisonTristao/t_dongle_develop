@@ -21,7 +21,7 @@ uint8_t wrapper_e() {
 }
 
 // Example function to be added to the shell
-uint8_t teste_1(int a, int b, uint8_t c) {
+uint8_t teste_1(int a, char b, uint8_t c) {
     Serial.print("Teste 1 called with args: ");
     Serial.print(a);
     Serial.print(", ");
