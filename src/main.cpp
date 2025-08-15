@@ -1,139 +1,77 @@
-#include <Arduino.h>
-#include <TinyShell.h>
+#include <WiFi.h>
+#include <esp_now.h>
 
-// create your shell instance
-TinyShell ts;
+#define PEER_MAC {0x48, 0x27, 0xE2, 0x14, 0x70, 0xFC} // mac of the other esp
 
-    /*
-    * the sintaxe to send commands to the shell is:
-    * <module> -<command> [args]
-    * 
-    * where:
-    * <module> is the name of the module
-    * -command is the name of the command
-    * [args] are the arguments for the command
-    * 
-    * example:
-    * teste -t1 1, 2, 3
-    * 
-    * module: teste
-    * command: t1
-    * args: 1, 2, 3
+uint8_t peerAddress[] = PEER_MAC;
+String commandBuffer = "";
 
-    * if your function returns uint8_t, it will be printed in the shell
-    * if your function returns other types, you need to wrap your function
-    * 
-    * the return uint8_t (byte) represents the status of the command:
-    * 0 = success
-    * 255 = error
-    * 
-    * you can create types if you want to use them in your functions
-    * the definition of the types is done in the header file TableLinker.h
-    */
-
-// wrapper functions to be used in the shell
-uint8_t wrapper_h() {
-    Serial.println(ts.get_help("").c_str());
-    return RESULT_OK;  // return 0 to indicate success
+// callback for incoming esp-now data
+void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
+    char buffer[250];
+    memcpy(buffer, incomingData, len);
+    buffer[len] = '\0';
+    Serial.println(buffer); // print only the data
 }
 
-uint8_t wrapper_l(string module = "") {
-    Serial.println(ts.get_help(module).c_str());
-    return RESULT_OK;  // return 0 to indicate success
-}
-
-uint8_t wrapper_e() {
-    // explain the command usage
-    Serial.println("Usage: <module> -<command> [args]");
-    Serial.println("Example: teste -t1 1, 2, 3");  
-    return RESULT_OK;  // return 0 to indicate success
-}
-
-// example function to be added to the shell
-uint8_t teste_1(int a, char b, uint8_t c) {
-    Serial.print("Teste 1 called with args: ");
-    Serial.print(a);
-    Serial.print(", ");
-    Serial.print(b);
-    Serial.print(", ");
-    Serial.print(c);
-    Serial.println();
-    return RESULT_OK;  // return 0 to indicate success
-}
-
-uint8_t teste_2(int a, int b, uint8_t c) {
-    Serial.print("Teste 2 called with args: ");
-    Serial.print(a);
-    Serial.print(", ");
-    Serial.print(b);
-    Serial.print(", ");
-    Serial.print(c);
-    Serial.println();
-    return RESULT_ERROR;  // return 255 to indicate an error
+// callback for esp-now send status
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+    // no print, could handle errors if needed
 }
 
 void setup() {
-    Serial.begin(921600);
-    delay(1000);
+    Serial.begin(115200);
+    while (!Serial); // wait for serial to be ready
 
-    // create the modules
-    ts.create_module("teste", "Funcoes de teste com texto");
-    ts.create_module("help", "ajuda e informacoes");
+    // print mac address
+    Serial.print("mac: ");
+    Serial.println(WiFi.macAddress());
 
-    // add the functions to the modules
-    ts.add(teste_1, "t1", "Teste de funcao com 3 parametros", "teste");
-    ts.add(teste_2, "t2", "Teste de funcao com 3 parametros", "teste");
+    // set wifi to station mode
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect(); // avoid trying to connect
 
-    // add the wrapper functions to the help module
-    ts.add(wrapper_h, "h", "Lista os modulos", "help");
-    ts.add(wrapper_l, "l", "Lista as funcoes de um modulo", "help");
-    ts.add(wrapper_e, "e", "Explica o uso do comando", "help");
+    // init esp-now
+    if (esp_now_init() != ESP_OK) return;
+
+    // register callbacks
+    esp_now_register_recv_cb(OnDataRecv);
+    esp_now_register_send_cb(OnDataSent);
+
+    // add peer
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, peerAddress, 6);
+    peerInfo.channel = 0; // same channel for both esp
+    peerInfo.encrypt = false;
+    esp_now_add_peer(&peerInfo);
 }
 
-String commandBuffer = "";
-
 void loop() {
-
-    // the code below reads commands from the serial port
-    // it has nothing to do with the shell itself
-    // you can remove it if you want to use the shell in another way
-    // you just need to send a string formatted as "<module> -<command> [args]\n"
-
+    // read serial input and send via esp-now
     while (Serial.available()) {
         char c = Serial.read();
 
-        // detects if the character is a control character
-        if (c == 8 || c == 127) {  // backspace/delete
+        // echo character to serial
+        Serial.write(c);
+
+        // handle backspace/delete
+        if (c == 8 || c == 127) {
             if (!commandBuffer.isEmpty()) {
                 commandBuffer.remove(commandBuffer.length() - 1);
-
-                // deletes the last character from the serial output
-                Serial.print("\b \b");
             }
             continue;
         }
 
-        // echo the character to the serial output
-        Serial.write(c);
-
-        // end of command detection
         if (c == '\n') {
-            commandBuffer.trim();  // remove leading/trailing whitespace
-            Serial.println();      // new line for better readability
-
-            Serial.println("Received command: " + commandBuffer);
-
-            // run the command in the shell
-            string response = ts.run_line_command(commandBuffer.c_str());
-
-            delay(100);  // give some time for the shell to process the command
-            Serial.println(String(response.c_str()));
-
+            commandBuffer.trim();
+            if (commandBuffer.length() > 0) {
+                esp_now_send(peerAddress, (uint8_t *)commandBuffer.c_str(), commandBuffer.length());
+            }
             commandBuffer = "";
         } else {
             commandBuffer += c;
         }
     }
 
-    delay(10);
+    delay(5); // small delay to prevent blocking
 }
