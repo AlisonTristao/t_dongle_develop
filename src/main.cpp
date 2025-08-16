@@ -1,17 +1,32 @@
 #include <WiFi.h>
 #include <esp_now.h>
 
+// types of logs 
+enum class logType {
+    NONE,
+    INFO,
+    TELEMETRY,
+    ERROR,
+    DEBUG
+};
+
+// message structure
+typedef struct message {
+    uint32_t timer;
+    char msg[231];
+    logType type;
+} message; 
+
 #define PEER_MAC {0x48, 0x27, 0xE2, 0x14, 0x70, 0xFC} // mac of the other esp
 
+message myData;
 uint8_t peerAddress[] = PEER_MAC;
 String commandBuffer = "";
 
 // callback for incoming esp-now data
 void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
-    char buffer[250];
-    memcpy(buffer, incomingData, len);
-    buffer[len] = '\0';
-    Serial.println(buffer); // print only the data
+    memcpy(&myData, incomingData, sizeof(myData));
+    Serial.printf("[%u] %s\n", myData.timer, myData.msg);
 }
 
 // callback for esp-now send status
@@ -20,7 +35,7 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 }
 
 void setup() {
-    Serial.begin(115200);
+    Serial.begin(921600);
     while (!Serial); // wait for serial to be ready
 
     // print mac address
