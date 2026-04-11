@@ -1,5 +1,6 @@
 #include "ShellSerial.h"
 
+// Build the shell parser and history state with bounded storage.
 ShellSerial::ShellSerial(size_t logCapacity)
 	: serial_(nullptr),
 	  renderedLength_(0),
@@ -17,6 +18,7 @@ ShellSerial::ShellSerial(size_t logCapacity)
 	}
 }
 
+// Attach the stream and reset runtime state.
 void ShellSerial::begin(Stream& serialPort) {
 	serial_ = &serialPort;
 
@@ -28,6 +30,7 @@ void ShellSerial::begin(Stream& serialPort) {
 	historyCursor_ = -1;
 }
 
+// Consume all available bytes until a full line is ready.
 bool ShellSerial::readInputLine(String& outLine) {
 	outLine = "";
 
@@ -47,6 +50,7 @@ bool ShellSerial::readInputLine(String& outLine) {
 	return lineReady;
 }
 
+// Apply local backspace behavior and redraw terminal line.
 void ShellSerial::eraseLastChar() {
 	if (inputBuffer_.length() == 0) {
 		return;
@@ -57,6 +61,7 @@ void ShellSerial::eraseLastChar() {
 	redrawInput();
 }
 
+// Reset editable text and leave history untouched.
 void ShellSerial::clearInput() {
 	inputBuffer_ = "";
 	draftBeforeHistory_ = "";
@@ -64,20 +69,24 @@ void ShellSerial::clearInput() {
 	redrawInput();
 }
 
+// Public helper to append text to history buffer.
 void ShellSerial::addLog(const String& message) {
 	pushLog(message);
 }
 
+// Remove all command history entries.
 void ShellSerial::clearLogs() {
 	count_ = 0;
 	firstIndex_ = 0;
 	historyCursor_ = -1;
 }
 
+// Return current number of stored entries.
 size_t ShellSerial::logCount() const {
 	return count_;
 }
 
+// Read one entry from logical history position.
 bool ShellSerial::logAt(size_t index, String& outMessage) const {
 	if (index >= count_) {
 		outMessage = "";
@@ -88,12 +97,14 @@ bool ShellSerial::logAt(size_t index, String& outMessage) const {
 	return true;
 }
 
+// Set prompt and immediately update visual line.
 void ShellSerial::setPrompt(const String& text) {
 	prompt_ = text;
 	redrawInput();
 }
 
 void ShellSerial::processChar(char c, bool& lineReady, String& outLine) {
+	// Parse ANSI escape sequences, especially arrow keys.
 	if (escState_ != EscState::None) {
 		if (escState_ == EscState::Esc) {
 			escState_ = (c == '[') ? EscState::Bracket : EscState::None;
@@ -111,11 +122,13 @@ void ShellSerial::processChar(char c, bool& lineReady, String& outLine) {
 		}
 	}
 
+	// Escape sequence introducer.
 	if (c == 27) {
 		escState_ = EscState::Esc;
 		return;
 	}
 
+	// Finish command line on CR/LF and push non-empty command to history.
 	if (c == '\r' || c == '\n') {
 		if (c == '\n' && ignoreNextLf_) {
 			ignoreNextLf_ = false;
@@ -145,11 +158,13 @@ void ShellSerial::processChar(char c, bool& lineReady, String& outLine) {
 
 	ignoreNextLf_ = false;
 
+	// Handle both backspace variants from terminals.
 	if (c == 8 || c == 127) {
 		eraseLastChar();
 		return;
 	}
 
+	// Append printable characters.
 	if (static_cast<uint8_t>(c) >= 32) {
 		if (historyCursor_ >= 0) {
 			historyCursor_ = -1;
@@ -161,6 +176,7 @@ void ShellSerial::processChar(char c, bool& lineReady, String& outLine) {
 	}
 }
 
+// Repaint current terminal line and clear leftover chars from previous frame.
 void ShellSerial::redrawInput() {
 	if (serial_ == nullptr) {
 		return;
@@ -183,6 +199,7 @@ void ShellSerial::redrawInput() {
 	renderedLength_ = visibleLine.length();
 }
 
+// Move to older command in history.
 void ShellSerial::onArrowUp() {
 	if (count_ == 0) {
 		return;
@@ -199,6 +216,7 @@ void ShellSerial::onArrowUp() {
 	redrawInput();
 }
 
+// Move to newer command in history or restore unsent draft.
 void ShellSerial::onArrowDown() {
 	if (count_ == 0 || historyCursor_ < 0) {
 		return;
@@ -215,6 +233,7 @@ void ShellSerial::onArrowDown() {
 	redrawInput();
 }
 
+// Store normalized text in circular buffer and overwrite oldest on overflow.
 void ShellSerial::pushLog(const String& message) {
 	String normalized = message;
 	normalized.trim();
@@ -233,6 +252,7 @@ void ShellSerial::pushLog(const String& message) {
 	firstIndex_ = (firstIndex_ + 1) % capacity_;
 }
 
+// Convert logical offset (oldest..newest) to circular index.
 String ShellSerial::getLogByOffset(size_t offset) const {
 	if (offset >= count_) {
 		return "";
