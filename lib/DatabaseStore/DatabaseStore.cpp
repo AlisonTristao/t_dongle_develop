@@ -161,6 +161,10 @@ bool DatabaseStore::begin(EspNowManager& espNow, Stream* io) {
 
     ready_ = true;
 
+    if (!ensureDefaultBroadcastPeer()) {
+        logLine("[database] aviso: nao foi possivel garantir peer default 000");
+    }
+
     if (!loadPeersFromDatabase(espNow)) {
         logLine("[database] banco aberto, mas falhou carga inicial de peers");
     }
@@ -367,6 +371,63 @@ bool DatabaseStore::logBootEvent(const char* reason) {
     sql += ");";
 
     return executeNoResult(sql);
+}
+
+bool DatabaseStore::getDefaultBroadcastMac(uint8_t outMac[6]) {
+    if (!ready_ || db_ == nullptr || outMac == nullptr) {
+        return false;
+    }
+
+    struct MacQueryContext {
+        uint8_t* out;
+        bool found;
+    };
+
+    MacQueryContext context = {outMac, false};
+
+    auto callback = [](void* rawContext, int argc, char** argv, char**) -> int {
+        if (rawContext == nullptr || argc <= 0 || argv == nullptr || argv[0] == nullptr) {
+            return 0;
+        }
+
+        auto* context = static_cast<MacQueryContext*>(rawContext);
+        unsigned int macBytes[6] = {0, 0, 0, 0, 0, 0};
+        if (std::sscanf(
+                argv[0],
+                "%02x:%02x:%02x:%02x:%02x:%02x",
+                &macBytes[0], &macBytes[1], &macBytes[2],
+                &macBytes[3], &macBytes[4], &macBytes[5]
+            ) != 6) {
+            return 0;
+        }
+
+        for (size_t i = 0; i < 6; ++i) {
+            context->out[i] = static_cast<uint8_t>(macBytes[i]);
+        }
+
+        context->found = true;
+        return 1;
+    };
+
+    char* errorMessage = nullptr;
+    const int rc = sqlite3_exec(
+        db_,
+        "SELECT mac FROM peers "
+        "WHERE name='000' OR mac='FF:FF:FF:FF:FF:FF' "
+        "ORDER BY CASE WHEN name='000' THEN 0 ELSE 1 END, id ASC LIMIT 1;",
+        callback,
+        &context,
+        &errorMessage
+    );
+
+    if (rc != SQLITE_OK && rc != SQLITE_ABORT) {
+        if (errorMessage != nullptr) {
+            sqlite3_free(errorMessage);
+        }
+        return false;
+    }
+
+    return context.found;
 }
 
 bool DatabaseStore::syncPeersFromManager(const EspNowManager& espNow) {
@@ -612,6 +673,36 @@ bool DatabaseStore::applyRuntimeMigrations() {
     );
 }
 
+bool DatabaseStore::ensureDefaultBroadcastPeer() {
+    if (!ready_) {
+        return false;
+    }
+
+    const int64_t now = currentEpochSeconds();
+
+    String insertSql;
+    insertSql.reserve(280);
+    insertSql += "INSERT OR IGNORE INTO peers(mac,name,description,created_at,updated_at) VALUES('";
+    insertSql += "FF:FF:FF:FF:FF:FF";
+    insertSql += "','000','peer virtual padrao para broadcast',";
+    insertSql += String(static_cast<long long>(now));
+    insertSql += ",";
+    insertSql += String(static_cast<long long>(now));
+    insertSql += ");";
+
+    if (!executeNoResult(insertSql)) {
+        return false;
+    }
+
+    String updateSql;
+    updateSql.reserve(240);
+    updateSql += "UPDATE peers SET name='000', description='peer virtual padrao para broadcast', updated_at=";
+    updateSql += String(static_cast<long long>(now));
+    updateSql += " WHERE mac='FF:FF:FF:FF:FF:FF';";
+
+    return executeNoResult(updateSql);
+}
+
 bool DatabaseStore::peerIdByMac(const uint8_t mac[6], int32_t& outPeerId) {
     if (!ready_ || mac == nullptr) {
         return false;
@@ -667,9 +758,13 @@ bool DatabaseStore::loadPeersFromDatabase(EspNowManager& espNow) {
     struct PeerLoadContext {
         EspNowManager* manager;
         size_t loaded;
+        size_t alreadyPresent;
+        size_t skippedBroadcast;
+        size_t failed;
+        size_t processed;
     };
 
-    PeerLoadContext context = {&espNow, 0};
+    PeerLoadContext context = {&espNow, 0, 0, 0, 0, 0};
 
     auto callback = [](void* rawContext, int argc, char** argv, char**) -> int {
         if (rawContext == nullptr || argc < 1 || argv == nullptr || argv[0] == nullptr) {
@@ -677,6 +772,7 @@ bool DatabaseStore::loadPeersFromDatabase(EspNowManager& espNow) {
         }
 
         auto* context = static_cast<PeerLoadContext*>(rawContext);
+        ++context->processed;
 
         unsigned int macBytes[6] = {0, 0, 0, 0, 0, 0};
         if (std::sscanf(
@@ -693,11 +789,27 @@ bool DatabaseStore::loadPeersFromDatabase(EspNowManager& espNow) {
             mac[i] = static_cast<uint8_t>(macBytes[i]);
         }
 
+        const bool isBroadcast =
+            mac[0] == 0xFF && mac[1] == 0xFF && mac[2] == 0xFF &&
+            mac[3] == 0xFF && mac[4] == 0xFF && mac[5] == 0xFF;
+        if (isBroadcast) {
+            // Keep broadcast peer virtual (000 alias) instead of materializing as real indexed peer.
+            ++context->skippedBroadcast;
+            return 0;
+        }
+
         const char* name = (argc > 1 && argv[1] != nullptr) ? argv[1] : "peer";
         const char* description = (argc > 2 && argv[2] != nullptr) ? argv[2] : "";
 
+        if (context->manager->deviceIndexByMac(mac) >= 0) {
+            ++context->alreadyPresent;
+            return 0;
+        }
+
         if (context->manager->addDevice(mac, name, description)) {
             ++context->loaded;
+        } else {
+            ++context->failed;
         }
 
         return 0;
@@ -720,8 +832,17 @@ bool DatabaseStore::loadPeersFromDatabase(EspNowManager& espNow) {
         return false;
     }
 
-    char line[96] = {0};
-    std::snprintf(line, sizeof(line), "[database] peers carregados: %u", static_cast<unsigned>(context.loaded));
+    char line[192] = {0};
+    std::snprintf(
+        line,
+        sizeof(line),
+        "[database] peers lidos=%u adicionados=%u ja_em_memoria=%u ignorado_000=%u falhas=%u",
+        static_cast<unsigned>(context.processed),
+        static_cast<unsigned>(context.loaded),
+        static_cast<unsigned>(context.alreadyPresent),
+        static_cast<unsigned>(context.skippedBroadcast),
+        static_cast<unsigned>(context.failed)
+    );
     logLine(line);
     return true;
 }

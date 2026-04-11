@@ -6,7 +6,11 @@
 namespace StartupConfig {
 
 /**
- * @brief Waits for serial monitor attach while animating RGB LED.
+ * @brief Waits for serial monitor attach while updating startup visuals.
+ *
+ * Visual behavior:
+ * - RGB LED carousel while disconnected.
+ * - LCD status text for disconnected/connected states.
  */
 void waitForSerialAndAnimateLed(DonglePeripherals& peripherals);
 

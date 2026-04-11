@@ -77,6 +77,11 @@ public:
     bool logBootEvent(const char* reason = "power_on");
 
     /**
+     * @brief Returns default broadcast MAC configured in DB.
+     */
+    bool getDefaultBroadcastMac(uint8_t outMac[6]);
+
+    /**
      * @brief Persists all peers currently registered in EspNowManager.
      */
     bool syncPeersFromManager(const EspNowManager& espNow);
@@ -122,6 +127,7 @@ private:
     bool ensureBootstrapAssets();
     bool applyBootstrapScript();
     bool applyRuntimeMigrations();
+    bool ensureDefaultBroadcastPeer();
     bool loadPeersFromDatabase(EspNowManager& espNow);
     bool ensurePeerExistsWithDefaults(const uint8_t mac[6], int32_t& outPeerId);
     bool peerIdByMac(const uint8_t mac[6], int32_t& outPeerId);
