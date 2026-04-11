@@ -219,7 +219,7 @@ string normalizeCommand(const string& command) {
     if (input.rfind(prefix, 0) == 0) {
         const string args = trimCopy(input.substr(prefix.length()));
         if (!args.empty() && args.find(',') == string::npos) {
-            return "espnow -send_all " + args;
+            return "espnow -send_to 000, " + args;
         }
     }
 
@@ -234,6 +234,20 @@ uint8_t clampByte(int32_t value) {
         return 255;
     }
     return static_cast<uint8_t>(value);
+}
+
+void resolveDefaultBroadcastMac(uint8_t outMac[6]) {
+    if (outMac == nullptr) {
+        return;
+    }
+
+    memcpy(outMac, kFallbackBroadcastMac, 6);
+    if (g_ctx.database != nullptr && g_ctx.database->isReady()) {
+        uint8_t dbMac[6] = {0};
+        if (g_ctx.database->getDefaultBroadcastMac(dbMac)) {
+            memcpy(outMac, dbMac, 6);
+        }
+    }
 }
 
 uint8_t wrapper_espnow_send_all(string command);
@@ -753,35 +767,22 @@ uint8_t wrapper_espnow_send_to(int32_t deviceNumber, string command) {
 
     if (deviceNumber == 0) {
         // Peer virtual 000: route to default broadcast MAC (stored in DB, with FF fallback).
-        uint8_t broadcastMac[6] = {
-            kFallbackBroadcastMac[0],
-            kFallbackBroadcastMac[1],
-            kFallbackBroadcastMac[2],
-            kFallbackBroadcastMac[3],
-            kFallbackBroadcastMac[4],
-            kFallbackBroadcastMac[5]
-        };
-        if (g_ctx.database != nullptr && g_ctx.database->isReady()) {
-            uint8_t dbMac[6] = {0};
-            if (g_ctx.database->getDefaultBroadcastMac(dbMac)) {
-                memcpy(broadcastMac, dbMac, sizeof(broadcastMac));
-            }
-        }
+        uint8_t broadcastMac[6] = {0, 0, 0, 0, 0, 0};
+        resolveDefaultBroadcastMac(broadcastMac);
 
-        bool delivered = false;
-        const bool gotStatus = g_ctx.espNow->sendToMacWithStatus(broadcastMac, outgoing, delivered, 700);
+        const bool queued = g_ctx.espNow->sendToMac(broadcastMac, outgoing);
 
         if (g_ctx.database != nullptr && g_ctx.database->isReady()) {
-            g_ctx.database->logOutgoingEspNow(broadcastMac, outgoing, gotStatus && delivered);
+            g_ctx.database->logOutgoingEspNow(broadcastMac, outgoing, queued);
         }
 
-        if (!gotStatus) {
-            printLine("[espnow] 000 status=false (sem callback/timeout)");
+        if (!queued) {
+            printLine("[espnow] 000 status=false");
             return RESULT_ERROR;
         }
 
-        printLine(delivered ? "[espnow] 000 status=true" : "[espnow] 000 status=false");
-        return delivered ? RESULT_OK : RESULT_ERROR;
+        printLine("[espnow] 000 status=true");
+        return RESULT_OK;
     }
 
     const size_t index = static_cast<size_t>(deviceNumber - 1);
@@ -821,8 +822,21 @@ uint8_t wrapper_espnow_send_all(string command) {
     const bool attempted = g_ctx.espNow->sendToAllWithStatus(outgoing, deliveredCount, triedCount, 700);
 
     if (!attempted || triedCount == 0) {
-        printLine("[espnow] status=false (nenhum peer/timeout)");
-        return RESULT_ERROR;
+        uint8_t broadcastMac[6] = {0, 0, 0, 0, 0, 0};
+        resolveDefaultBroadcastMac(broadcastMac);
+
+        const bool queued = g_ctx.espNow->sendToMac(broadcastMac, outgoing);
+        if (g_ctx.database != nullptr && g_ctx.database->isReady()) {
+            g_ctx.database->logOutgoingEspNow(broadcastMac, outgoing, queued);
+        }
+
+        if (!queued) {
+            printLine("[espnow] status=false (nenhum peer e broadcast falhou)");
+            return RESULT_ERROR;
+        }
+
+        printLine("[espnow] status=true (broadcast 000)");
+        return RESULT_OK;
     }
 
     char line[120] = {0};

@@ -123,6 +123,66 @@ int queryIntCallback(void* rawContext, int argc, char** argv, char**) {
     return 0;
 }
 
+String safeColumnText(sqlite3_stmt* stmt, int columnIndex) {
+    if (stmt == nullptr) {
+        return "";
+    }
+
+    const unsigned char* value = sqlite3_column_text(stmt, columnIndex);
+    if (value == nullptr) {
+        return "";
+    }
+
+    return String(reinterpret_cast<const char*>(value));
+}
+
+String epochToDateTimeText(int64_t epoch) {
+    if (epoch <= 0) {
+        return "(sem-data)";
+    }
+
+    const time_t raw = static_cast<time_t>(epoch);
+    std::tm localTime = {};
+    if (localtime_r(&raw, &localTime) == nullptr) {
+        return "(sem-data)";
+    }
+
+    char out[24] = {0};
+    std::strftime(out, sizeof(out), "%Y-%m-%d %H:%M:%S", &localTime);
+    return String(out);
+}
+
+String sanitizeAndTruncateField(const String& input, size_t maxLen) {
+    String out;
+    out.reserve((maxLen > 0 ? maxLen : 1) + 8);
+
+    const size_t inputLen = input.length();
+    for (size_t i = 0; i < inputLen; ++i) {
+        char ch = input[i];
+        if (ch == '\r' || ch == '\n' || ch == '\t') {
+            ch = ' ';
+        } else if (ch == '|') {
+            ch = '/';
+        }
+
+        out += ch;
+
+        if (maxLen > 0 && out.length() >= maxLen) {
+            if (i + 1 < inputLen) {
+                out += "...";
+            }
+            break;
+        }
+    }
+
+    out.trim();
+    if (out.isEmpty()) {
+        return "(vazio)";
+    }
+
+    return out;
+}
+
 } // namespace
 
 DatabaseStore::DatabaseStore()
@@ -540,19 +600,60 @@ bool DatabaseStore::readCommandLogsWithOutput(size_t limit, String& outText) {
     }
 
     String sql;
-    sql.reserve(640);
-    sql += "SELECT c.id, ";
-    sql += "datetime(c.created_at, 'unixepoch', 'localtime') AS data_hora, ";
-    sql += "c.source, ";
-    sql += "c.command, ";
-    sql += "replace(replace(COALESCE(o.output,''), char(13), ' '), char(10), ' ') AS output ";
+    sql.reserve(220);
+    sql += "SELECT c.id, c.created_at, c.source, c.command, o.output ";
     sql += "FROM command_log c ";
     sql += "LEFT JOIN command_log_output o ON o.log_id = c.id ";
     sql += "ORDER BY c.id DESC LIMIT ";
     sql += static_cast<unsigned long>(limit);
     sql += ";";
 
-    return queryToText(sql, limit, outText);
+    sqlite3_stmt* stmt = nullptr;
+    const int prepareRc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr);
+    if (prepareRc != SQLITE_OK || stmt == nullptr) {
+        outText = String("[database] SQL error: ") + sqlite3_errmsg(db_);
+        return false;
+    }
+
+    outText = "";
+    size_t rowCount = 0;
+    int stepRc = SQLITE_ROW;
+    while ((stepRc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        ++rowCount;
+
+        const int32_t id = static_cast<int32_t>(sqlite3_column_int(stmt, 0));
+        const int64_t createdAt = static_cast<int64_t>(sqlite3_column_int64(stmt, 1));
+        const String source = sanitizeAndTruncateField(safeColumnText(stmt, 2), 24);
+        const String command = sanitizeAndTruncateField(safeColumnText(stmt, 3), 72);
+        const String output = sanitizeAndTruncateField(safeColumnText(stmt, 4), 96);
+
+        outText += "[";
+        outText += static_cast<unsigned long>(rowCount);
+        outText += "] id=";
+        outText += static_cast<long>(id);
+        outText += " | data_hora=";
+        outText += epochToDateTimeText(createdAt);
+        outText += " | source=";
+        outText += source;
+        outText += " | command=";
+        outText += command;
+        outText += " | output=";
+        outText += output;
+        outText += "\n";
+    }
+
+    sqlite3_finalize(stmt);
+
+    if (stepRc != SQLITE_DONE) {
+        outText = String("[database] SQL error: ") + sqlite3_errmsg(db_);
+        return false;
+    }
+
+    if (rowCount == 0) {
+        outText = "[database] consulta sem linhas (ou comando executado com sucesso)";
+    }
+
+    return true;
 }
 
 bool DatabaseStore::readEspNowHistory(size_t limit, String& outText) {
@@ -568,33 +669,118 @@ bool DatabaseStore::readEspNowHistory(size_t limit, String& outText) {
         limit = 200;
     }
 
-    String sql;
-    sql.reserve(1200);
-    sql += "SELECT dir, data_hora, peer, mac, mensagem, status FROM (";
-    sql += "SELECT 'tx' AS dir, ";
-    sql += "datetime(o.sent_at, 'unixepoch', 'localtime') AS data_hora, ";
-    sql += "COALESCE(p.name, '(sem-peer)') AS peer, ";
-    sql += "o.mac AS mac, ";
-    sql += "replace(replace(o.payload, char(13), ' '), char(10), ' ') AS mensagem, ";
-    sql += "CASE WHEN o.delivered = 1 THEN 'sucesso' ELSE 'falha' END AS status, ";
-    sql += "o.sent_at AS sort_ts ";
-    sql += "FROM espnow_outgoing_log o ";
-    sql += "LEFT JOIN peers p ON p.id = o.peer_id ";
-    sql += "UNION ALL ";
-    sql += "SELECT 'rx' AS dir, ";
-    sql += "datetime(i.received_at, 'unixepoch', 'localtime') AS data_hora, ";
-    sql += "COALESCE(p.name, '(sem-peer)') AS peer, ";
-    sql += "COALESCE(p.mac, '(sem-mac)') AS mac, ";
-    sql += "replace(replace(i.payload, char(13), ' '), char(10), ' ') AS mensagem, ";
-    sql += "'recebido' AS status, ";
-    sql += "i.received_at AS sort_ts ";
-    sql += "FROM espnow_incoming_log i ";
-    sql += "LEFT JOIN peers p ON p.id = i.peer_id";
-    sql += ") hist ORDER BY sort_ts DESC LIMIT ";
-    sql += static_cast<unsigned long>(limit);
-    sql += ";";
+    String txSql;
+    txSql.reserve(240);
+    txSql += "SELECT o.id, o.sent_at, p.name, o.mac, o.payload, o.delivered ";
+    txSql += "FROM espnow_outgoing_log o ";
+    txSql += "LEFT JOIN peers p ON p.id = o.peer_id ";
+    txSql += "ORDER BY o.sent_at DESC LIMIT ";
+    txSql += static_cast<unsigned long>(limit);
+    txSql += ";";
 
-    return queryToText(sql, limit, outText);
+    String rxSql;
+    rxSql.reserve(240);
+    rxSql += "SELECT i.id, i.received_at, p.name, p.mac, i.payload ";
+    rxSql += "FROM espnow_incoming_log i ";
+    rxSql += "LEFT JOIN peers p ON p.id = i.peer_id ";
+    rxSql += "ORDER BY i.received_at DESC LIMIT ";
+    rxSql += static_cast<unsigned long>(limit);
+    rxSql += ";";
+
+    sqlite3_stmt* txStmt = nullptr;
+    int prepareRc = sqlite3_prepare_v2(db_, txSql.c_str(), -1, &txStmt, nullptr);
+    if (prepareRc != SQLITE_OK || txStmt == nullptr) {
+        outText = String("[database] SQL error: ") + sqlite3_errmsg(db_);
+        return false;
+    }
+
+    outText = "[database] ESP-NOW TX\n";
+    size_t txRows = 0;
+    int txStepRc = SQLITE_ROW;
+    while ((txStepRc = sqlite3_step(txStmt)) == SQLITE_ROW) {
+        ++txRows;
+
+        const int32_t id = static_cast<int32_t>(sqlite3_column_int(txStmt, 0));
+        const int64_t sentAt = static_cast<int64_t>(sqlite3_column_int64(txStmt, 1));
+        const String peer = sanitizeAndTruncateField(safeColumnText(txStmt, 2), 24);
+        const String mac = sanitizeAndTruncateField(safeColumnText(txStmt, 3), 17);
+        const String message = sanitizeAndTruncateField(safeColumnText(txStmt, 4), 96);
+        const bool delivered = sqlite3_column_int(txStmt, 5) == 1;
+
+        outText += "[";
+        outText += static_cast<unsigned long>(txRows);
+        outText += "] id=";
+        outText += static_cast<long>(id);
+        outText += " | data_hora=";
+        outText += epochToDateTimeText(sentAt);
+        outText += " | peer=";
+        outText += peer;
+        outText += " | mac=";
+        outText += mac;
+        outText += " | mensagem=";
+        outText += message;
+        outText += " | status=";
+        outText += delivered ? "sucesso" : "falha";
+        outText += "\n";
+    }
+
+    sqlite3_finalize(txStmt);
+
+    if (txStepRc != SQLITE_DONE) {
+        outText = String("[database] SQL error: ") + sqlite3_errmsg(db_);
+        return false;
+    }
+
+    if (txRows == 0) {
+        outText += "(sem linhas)\n";
+    }
+
+    sqlite3_stmt* rxStmt = nullptr;
+    prepareRc = sqlite3_prepare_v2(db_, rxSql.c_str(), -1, &rxStmt, nullptr);
+    if (prepareRc != SQLITE_OK || rxStmt == nullptr) {
+        outText = String("[database] SQL error: ") + sqlite3_errmsg(db_);
+        return false;
+    }
+
+    outText += "\n[database] ESP-NOW RX\n";
+    size_t rxRows = 0;
+    int rxStepRc = SQLITE_ROW;
+    while ((rxStepRc = sqlite3_step(rxStmt)) == SQLITE_ROW) {
+        ++rxRows;
+
+        const int32_t id = static_cast<int32_t>(sqlite3_column_int(rxStmt, 0));
+        const int64_t receivedAt = static_cast<int64_t>(sqlite3_column_int64(rxStmt, 1));
+        const String peer = sanitizeAndTruncateField(safeColumnText(rxStmt, 2), 24);
+        const String mac = sanitizeAndTruncateField(safeColumnText(rxStmt, 3), 17);
+        const String message = sanitizeAndTruncateField(safeColumnText(rxStmt, 4), 96);
+
+        outText += "[";
+        outText += static_cast<unsigned long>(rxRows);
+        outText += "] id=";
+        outText += static_cast<long>(id);
+        outText += " | data_hora=";
+        outText += epochToDateTimeText(receivedAt);
+        outText += " | peer=";
+        outText += peer;
+        outText += " | mac=";
+        outText += mac;
+        outText += " | mensagem=";
+        outText += message;
+        outText += " | status=recebido\n";
+    }
+
+    sqlite3_finalize(rxStmt);
+
+    if (rxStepRc != SQLITE_DONE) {
+        outText = String("[database] SQL error: ") + sqlite3_errmsg(db_);
+        return false;
+    }
+
+    if (rxRows == 0) {
+        outText += "(sem linhas)\n";
+    }
+
+    return true;
 }
 
 bool DatabaseStore::dropTable(const String& tableName) {
