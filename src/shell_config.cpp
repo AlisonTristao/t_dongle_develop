@@ -270,6 +270,8 @@ uint8_t wrapper_help_e() {
     printLine("Alias 000 no send_to = envia para todos os peers");
     printLine("Editar peer: espnow -update 1, \"nome novo\", \"descricao nova\"");
     printLine("Banco sqlite no SD: database -status | database -tables | database -read peers, 20");
+    printLine("Logs comando+saida: database -logs 20");
+    printLine("Historico ESP-NOW RX/TX: database -espnow_history 30");
     return RESULT_OK;
 }
 
@@ -902,6 +904,30 @@ uint8_t wrapper_database_drop(string tableName) {
     return RESULT_OK;
 }
 
+uint8_t wrapper_database_logs(int32_t limit = 20) {
+    if (g_ctx.database == nullptr) {
+        return RESULT_ERROR;
+    }
+
+    const size_t boundedLimit = (limit > 0) ? static_cast<size_t>(limit) : 20U;
+    String output;
+    const bool ok = g_ctx.database->readCommandLogsWithOutput(boundedLimit, output);
+    printLine(output.c_str());
+    return ok ? RESULT_OK : RESULT_ERROR;
+}
+
+uint8_t wrapper_database_espnow_history(int32_t limit = 30) {
+    if (g_ctx.database == nullptr) {
+        return RESULT_ERROR;
+    }
+
+    const size_t boundedLimit = (limit > 0) ? static_cast<size_t>(limit) : 30U;
+    String output;
+    const bool ok = g_ctx.database->readEspNowHistory(boundedLimit, output);
+    printLine(output.c_str());
+    return ok ? RESULT_OK : RESULT_ERROR;
+}
+
 uint8_t wrapper_database_rebuild() {
     if (g_ctx.database == nullptr || g_ctx.espNow == nullptr) {
         return RESULT_ERROR;
@@ -991,6 +1017,8 @@ uint8_t registerDefaultModules() {
     g_ctx.shell->add(wrapper_database_status, "status", "status geral do sqlite", "database");
     g_ctx.shell->add(wrapper_database_tables, "tables", "lista tabelas no banco", "database");
     g_ctx.shell->add(wrapper_database_read, "read", "le tabela: <nome>, <limite>", "database");
+    g_ctx.shell->add(wrapper_database_logs, "logs", "historico de comandos com saidas: <limite>", "database");
+    g_ctx.shell->add(wrapper_database_espnow_history, "espnow_history", "historico ESP-NOW RX/TX com status: <limite>", "database");
     g_ctx.shell->add(wrapper_database_drop, "drop", "remove tabela: <nome>", "database");
     g_ctx.shell->add(wrapper_database_rebuild, "rebuild", "recria banco a partir do bootstrap", "database");
     g_ctx.shell->add(wrapper_database_exec, "exec", "executa SQL livre: <sql>", "database");

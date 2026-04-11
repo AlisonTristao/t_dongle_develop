@@ -102,6 +102,20 @@ public:
     bool readTable(const String& tableName, size_t limit, String& outText);
 
     /**
+     * @brief Reads shell command logs joined with their textual outputs.
+     *
+     * Output fields include formatted date/time for readability.
+     */
+    bool readCommandLogsWithOutput(size_t limit, String& outText);
+
+    /**
+     * @brief Reads unified ESP-NOW history (RX and TX) with delivery status.
+     *
+     * Output fields include formatted date/time and TX success/failure.
+     */
+    bool readEspNowHistory(size_t limit, String& outText);
+
+    /**
      * @brief Drops one table when identifier is valid.
      */
     bool dropTable(const String& tableName);

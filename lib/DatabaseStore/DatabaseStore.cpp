@@ -526,6 +526,77 @@ bool DatabaseStore::readTable(const String& tableName, size_t limit, String& out
     return queryToText(sql, limit, outText);
 }
 
+bool DatabaseStore::readCommandLogsWithOutput(size_t limit, String& outText) {
+    if (!ready_) {
+        outText = "[database] nao inicializado";
+        return false;
+    }
+
+    if (limit == 0) {
+        limit = 20;
+    }
+    if (limit > 200) {
+        limit = 200;
+    }
+
+    String sql;
+    sql.reserve(640);
+    sql += "SELECT c.id, ";
+    sql += "datetime(c.created_at, 'unixepoch', 'localtime') AS data_hora, ";
+    sql += "c.source, ";
+    sql += "c.command, ";
+    sql += "replace(replace(COALESCE(o.output,''), char(13), ' '), char(10), ' ') AS output ";
+    sql += "FROM command_log c ";
+    sql += "LEFT JOIN command_log_output o ON o.log_id = c.id ";
+    sql += "ORDER BY c.id DESC LIMIT ";
+    sql += static_cast<unsigned long>(limit);
+    sql += ";";
+
+    return queryToText(sql, limit, outText);
+}
+
+bool DatabaseStore::readEspNowHistory(size_t limit, String& outText) {
+    if (!ready_) {
+        outText = "[database] nao inicializado";
+        return false;
+    }
+
+    if (limit == 0) {
+        limit = 20;
+    }
+    if (limit > 200) {
+        limit = 200;
+    }
+
+    String sql;
+    sql.reserve(1200);
+    sql += "SELECT dir, data_hora, peer, mac, mensagem, status FROM (";
+    sql += "SELECT 'tx' AS dir, ";
+    sql += "datetime(o.sent_at, 'unixepoch', 'localtime') AS data_hora, ";
+    sql += "COALESCE(p.name, '(sem-peer)') AS peer, ";
+    sql += "o.mac AS mac, ";
+    sql += "replace(replace(o.payload, char(13), ' '), char(10), ' ') AS mensagem, ";
+    sql += "CASE WHEN o.delivered = 1 THEN 'sucesso' ELSE 'falha' END AS status, ";
+    sql += "o.sent_at AS sort_ts ";
+    sql += "FROM espnow_outgoing_log o ";
+    sql += "LEFT JOIN peers p ON p.id = o.peer_id ";
+    sql += "UNION ALL ";
+    sql += "SELECT 'rx' AS dir, ";
+    sql += "datetime(i.received_at, 'unixepoch', 'localtime') AS data_hora, ";
+    sql += "COALESCE(p.name, '(sem-peer)') AS peer, ";
+    sql += "COALESCE(p.mac, '(sem-mac)') AS mac, ";
+    sql += "replace(replace(i.payload, char(13), ' '), char(10), ' ') AS mensagem, ";
+    sql += "'recebido' AS status, ";
+    sql += "i.received_at AS sort_ts ";
+    sql += "FROM espnow_incoming_log i ";
+    sql += "LEFT JOIN peers p ON p.id = i.peer_id";
+    sql += ") hist ORDER BY sort_ts DESC LIMIT ";
+    sql += static_cast<unsigned long>(limit);
+    sql += ";";
+
+    return queryToText(sql, limit, outText);
+}
+
 bool DatabaseStore::dropTable(const String& tableName) {
     if (!ready_) {
         return false;
