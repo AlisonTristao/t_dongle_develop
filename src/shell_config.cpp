@@ -43,6 +43,42 @@ string stripOuterQuotes(const string& text) {
     return s;
 }
 
+string stripModulePrefix(const string& text) {
+    string s = trimCopy(text);
+    if (s.length() < 4 || s.front() != '[') {
+        return s;
+    }
+
+    const size_t close = s.find(']');
+    if (close == string::npos || close <= 1) {
+        return s;
+    }
+
+    bool hasAlpha = false;
+    for (size_t i = 1; i < close; ++i) {
+        const unsigned char ch = static_cast<unsigned char>(s[i]);
+        if (std::isalpha(ch) != 0) {
+            hasAlpha = true;
+        }
+
+        if (!(std::isalnum(ch) != 0 || ch == '_' || ch == '-')) {
+            return s;
+        }
+    }
+
+    // Preserve non-module prefixes like numeric peer labels: [000], [001], ...
+    if (!hasAlpha) {
+        return s;
+    }
+
+    size_t start = close + 1;
+    while (start < s.length() && std::isspace(static_cast<unsigned char>(s[start])) != 0) {
+        ++start;
+    }
+
+    return s.substr(start);
+}
+
 bool parseMacAddress(const string& text, uint8_t outMac[6]) {
     unsigned int bytes[6] = {0, 0, 0, 0, 0, 0};
     const string clean = stripOuterQuotes(text);
@@ -162,15 +198,17 @@ uint16_t lcdColorForLine(const string& text) {
 }
 
 void printLine(const string& text) {
-    g_commandOutputBuffer += text;
+    const string normalized = stripModulePrefix(text);
+
+    g_commandOutputBuffer += normalized;
     g_commandOutputBuffer += "\n";
 
     if (g_ctx.io != nullptr) {
-        g_ctx.io->println(text.c_str());
+        g_ctx.io->println(normalized.c_str());
     }
 
     if (g_ctx.lcdTerminal != nullptr && g_ctx.lcdTerminal->isReady()) {
-        g_ctx.lcdTerminal->writeText(String(text.c_str()), lcdColorForLine(text));
+        g_ctx.lcdTerminal->writeText(String(normalized.c_str()), lcdColorForLine(normalized));
     }
 }
 
