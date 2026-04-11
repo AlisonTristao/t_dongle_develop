@@ -2,6 +2,7 @@
 
 #include <sys/time.h>
 
+#include <cctype>
 #include <cstdio>
 #include <ctime>
 
@@ -31,6 +32,61 @@ void colorWheel(uint8_t position, uint8_t& r, uint8_t& g, uint8_t& b) {
 
 bool isSerialTerminalOpen() {
     return static_cast<bool>(Serial);
+}
+
+void drainSerialInput() {
+    while (Serial.available()) {
+        Serial.read();
+    }
+}
+
+bool readLineWithEcho(Stream& io, String& outLine, uint32_t timeoutMs) {
+    outLine = "";
+    const uint32_t start = millis();
+
+    while ((millis() - start) < timeoutMs) {
+        while (Serial.available()) {
+            const int value = Serial.read();
+            if (value < 0) {
+                break;
+            }
+
+            const char c = static_cast<char>(value);
+
+            if (c == '\r' || c == '\n') {
+                io.println();
+
+                // Consume optional paired line ending to avoid leaking a leftover '\n'/'\r'.
+                while (Serial.available()) {
+                    const int next = Serial.peek();
+                    if (next == '\r' || next == '\n') {
+                        Serial.read();
+                    } else {
+                        break;
+                    }
+                }
+
+                return true;
+            }
+
+            if (c == '\b' || c == 127) {
+                if (!outLine.isEmpty()) {
+                    outLine.remove(outLine.length() - 1);
+                    io.print("\b \b");
+                }
+                continue;
+            }
+
+            if (std::isprint(static_cast<unsigned char>(c)) != 0) {
+                outLine += c;
+                io.print(c);
+            }
+        }
+
+        delay(10);
+    }
+
+    return false;
 }
 
 bool parseDateTime(const String& text, time_t& outEpoch) {
@@ -115,19 +171,38 @@ void waitForSerialAndAnimateLed(DonglePeripherals& peripherals) {
         delay(24);
     }
 
-    while (Serial.available()) {
-        Serial.read();
-    }
+    drainSerialInput();
 
     Serial.println("[startup] monitor conectado. pressione ENTER para iniciar");
     Serial.print("[startup] > ");
 
+    bool enterConfirmed = false;
     uint32_t lastPromptMs = millis();
-    while (true) {
+    while (!enterConfirmed) {
         if (Serial.available()) {
-            const String line = Serial.readStringUntil('\n');
-            (void)line;
-            break;
+            const int value = Serial.read();
+            if (value >= 0) {
+                const char c = static_cast<char>(value);
+                if (c == '\r' || c == '\n') {
+                    Serial.println();
+
+                    while (Serial.available()) {
+                        const int next = Serial.peek();
+                        if (next == '\r' || next == '\n') {
+                            Serial.read();
+                        } else {
+                            break;
+                        }
+                    }
+
+                    enterConfirmed = true;
+                    continue;
+                }
+
+                if (std::isprint(static_cast<unsigned char>(c)) != 0) {
+                    Serial.print(c);
+                }
+            }
         }
 
         if ((millis() - lastPromptMs) >= 2000) {
@@ -146,19 +221,18 @@ void waitForSerialAndAnimateLed(DonglePeripherals& peripherals) {
 }
 
 void promptAndSetDateTime(Stream& io, uint32_t timeoutMs) {
+    drainSerialInput();
+
     io.println("[clock] informe data/hora: YYYY-MM-DD HH:MM:SS");
     io.println("[clock] ENTER vazio para pular (timeout 30s)");
     io.print("[clock] > ");
 
-    const uint32_t start = millis();
     String line;
 
-    while ((millis() - start) < timeoutMs) {
-        if (Serial.available()) {
-            line = Serial.readStringUntil('\n');
-            break;
-        }
-        delay(10);
+    const bool submitted = readLineWithEcho(io, line, timeoutMs);
+    if (!submitted) {
+        io.println("[clock] timeout sem confirmacao, mantendo horario atual");
+        return;
     }
 
     line.trim();
