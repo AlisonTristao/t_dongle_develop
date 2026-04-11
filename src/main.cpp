@@ -20,11 +20,14 @@ LcdTerminal lcdTerminal;
 TinyShell tinyShell;
 
 void setup() {
+    // Hardware baseline (pins and default levels) before any peripheral init.
     BoardConfig::initBoardPins(false);
 
+    // Bring up onboard peripherals used by shell commands.
     donglePeripherals.begin();
     donglePeripherals.beginSd(false);
 
+    // Interactive serial shell setup.
     serialShell.begin(Serial, 921600);
     serialShell.setPrompt("$ ");
     while (!Serial) {
@@ -66,6 +69,7 @@ void setup() {
 void loop() {
     String command;
     if (serialShell.readInputLine(command)) {
+        // Keep command/output/result visually separated in the serial terminal.
         Serial.println();
 
         const std::string response = ShellConfig::runLine(std::string(command.c_str()));
@@ -77,5 +81,6 @@ void loop() {
         Serial.println();
     }
 
-    delay(5);
+    // Small cooperative delay for non-blocking loop behavior.
+    delay(1);
 }

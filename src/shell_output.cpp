@@ -23,6 +23,7 @@ const char* outputPrefix(const String& text) {
 namespace ShellOutput {
 
 void printResponse(Stream& io, const std::string& response) {
+    // Normalize response into clean single-line chunks for terminal rendering.
     String text = String(response.c_str());
     text.replace("\r\n", "\n");
     text.replace('\r', '\n');
@@ -44,6 +45,7 @@ void printResponse(Stream& io, const std::string& response) {
 
         line.trim();
         if (line.length() > 0) {
+            // Prefix each output line to clearly separate shell result from input.
             io.print(outputPrefix(line));
             io.println(line);
         }

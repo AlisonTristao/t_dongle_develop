@@ -269,6 +269,7 @@ bool DonglePeripherals::beginSd(bool oneBitMode) {
             continue;
         }
 
+        // Accept only successful mount with a detected card.
         if (SD_MMC.cardType() == CARD_NONE) {
             SD_MMC.end();
             continue;
