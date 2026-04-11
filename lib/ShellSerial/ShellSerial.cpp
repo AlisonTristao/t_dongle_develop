@@ -4,6 +4,7 @@
 ShellSerial::ShellSerial(size_t logCapacity)
 	: serial_(nullptr),
 	  renderedLength_(0),
+	cursorIndex_(0),
 	  escState_(EscState::None),
 	  ignoreNextLf_(false),
 	  capacity_(logCapacity),
@@ -25,6 +26,7 @@ void ShellSerial::begin(Stream& serialPort) {
 	inputBuffer_ = "";
 	draftBeforeHistory_ = "";
 	renderedLength_ = 0;
+	cursorIndex_ = 0;
 	escState_ = EscState::None;
 	ignoreNextLf_ = false;
 	historyCursor_ = -1;
@@ -52,11 +54,12 @@ bool ShellSerial::readInputLine(String& outLine) {
 
 // Apply local backspace behavior and redraw terminal line.
 void ShellSerial::eraseLastChar() {
-	if (inputBuffer_.length() == 0) {
+	if (inputBuffer_.length() == 0 || cursorIndex_ == 0) {
 		return;
 	}
 
-	inputBuffer_.remove(inputBuffer_.length() - 1);
+	inputBuffer_.remove(cursorIndex_ - 1, 1);
+	--cursorIndex_;
 	historyCursor_ = -1;
 	redrawInput();
 }
@@ -65,6 +68,7 @@ void ShellSerial::eraseLastChar() {
 void ShellSerial::clearInput() {
 	inputBuffer_ = "";
 	draftBeforeHistory_ = "";
+	cursorIndex_ = 0;
 	historyCursor_ = -1;
 	redrawInput();
 }
@@ -116,6 +120,10 @@ void ShellSerial::processChar(char c, bool& lineReady, String& outLine) {
 				onArrowUp();
 			} else if (c == 'B') {
 				onArrowDown();
+			    } else if (c == 'C') {
+				    onArrowRight();
+			    } else if (c == 'D') {
+				    onArrowLeft();
 			}
 			escState_ = EscState::None;
 			return;
@@ -147,6 +155,7 @@ void ShellSerial::processChar(char c, bool& lineReady, String& outLine) {
 		draftBeforeHistory_ = "";
 		historyCursor_ = -1;
 		renderedLength_ = 0;
+		    cursorIndex_ = 0;
 
 		if (line.length() > 0) {
 			pushLog(line);
@@ -171,7 +180,14 @@ void ShellSerial::processChar(char c, bool& lineReady, String& outLine) {
 			draftBeforeHistory_ = "";
 		}
 
-		inputBuffer_ += c;
+		    if (cursorIndex_ >= inputBuffer_.length()) {
+			    inputBuffer_ += c;
+		    } else {
+			    const String left = inputBuffer_.substring(0, cursorIndex_);
+			    const String right = inputBuffer_.substring(cursorIndex_);
+			    inputBuffer_ = left + String(c) + right;
+		    }
+		    ++cursorIndex_;
 		redrawInput();
 	}
 }
@@ -196,6 +212,15 @@ void ShellSerial::redrawInput() {
 
 	serial_->print('\r');
 	serial_->print(visibleLine);
+
+	   const size_t cursorColumn = prompt_.length() + cursorIndex_;
+	   if (cursorColumn < visibleLine.length()) {
+		    const size_t stepBack = visibleLine.length() - cursorColumn;
+		    for (size_t i = 0; i < stepBack; ++i) {
+			    serial_->print('\b');
+		    }
+	   }
+
 	renderedLength_ = visibleLine.length();
 }
 
@@ -213,6 +238,7 @@ void ShellSerial::onArrowUp() {
 	}
 
 	inputBuffer_ = getLogByOffset(static_cast<size_t>(historyCursor_));
+	cursorIndex_ = inputBuffer_.length();
 	redrawInput();
 }
 
@@ -230,6 +256,27 @@ void ShellSerial::onArrowDown() {
 		inputBuffer_ = draftBeforeHistory_;
 	}
 
+	cursorIndex_ = inputBuffer_.length();
+	redrawInput();
+}
+
+// Move cursor one position to the left.
+void ShellSerial::onArrowLeft() {
+	if (cursorIndex_ == 0) {
+				return;
+	}
+
+	--cursorIndex_;
+	redrawInput();
+}
+
+// Move cursor one position to the right.
+void ShellSerial::onArrowRight() {
+	if (cursorIndex_ >= inputBuffer_.length()) {
+				return;
+	}
+
+	++cursorIndex_;
 	redrawInput();
 }
 

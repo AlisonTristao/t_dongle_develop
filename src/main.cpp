@@ -35,13 +35,35 @@ static const char* shellOutputPrefix(const String& text) {
 
 static void printShellResponse(const std::string& response) {
     String text = String(response.c_str());
+    text.replace("\r\n", "\n");
+    text.replace('\r', '\n');
     text.trim();
     if (text.length() == 0) {
         return;
     }
 
-    Serial.print(shellOutputPrefix(text));
-    Serial.println(text);
+    int32_t start = 0;
+    while (start <= static_cast<int32_t>(text.length())) {
+        const int32_t newline = text.indexOf('\n', start);
+        String line;
+
+        if (newline < 0) {
+            line = text.substring(start);
+        } else {
+            line = text.substring(start, newline);
+        }
+
+        line.trim();
+        if (line.length() > 0) {
+            Serial.print(shellOutputPrefix(line));
+            Serial.println(line);
+        }
+
+        if (newline < 0) {
+            break;
+        }
+        start = newline + 1;
+    }
 }
 
 // callback for incoming esp-now data
@@ -97,10 +119,17 @@ void setup() {
 void loop() {
     String command;
     if (serialShell.readInputLine(command)) {
+        // Visual spacing between typed command and shell output.
+        Serial.println();
+
         const std::string response = ShellConfig::runLine(std::string(command.c_str()));
         if (!response.empty()) {
+            // Keep shell command output and final status/result separated.
+            Serial.println();
             printShellResponse(response);
         }
+
+        Serial.println();
     }
 
     delay(5); // small delay to prevent blocking

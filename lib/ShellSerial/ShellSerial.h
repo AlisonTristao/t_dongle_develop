@@ -8,6 +8,7 @@
  * Features:
  * - line reading from Stream/Serial
  * - backspace and clear input helpers
+ * - left/right cursor movement with in-line editing
  * - in-memory circular log/history
  * - arrow up/down history recall using ESC sequences
  */
@@ -109,6 +110,7 @@ private:
 	String prompt_;
 	String draftBeforeHistory_;
 	size_t renderedLength_;
+	size_t cursorIndex_;
 	EscState escState_;
 	bool ignoreNextLf_;
 
@@ -137,6 +139,16 @@ private:
 	 * @brief Moves history cursor to newer entry.
 	 */
 	void onArrowDown();
+
+	/**
+	 * @brief Moves cursor one position to the left.
+	 */
+	void onArrowLeft();
+
+	/**
+	 * @brief Moves cursor one position to the right.
+	 */
+	void onArrowRight();
 
 	/**
 	 * @brief Inserts a message into the circular history buffer.
