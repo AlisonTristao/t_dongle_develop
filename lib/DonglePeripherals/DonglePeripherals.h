@@ -4,6 +4,17 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7735.h>
 
+class DongleSt7735 final : public Adafruit_ST7735 {
+public:
+    DongleSt7735(int8_t cs, int8_t dc, int8_t mosi, int8_t sclk, int8_t rst = -1)
+        : Adafruit_ST7735(cs, dc, mosi, sclk, rst) {
+    }
+
+    void setPanelOffset(int8_t colStart, int8_t rowStart) {
+        setColRowStart(colStart, rowStart);
+    }
+};
+
 /**
  * @brief Unified peripheral manager for LILYGO T-Dongle-S3.
  *
@@ -55,6 +66,22 @@ public:
      * @brief Reinitializes LCD and clears the screen.
      */
     bool reinitLcd(uint8_t rotation = 1);
+
+    /**
+     * @brief Updates LCD rotation at runtime.
+     * @param rotation Orientation index 0..3.
+     */
+    void setLcdRotation(uint8_t rotation);
+
+    /**
+     * @brief Returns current LCD rotation index.
+     */
+    uint8_t lcdRotation() const;
+
+    /**
+     * @brief Returns LCD object pointer, ensuring init when possible.
+     */
+    Adafruit_ST7735* lcd();
 
     /**
      * @brief Controls LCD backlight pin.
@@ -117,12 +144,13 @@ public:
     uint64_t sdUsedMB() const;
 
 private:
-    Adafruit_ST7735 tft_;
+    DongleSt7735 tft_;
     bool ledReady_;
     bool lcdReady_;
     bool sdReady_;
     bool lcdBacklightOn_;
     bool lcdBacklightActiveHigh_;
+    uint8_t lcdRotation_;
 
     void sendLedByte(uint8_t value) const;
     void writeLedFrame(uint8_t brightness31, uint8_t r, uint8_t g, uint8_t b) const;

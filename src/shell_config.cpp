@@ -58,9 +58,35 @@ bool parseMacAddress(const string& text, uint8_t outMac[6]) {
     return true;
 }
 
+uint16_t lcdColorForLine(const string& text) {
+    string lower = text;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+
+    if (lower.find("erro") != string::npos || lower.find("falha") != string::npos) {
+        return ST77XX_RED;
+    }
+    if (lower.rfind("[espnow]", 0) == 0) {
+        return ST77XX_CYAN;
+    }
+    if (lower.rfind("[dongle]", 0) == 0) {
+        return ST77XX_GREEN;
+    }
+    if (lower.rfind("[help]", 0) == 0) {
+        return ST77XX_YELLOW;
+    }
+
+    return ST77XX_WHITE;
+}
+
 void printLine(const string& text) {
     if (g_ctx.io != nullptr) {
         g_ctx.io->println(text.c_str());
+    }
+
+    if (g_ctx.lcdTerminal != nullptr && g_ctx.lcdTerminal->isReady()) {
+        g_ctx.lcdTerminal->writeText(String(text.c_str()), lcdColorForLine(text));
     }
 }
 
@@ -107,9 +133,11 @@ uint8_t wrapper_help_l(string module = "") {
 }
 
 uint8_t wrapper_help_e() {
+    printLine("[help] comandos gerais");
     printLine("Uso: <module> -<command> [args]");
     printLine("Exemplo local LCD: dongle -lcd \"Ola dongle\"");
     printLine("Se LCD nao aparecer: dongle -lcd_bl 1 e depois dongle -lcd_reinit");
+    printLine("Se LCD estiver invertido: dongle -lcd_rot 0..3");
     printLine("Exemplo local LED: dongle -led 255, 0, 0");
     printLine("Exemplo espnow unicast: espnow -send_to 1, \"dongle -run status\"");
     printLine("Exemplo espnow broadcast: espnow -send_to \"dongle -run status\"");
@@ -152,7 +180,15 @@ uint8_t wrapper_dongle_lcd(string text) {
         return RESULT_ERROR;
     }
 
-    const bool ok = g_ctx.peripherals->writeLcd(String(stripOuterQuotes(text).c_str()), true);
+    const String content = String(stripOuterQuotes(text).c_str());
+
+    if (g_ctx.lcdTerminal != nullptr && g_ctx.lcdTerminal->isReady()) {
+        g_ctx.lcdTerminal->writeText(content, ST77XX_WHITE);
+        printLine("[dongle] texto escrito no terminal LCD");
+        return RESULT_OK;
+    }
+
+    const bool ok = g_ctx.peripherals->writeLcd(content, true);
     if (!ok) {
         printLine("[dongle] LCD nao inicializado");
         return RESULT_ERROR;
@@ -165,6 +201,12 @@ uint8_t wrapper_dongle_lcd(string text) {
 uint8_t wrapper_dongle_lcd_clear() {
     if (g_ctx.peripherals == nullptr) {
         return RESULT_ERROR;
+    }
+
+    if (g_ctx.lcdTerminal != nullptr && g_ctx.lcdTerminal->isReady()) {
+        g_ctx.lcdTerminal->clear();
+        printLine("[dongle] terminal LCD limpo");
+        return RESULT_OK;
     }
 
     const bool ok = g_ctx.peripherals->clearLcd();
@@ -193,13 +235,51 @@ uint8_t wrapper_dongle_lcd_reinit() {
         return RESULT_ERROR;
     }
 
-    const bool ok = g_ctx.peripherals->reinitLcd(1);
+    const bool ok = g_ctx.peripherals->reinitLcd(g_ctx.peripherals->lcdRotation());
     if (!ok) {
         printLine("[dongle] falha ao reinicializar LCD");
         return RESULT_ERROR;
     }
 
+    if (g_ctx.lcdTerminal != nullptr) {
+        g_ctx.lcdTerminal->begin(*g_ctx.peripherals);
+    }
+
     printLine("[dongle] LCD reinicializado");
+    return RESULT_OK;
+}
+
+uint8_t wrapper_dongle_lcd_rot(int32_t rotation) {
+    if (g_ctx.peripherals == nullptr) {
+        return RESULT_ERROR;
+    }
+
+    const int32_t normalized = ((rotation % 4) + 4) % 4;
+    g_ctx.peripherals->setLcdRotation(static_cast<uint8_t>(normalized));
+
+    if (g_ctx.lcdTerminal != nullptr) {
+        g_ctx.lcdTerminal->begin(*g_ctx.peripherals);
+    }
+
+    char line[80] = {0};
+    std::snprintf(line, sizeof(line), "[dongle] rotacao LCD = %ld", static_cast<long>(normalized));
+    printLine(line);
+    return RESULT_OK;
+}
+
+uint8_t wrapper_dongle_lcd_rot_get() {
+    if (g_ctx.peripherals == nullptr) {
+        return RESULT_ERROR;
+    }
+
+    char line[80] = {0};
+    std::snprintf(
+        line,
+        sizeof(line),
+        "[dongle] rotacao LCD atual = %u",
+        static_cast<unsigned>(g_ctx.peripherals->lcdRotation())
+    );
+    printLine(line);
     return RESULT_OK;
 }
 
@@ -417,11 +497,13 @@ uint8_t wrapper_espnow_send_all(string command) {
 namespace ShellConfig {
 
 bool bind(const Context& context) {
-    if (context.shell == nullptr || context.espNow == nullptr || context.peripherals == nullptr || context.io == nullptr) {
+    if (context.shell == nullptr || context.espNow == nullptr || context.peripherals == nullptr || context.lcdTerminal == nullptr || context.io == nullptr) {
         return false;
     }
 
     g_ctx = context;
+
+    g_ctx.lcdTerminal->begin(*g_ctx.peripherals);
     return true;
 }
 
@@ -442,8 +524,10 @@ uint8_t registerDefaultModules() {
     g_ctx.shell->add(wrapper_dongle_run, "run", "executa comando local (placeholder)", "dongle");
     g_ctx.shell->add(wrapper_dongle_led, "led", "define LED RGB: <r>, <g>, <b>", "dongle");
     g_ctx.shell->add(wrapper_dongle_led_off, "led_off", "desliga o LED", "dongle");
-    g_ctx.shell->add(wrapper_dongle_lcd, "lcd", "escreve texto no LCD: <texto>", "dongle");
-    g_ctx.shell->add(wrapper_dongle_lcd_clear, "lcd_clear", "limpa o LCD", "dongle");
+    g_ctx.shell->add(wrapper_dongle_lcd, "lcd", "escreve texto no terminal LCD: <texto>", "dongle");
+    g_ctx.shell->add(wrapper_dongle_lcd_clear, "lcd_clear", "limpa o terminal LCD", "dongle");
+    g_ctx.shell->add(wrapper_dongle_lcd_rot, "lcd_rot", "rotacao LCD: <0|1|2|3>", "dongle");
+    g_ctx.shell->add(wrapper_dongle_lcd_rot_get, "lcd_rot_get", "mostra rotacao atual do LCD", "dongle");
     g_ctx.shell->add(wrapper_dongle_lcd_bl, "lcd_bl", "backlight LCD: <0=ON|1=OFF>", "dongle");
     g_ctx.shell->add(wrapper_dongle_lcd_bl_inv, "lcd_bl_inv", "polaridade backlight: <1=HIGH_ON|0=LOW_ON>", "dongle");
     g_ctx.shell->add(wrapper_dongle_lcd_reinit, "lcd_reinit", "reinicializa o LCD", "dongle");

@@ -23,6 +23,8 @@ static constexpr uint8_t PIN_TFT_SCL  = 5;      // GPIO5 (SCLK)
 static constexpr uint8_t PIN_TFT_DC   = 2;      // GPIO2
 static constexpr uint8_t PIN_TFT_RES  = 1;      // GPIO1
 static constexpr uint8_t PIN_TFT_LED  = 38;     // GPIO38 (backlight)
+static constexpr uint8_t TFT_COL_START = 26;    // ST7735 RAM col offset calibration
+static constexpr uint8_t TFT_ROW_START = 1;     // ST7735 RAM row offset calibration
 
 // TF card (SDMMC bus on this board)
 static constexpr uint8_t PIN_SDMMC_D0  = 14;    // GPIO14

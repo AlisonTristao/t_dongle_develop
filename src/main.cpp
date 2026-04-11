@@ -3,6 +3,7 @@
 #include <ShellSerial.h>
 #include <EspNowManager.h>
 #include <DonglePeripherals.h>
+#include <LcdTerminal.h>
 #include <TinyShell.h>
 #include "shell_config.h"
 
@@ -13,12 +14,39 @@ EspNowManager::message myData = {};
 ShellSerial serialShell;
 EspNowManager espNowManager;
 DonglePeripherals donglePeripherals;
+LcdTerminal lcdTerminal;
 TinyShell tinyShell;
+
+static const char* shellOutputPrefix(const String& text) {
+    String lower = text;
+    lower.toLowerCase();
+
+    if (
+        lower.indexOf("falhou") >= 0 ||
+        lower.indexOf("erro") >= 0 ||
+        lower.indexOf("error") >= 0 ||
+        lower.indexOf("invalid") >= 0
+    ) {
+        return "! ";
+    }
+
+    return "> ";
+}
+
+static void printShellResponse(const std::string& response) {
+    String text = String(response.c_str());
+    text.trim();
+    if (text.length() == 0) {
+        return;
+    }
+
+    Serial.print(shellOutputPrefix(text));
+    Serial.println(text);
+}
 
 // callback for incoming esp-now data
 void OnDataRecv(const uint8_t *mac, const EspNowManager::message& incomingData) {
     myData = incomingData;
-    serialShell.addLog(String(myData.msg));
     Serial.printf("%s\n", myData.msg);
 }
 
@@ -51,7 +79,7 @@ void setup() {
 
     espNowManager.addDevice(PEER_MAC, "peer-main", "peer principal para mensagens esp-now");
 
-    const bool shellBound = ShellConfig::bind({&tinyShell, &espNowManager, &donglePeripherals, &Serial});
+    const bool shellBound = ShellConfig::bind({&tinyShell, &espNowManager, &donglePeripherals, &lcdTerminal, &Serial});
     if (!shellBound) {
         Serial.println("shell bind failed");
         return;
@@ -71,8 +99,7 @@ void loop() {
     if (serialShell.readInputLine(command)) {
         const std::string response = ShellConfig::runLine(std::string(command.c_str()));
         if (!response.empty()) {
-            Serial.println(response.c_str());
-            serialShell.addLog(String(response.c_str()));
+            printShellResponse(response);
         }
     }
 

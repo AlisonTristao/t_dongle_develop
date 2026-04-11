@@ -16,13 +16,14 @@ DonglePeripherals::DonglePeripherals()
       lcdReady_(false),
             sdReady_(false),
         lcdBacklightOn_(false),
-        lcdBacklightActiveHigh_(false) {
+        lcdBacklightActiveHigh_(false),
+        lcdRotation_(1) {
 }
 
 void DonglePeripherals::begin() {
     beginLed();
     ledOff();
-    beginLcd(1);
+    beginLcd(lcdRotation_);
 }
 
 bool DonglePeripherals::beginLed() {
@@ -51,6 +52,8 @@ void DonglePeripherals::ledOff() {
 }
 
 bool DonglePeripherals::beginLcd(uint8_t rotation) {
+    lcdRotation_ = static_cast<uint8_t>(rotation % 4);
+
     // Hardware reset sequence increases reliability on cold boot.
     pinMode(BoardConfig::PIN_TFT_RES, OUTPUT);
     digitalWrite(BoardConfig::PIN_TFT_RES, HIGH);
@@ -68,7 +71,12 @@ bool DonglePeripherals::beginLcd(uint8_t rotation) {
 #else
     tft_.initR(INITR_BLACKTAB);
 #endif
-    tft_.setRotation(rotation % 4);
+    // Align panel RAM window to avoid shifted/garbled content.
+    tft_.setPanelOffset(
+        static_cast<int8_t>(BoardConfig::TFT_COL_START),
+        static_cast<int8_t>(BoardConfig::TFT_ROW_START)
+    );
+    tft_.setRotation(lcdRotation_);
     tft_.fillScreen(ST77XX_BLACK);
     tft_.setTextColor(ST77XX_WHITE);
     tft_.setTextSize(1);
@@ -87,6 +95,30 @@ bool DonglePeripherals::isLcdReady() const {
 bool DonglePeripherals::reinitLcd(uint8_t rotation) {
     lcdReady_ = false;
     return beginLcd(rotation);
+}
+
+void DonglePeripherals::setLcdRotation(uint8_t rotation) {
+    lcdRotation_ = static_cast<uint8_t>(rotation % 4);
+
+    if (!lcdReady_) {
+        return;
+    }
+
+    tft_.setRotation(lcdRotation_);
+    tft_.fillScreen(ST77XX_BLACK);
+    tft_.setCursor(0, 0);
+}
+
+uint8_t DonglePeripherals::lcdRotation() const {
+    return lcdRotation_;
+}
+
+Adafruit_ST7735* DonglePeripherals::lcd() {
+    if (!lcdReady_ && !beginLcd(lcdRotation_)) {
+        return nullptr;
+    }
+
+    return &tft_;
 }
 
 void DonglePeripherals::setLcdBacklight(bool on) {
@@ -110,7 +142,7 @@ bool DonglePeripherals::isLcdBacklightActiveHigh() const {
 }
 
 bool DonglePeripherals::writeLcd(const String& text, bool clearFirst, uint16_t color) {
-    if (!lcdReady_ && !beginLcd(1)) {
+    if (!lcdReady_ && !beginLcd(lcdRotation_)) {
         return false;
     }
 
@@ -127,7 +159,7 @@ bool DonglePeripherals::writeLcd(const String& text, bool clearFirst, uint16_t c
 }
 
 bool DonglePeripherals::clearLcd(uint16_t color) {
-    if (!lcdReady_ && !beginLcd(1)) {
+    if (!lcdReady_ && !beginLcd(lcdRotation_)) {
         return false;
     }
 
