@@ -1,4 +1,6 @@
 #include <WiFi.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #include "config.h"
 #include "startup_config.h"
@@ -19,6 +21,36 @@ DonglePeripherals donglePeripherals;
 LcdTerminal lcdTerminal;
 DatabaseStore databaseStore;
 TinyShell tinyShell;
+
+namespace {
+
+TaskHandle_t g_espNowRxTaskHandle = nullptr;
+
+BaseType_t selectEspNowWorkerCore() {
+#if defined(CONFIG_FREERTOS_UNICORE) && (CONFIG_FREERTOS_UNICORE == 1)
+    return ARDUINO_RUNNING_CORE;
+#else
+    return (ARDUINO_RUNNING_CORE == 0) ? 1 : 0;
+#endif
+}
+
+void espNowRxWorkerTask(void*) {
+    EspNowConfig::RxMessageEvent event = {};
+
+    while (true) {
+        if (EspNowConfig::dequeueRxMessage(event, 250)) {
+            EspNowConfig::processRxMessage(event);
+        }
+
+        const uint32_t dropped = EspNowConfig::takeDroppedRxCount();
+        if (dropped > 0) {
+            Serial.print("espnow rx dropped=");
+            Serial.println(static_cast<unsigned long>(dropped));
+        }
+    }
+}
+
+} // namespace
 
 void setup() {
     // Hardware baseline (pins and default levels) before any peripheral init.
@@ -41,6 +73,11 @@ void setup() {
 
     EspNowConfig::attachCallbacks(espNowManager, Serial, &databaseStore);
 
+    const bool asyncRxEnabled = EspNowConfig::enableAsyncRx(24);
+    if (!asyncRxEnabled) {
+        Serial.println("espnow async queue init failed (fallback no callback)");
+    }
+
     if (!espNowManager.begin(0, false)) {
         Serial.println("esp-now init failed");
         return;
@@ -50,6 +87,27 @@ void setup() {
         Serial.println("database init failed (continuando sem persistencia)");
     } else {
         databaseStore.logBootEvent("power_on");
+    }
+
+    if (asyncRxEnabled) {
+        const BaseType_t workerCore = selectEspNowWorkerCore();
+        const BaseType_t taskOk = xTaskCreatePinnedToCore(
+            espNowRxWorkerTask,
+            "espnow_rx",
+            6144,
+            nullptr,
+            1,
+            &g_espNowRxTaskHandle,
+            workerCore
+        );
+
+        if (taskOk != pdPASS) {
+            EspNowConfig::disableAsyncRx();
+            Serial.println("espnow rx task create failed (fallback callback)");
+        } else {
+            Serial.print("espnow rx task core=");
+            Serial.println(static_cast<int>(workerCore));
+        }
     }
 
     const bool shellBound = ShellConfig::bind({
