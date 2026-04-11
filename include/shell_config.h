@@ -5,6 +5,7 @@
 #include <EspNowManager.h>
 #include <DonglePeripherals.h>
 #include <LcdTerminal.h>
+#include <DatabaseStore.h>
 
 #include <string>
 
@@ -18,6 +19,7 @@ struct Context {
 	EspNowManager* espNow;
 	DonglePeripherals* peripherals;
 	LcdTerminal* lcdTerminal;
+	DatabaseStore* database;
 	Stream* io;
 };
 
@@ -35,6 +37,7 @@ bool bind(const Context& context);
  * - help
  * - dongle
  * - espnow
+ * - database
  *
  * @return RESULT_OK on success.
  */

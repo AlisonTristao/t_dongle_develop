@@ -9,6 +9,7 @@
 #include <EspNowManager.h>
 #include <DonglePeripherals.h>
 #include <LcdTerminal.h>
+#include <DatabaseStore.h>
 #include <TinyShell.h>
 
 static constexpr uint8_t PEER_MAC[] = {0x80, 0xB5, 0x4E, 0xC6, 0xD8, 0xC8};
@@ -17,6 +18,7 @@ ShellSerial serialShell;
 EspNowManager espNowManager;
 DonglePeripherals donglePeripherals;
 LcdTerminal lcdTerminal;
+DatabaseStore databaseStore;
 TinyShell tinyShell;
 
 void setup() {
@@ -43,13 +45,22 @@ void setup() {
         return;
     }
 
-    espNowManager.addDevice(PEER_MAC, "peer-main", "peer principal para mensagens esp-now");
+    if (!databaseStore.begin(espNowManager, &Serial)) {
+        Serial.println("database init failed (continuando sem persistencia)");
+    }
+
+    if (espNowManager.addDevice(PEER_MAC, "peer-main", "peer principal para mensagens esp-now")) {
+        if (databaseStore.isReady()) {
+            databaseStore.upsertPeer(PEER_MAC, "peer-main", "peer principal para mensagens esp-now");
+        }
+    }
 
     const bool shellBound = ShellConfig::bind({
         &tinyShell,
         &espNowManager,
         &donglePeripherals,
         &lcdTerminal,
+        &databaseStore,
         &Serial
     });
     if (!shellBound) {

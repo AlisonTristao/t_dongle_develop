@@ -1,9 +1,66 @@
 #include "DonglePeripherals.h"
 
 #include <SD_MMC.h>
+#include <FS.h>
 #include <driver/gpio.h>
 
 #include "../../include/config.h"
+
+namespace {
+
+String normalizeFsPath(const String& path) {
+    if (path.isEmpty()) {
+        return "/";
+    }
+
+    if (path.startsWith("/")) {
+        return path;
+    }
+
+    String normalized = "/";
+    normalized += path;
+    return normalized;
+}
+
+bool removeTree(fs::FS& fs, const String& rawPath) {
+    const String path = normalizeFsPath(rawPath);
+    File node = fs.open(path);
+    if (!node) {
+        return false;
+    }
+
+    const bool isDirectory = node.isDirectory();
+    node.close();
+
+    if (!isDirectory) {
+        return fs.remove(path);
+    }
+
+    File directory = fs.open(path);
+    if (!directory || !directory.isDirectory()) {
+        return false;
+    }
+
+    File entry = directory.openNextFile();
+    while (entry) {
+        String entryPath = normalizeFsPath(String(entry.name()));
+        const bool entryIsDir = entry.isDirectory();
+        entry.close();
+
+        const bool ok = entryIsDir ? removeTree(fs, entryPath) : fs.remove(entryPath);
+        if (!ok) {
+            directory.close();
+            return false;
+        }
+
+        entry = directory.openNextFile();
+    }
+
+    directory.close();
+    return fs.rmdir(path);
+}
+
+} // namespace
 
 DonglePeripherals::DonglePeripherals()
     : tft_(
@@ -328,6 +385,35 @@ uint64_t DonglePeripherals::sdUsedMB() const {
         return 0;
     }
     return SD_MMC.usedBytes() / (1024ULL * 1024ULL);
+}
+
+bool DonglePeripherals::wipeSdContents() {
+    if (!sdReady_) {
+        return false;
+    }
+
+    File root = SD_MMC.open("/");
+    if (!root || !root.isDirectory()) {
+        return false;
+    }
+
+    File entry = root.openNextFile();
+    while (entry) {
+        String entryPath = normalizeFsPath(String(entry.name()));
+        const bool entryIsDir = entry.isDirectory();
+        entry.close();
+
+        const bool ok = entryIsDir ? removeTree(SD_MMC, entryPath) : SD_MMC.remove(entryPath);
+        if (!ok) {
+            root.close();
+            return false;
+        }
+
+        entry = root.openNextFile();
+    }
+
+    root.close();
+    return true;
 }
 
 void DonglePeripherals::sendLedByte(uint8_t value) const {

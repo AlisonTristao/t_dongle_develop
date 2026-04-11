@@ -9,7 +9,7 @@ namespace {
 
 using std::string;
 
-ShellConfig::Context g_ctx = {nullptr, nullptr, nullptr, nullptr};
+ShellConfig::Context g_ctx = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
 
 string trimCopy(const string& text) {
     const auto first = std::find_if_not(text.begin(), text.end(), [](unsigned char ch) {
@@ -184,6 +184,7 @@ uint8_t wrapper_help_e() {
     printLine("Exemplo local LED: dongle -led 255, 0, 0");
     printLine("Exemplo espnow unicast: espnow -send_to 1, \"dongle -run status\"");
     printLine("Exemplo espnow broadcast: espnow -send_to \"dongle -run status\"");
+    printLine("Banco sqlite no SD: database -status | database -tables | database -read peers, 20");
     return RESULT_OK;
 }
 
@@ -392,6 +393,47 @@ uint8_t wrapper_dongle_sd_status() {
     return RESULT_OK;
 }
 
+uint8_t wrapper_dongle_sd_wipe() {
+    if (g_ctx.peripherals == nullptr || g_ctx.espNow == nullptr) {
+        return RESULT_ERROR;
+    }
+
+    if (!g_ctx.peripherals->isSdReady()) {
+        printLine("[dongle] SD nao inicializado");
+        return RESULT_ERROR;
+    }
+
+    if (g_ctx.database != nullptr && g_ctx.database->isReady()) {
+        g_ctx.database->end();
+    }
+
+    const bool wipeOk = g_ctx.peripherals->wipeSdContents();
+    if (!wipeOk) {
+        printLine("[dongle] falha ao apagar conteudo do SD");
+        return RESULT_ERROR;
+    }
+
+    const bool sdReinitOk = g_ctx.peripherals->beginSd(false);
+    if (!sdReinitOk) {
+        printLine("[dongle] SD limpo, mas falhou reinit");
+        return RESULT_ERROR;
+    }
+
+    if (g_ctx.database != nullptr) {
+        if (g_ctx.database->begin(*g_ctx.espNow, g_ctx.io)) {
+            g_ctx.database->syncPeersFromManager(*g_ctx.espNow);
+            printLine("[dongle] SD limpo e database recriado");
+            return RESULT_OK;
+        }
+
+        printLine("[dongle] SD limpo, mas falhou ao recriar database");
+        return RESULT_ERROR;
+    }
+
+    printLine("[dongle] SD limpo");
+    return RESULT_OK;
+}
+
 uint8_t wrapper_espnow_list() {
     if (g_ctx.espNow == nullptr) {
         return RESULT_ERROR;
@@ -456,6 +498,12 @@ uint8_t wrapper_espnow_add(string macText, string name, string description) {
         return RESULT_ERROR;
     }
 
+    if (g_ctx.database != nullptr && g_ctx.database->isReady()) {
+        if (!g_ctx.database->upsertPeer(mac, stripOuterQuotes(name).c_str(), stripOuterQuotes(description).c_str())) {
+            printLine("[database] aviso: peer adicionado, mas nao persistido");
+        }
+    }
+
     printLine("[espnow] dispositivo adicionado");
     return RESULT_OK;
 }
@@ -466,10 +514,19 @@ uint8_t wrapper_espnow_remove(int32_t deviceNumber) {
     }
 
     const size_t index = static_cast<size_t>(deviceNumber - 1);
+    EspNowManager::deviceInfo removed = {};
+    const bool hadDevice = g_ctx.espNow->deviceAt(index, removed);
+
     const bool ok = g_ctx.espNow->removeDeviceByIndex(index);
     if (!ok) {
         printLine("[espnow] indice invalido");
         return RESULT_ERROR;
+    }
+
+    if (hadDevice && g_ctx.database != nullptr && g_ctx.database->isReady()) {
+        if (!g_ctx.database->removePeer(removed.mac)) {
+            printLine("[database] aviso: peer removido, mas persistencia nao atualizada");
+        }
     }
 
     printLine("[espnow] dispositivo removido");
@@ -491,6 +548,12 @@ uint8_t wrapper_espnow_remove_mac(string macText) {
     if (!ok) {
         printLine("[espnow] MAC nao encontrado");
         return RESULT_ERROR;
+    }
+
+    if (g_ctx.database != nullptr && g_ctx.database->isReady()) {
+        if (!g_ctx.database->removePeer(mac)) {
+            printLine("[database] aviso: peer removido, mas persistencia nao atualizada");
+        }
     }
 
     printLine("[espnow] dispositivo removido por MAC");
@@ -545,12 +608,108 @@ uint8_t wrapper_espnow_send_all(string command) {
     return RESULT_OK;
 }
 
+uint8_t wrapper_database_init() {
+    if (g_ctx.database == nullptr || g_ctx.espNow == nullptr) {
+        return RESULT_ERROR;
+    }
+
+    if (g_ctx.database->begin(*g_ctx.espNow, g_ctx.io)) {
+        g_ctx.database->syncPeersFromManager(*g_ctx.espNow);
+        printLine("[database] inicializado e sincronizado com peers");
+        return RESULT_OK;
+    }
+
+    printLine("[database] falha ao inicializar (confira SD e sqlite)");
+    return RESULT_ERROR;
+}
+
+uint8_t wrapper_database_status() {
+    if (g_ctx.database == nullptr) {
+        return RESULT_ERROR;
+    }
+
+    String status;
+    const bool ok = g_ctx.database->getStatus(status);
+    printLine(status.c_str());
+    return ok ? RESULT_OK : RESULT_ERROR;
+}
+
+uint8_t wrapper_database_tables() {
+    if (g_ctx.database == nullptr) {
+        return RESULT_ERROR;
+    }
+
+    String output;
+    const bool ok = g_ctx.database->listTables(output);
+    printLine(output.c_str());
+    return ok ? RESULT_OK : RESULT_ERROR;
+}
+
+uint8_t wrapper_database_read(string tableName, int32_t limit = 20) {
+    if (g_ctx.database == nullptr) {
+        return RESULT_ERROR;
+    }
+
+    String output;
+    const size_t boundedLimit = (limit > 0) ? static_cast<size_t>(limit) : 20U;
+    const bool ok = g_ctx.database->readTable(stripOuterQuotes(tableName).c_str(), boundedLimit, output);
+    printLine(output.c_str());
+    return ok ? RESULT_OK : RESULT_ERROR;
+}
+
+uint8_t wrapper_database_drop(string tableName) {
+    if (g_ctx.database == nullptr) {
+        return RESULT_ERROR;
+    }
+
+    const String safeName = String(stripOuterQuotes(tableName).c_str());
+    const bool ok = g_ctx.database->dropTable(safeName);
+    if (!ok) {
+        printLine("[database] falha ao remover tabela");
+        return RESULT_ERROR;
+    }
+
+    printLine("[database] tabela removida");
+    return RESULT_OK;
+}
+
+uint8_t wrapper_database_rebuild() {
+    if (g_ctx.database == nullptr || g_ctx.espNow == nullptr) {
+        return RESULT_ERROR;
+    }
+
+    if (g_ctx.database->rebuild(*g_ctx.espNow)) {
+        g_ctx.database->syncPeersFromManager(*g_ctx.espNow);
+        printLine("[database] banco recriado com bootstrap.sql");
+        return RESULT_OK;
+    }
+
+    printLine("[database] falha ao recriar banco");
+    return RESULT_ERROR;
+}
+
+uint8_t wrapper_database_exec(string sql) {
+    if (g_ctx.database == nullptr) {
+        return RESULT_ERROR;
+    }
+
+    String output;
+    const bool ok = g_ctx.database->executeSql(stripOuterQuotes(sql).c_str(), output);
+    printLine(output.c_str());
+    return ok ? RESULT_OK : RESULT_ERROR;
+}
+
 } // namespace
 
 namespace ShellConfig {
 
 bool bind(const Context& context) {
-    if (context.shell == nullptr || context.espNow == nullptr || context.peripherals == nullptr || context.lcdTerminal == nullptr || context.io == nullptr) {
+    if (context.shell == nullptr ||
+        context.espNow == nullptr ||
+        context.peripherals == nullptr ||
+        context.lcdTerminal == nullptr ||
+        context.database == nullptr ||
+        context.io == nullptr) {
         return false;
     }
 
@@ -568,6 +727,7 @@ uint8_t registerDefaultModules() {
     g_ctx.shell->create_module("help", "ajuda e informacoes");
     g_ctx.shell->create_module("dongle", "comandos executados localmente nesta ESP");
     g_ctx.shell->create_module("espnow", "gerenciamento de peers e envio de mensagens esp-now");
+    g_ctx.shell->create_module("database", "sqlite no SD: status, leitura e manutencao");
 
     g_ctx.shell->add(wrapper_help_h, "h", "lista os modulos", "help");
     g_ctx.shell->add(wrapper_help_l, "l", "lista as funcoes de um modulo", "help");
@@ -586,6 +746,7 @@ uint8_t registerDefaultModules() {
     g_ctx.shell->add(wrapper_dongle_lcd_reinit, "lcd_reinit", "reinicializa o LCD", "dongle");
     g_ctx.shell->add(wrapper_dongle_sd_init, "sd_init", "inicia o SD", "dongle");
     g_ctx.shell->add(wrapper_dongle_sd_status, "sd_status", "mostra status do SD", "dongle");
+    g_ctx.shell->add(wrapper_dongle_sd_wipe, "sd_wipe", "apaga todo o conteudo do SD", "dongle");
 
     g_ctx.shell->add(wrapper_espnow_list, "list", "lista dispositivos cadastrados", "espnow");
     g_ctx.shell->add(wrapper_espnow_add, "add", "adiciona peer: <mac>, <nome>, <descricao>", "espnow");
@@ -593,6 +754,14 @@ uint8_t registerDefaultModules() {
     g_ctx.shell->add(wrapper_espnow_remove_mac, "remove_mac", "remove peer por mac: <mac>", "espnow");
     g_ctx.shell->add(wrapper_espnow_send_to, "send_to", "envia para indice: <numero>, <comando>", "espnow");
     g_ctx.shell->add(wrapper_espnow_send_all, "send_all", "envia para todos: <comando>", "espnow");
+
+    g_ctx.shell->add(wrapper_database_init, "init", "abre o banco e aplica bootstrap.sql", "database");
+    g_ctx.shell->add(wrapper_database_status, "status", "status geral do sqlite", "database");
+    g_ctx.shell->add(wrapper_database_tables, "tables", "lista tabelas no banco", "database");
+    g_ctx.shell->add(wrapper_database_read, "read", "le tabela: <nome>, <limite>", "database");
+    g_ctx.shell->add(wrapper_database_drop, "drop", "remove tabela: <nome>", "database");
+    g_ctx.shell->add(wrapper_database_rebuild, "rebuild", "recria banco a partir do bootstrap", "database");
+    g_ctx.shell->add(wrapper_database_exec, "exec", "executa SQL livre: <sql>", "database");
 
     return RESULT_OK;
 }
@@ -602,7 +771,13 @@ std::string runLine(const std::string& command) {
         return "Shell nao configurada.";
     }
 
-    return g_ctx.shell->run_line_command(normalizeCommand(command));
+    const std::string normalized = normalizeCommand(command);
+
+    if (g_ctx.database != nullptr && g_ctx.database->isReady()) {
+        g_ctx.database->logCommand(normalized.c_str(), "serial");
+    }
+
+    return g_ctx.shell->run_line_command(normalized);
 }
 
 } // namespace ShellConfig

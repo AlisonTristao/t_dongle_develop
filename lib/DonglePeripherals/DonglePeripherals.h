@@ -154,6 +154,12 @@ public:
      */
     uint64_t sdUsedMB() const;
 
+    /**
+     * @brief Removes all files/folders from SD root.
+     * @return true when cleanup succeeds.
+     */
+    bool wipeSdContents();
+
 private:
     DongleSt7735 tft_;
     bool ledReady_;
