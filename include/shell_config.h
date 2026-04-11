@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <TinyShell.h>
 #include <EspNowManager.h>
+#include <DonglePeripherals.h>
 
 #include <string>
 
@@ -14,6 +15,7 @@ namespace ShellConfig {
 struct Context {
 	TinyShell* shell;
 	EspNowManager* espNow;
+	DonglePeripherals* peripherals;
 	Stream* io;
 };
 

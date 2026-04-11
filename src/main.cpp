@@ -2,6 +2,7 @@
 #include "config.h"
 #include <ShellSerial.h>
 #include <EspNowManager.h>
+#include <DonglePeripherals.h>
 #include <TinyShell.h>
 #include "shell_config.h"
 
@@ -11,6 +12,7 @@ static constexpr uint8_t PEER_MAC[] = {0x80, 0xB5, 0x4E, 0xC6, 0xD8, 0xC8};
 EspNowManager::message myData = {};
 ShellSerial serialShell;
 EspNowManager espNowManager;
+DonglePeripherals donglePeripherals;
 TinyShell tinyShell;
 
 // callback for incoming esp-now data
@@ -27,6 +29,9 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 
 void setup() {
     BoardConfig::initBoardPins(false);
+
+    donglePeripherals.begin();
+    donglePeripherals.beginSd(false);
 
     serialShell.begin(Serial, 921600);
     serialShell.setPrompt("$ ");
@@ -46,7 +51,7 @@ void setup() {
 
     espNowManager.addDevice(PEER_MAC, "peer-main", "peer principal para mensagens esp-now");
 
-    const bool shellBound = ShellConfig::bind({&tinyShell, &espNowManager, &Serial});
+    const bool shellBound = ShellConfig::bind({&tinyShell, &espNowManager, &donglePeripherals, &Serial});
     if (!shellBound) {
         Serial.println("shell bind failed");
         return;

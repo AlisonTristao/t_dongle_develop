@@ -2,13 +2,14 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <cstdio>
 
 namespace {
 
 using std::string;
 
-ShellConfig::Context g_ctx = {nullptr, nullptr, nullptr};
+ShellConfig::Context g_ctx = {nullptr, nullptr, nullptr, nullptr};
 
 string trimCopy(const string& text) {
     const auto first = std::find_if_not(text.begin(), text.end(), [](unsigned char ch) {
@@ -77,6 +78,16 @@ string normalizeCommand(const string& command) {
     return input;
 }
 
+uint8_t clampByte(int32_t value) {
+    if (value < 0) {
+        return 0;
+    }
+    if (value > 255) {
+        return 255;
+    }
+    return static_cast<uint8_t>(value);
+}
+
 uint8_t wrapper_help_h() {
     if (g_ctx.shell == nullptr) {
         return RESULT_ERROR;
@@ -97,7 +108,9 @@ uint8_t wrapper_help_l(string module = "") {
 
 uint8_t wrapper_help_e() {
     printLine("Uso: <module> -<command> [args]");
-    printLine("Exemplo local: dongle -run \"status\"");
+    printLine("Exemplo local LCD: dongle -lcd \"Ola dongle\"");
+    printLine("Se LCD nao aparecer: dongle -lcd_bl 1 e depois dongle -lcd_reinit");
+    printLine("Exemplo local LED: dongle -led 255, 0, 0");
     printLine("Exemplo espnow unicast: espnow -send_to 1, \"dongle -run status\"");
     printLine("Exemplo espnow broadcast: espnow -send_to \"dongle -run status\"");
     return RESULT_OK;
@@ -111,6 +124,138 @@ uint8_t wrapper_dongle_run(string command) {
 
 uint8_t wrapper_dongle_ping() {
     printLine("[dongle] pong");
+    return RESULT_OK;
+}
+
+uint8_t wrapper_dongle_led(int32_t r, int32_t g, int32_t b) {
+    if (g_ctx.peripherals == nullptr) {
+        return RESULT_ERROR;
+    }
+
+    g_ctx.peripherals->setLedColor(clampByte(r), clampByte(g), clampByte(b));
+    printLine("[dongle] LED atualizado");
+    return RESULT_OK;
+}
+
+uint8_t wrapper_dongle_led_off() {
+    if (g_ctx.peripherals == nullptr) {
+        return RESULT_ERROR;
+    }
+
+    g_ctx.peripherals->ledOff();
+    printLine("[dongle] LED desligado");
+    return RESULT_OK;
+}
+
+uint8_t wrapper_dongle_lcd(string text) {
+    if (g_ctx.peripherals == nullptr) {
+        return RESULT_ERROR;
+    }
+
+    const bool ok = g_ctx.peripherals->writeLcd(String(stripOuterQuotes(text).c_str()), true);
+    if (!ok) {
+        printLine("[dongle] LCD nao inicializado");
+        return RESULT_ERROR;
+    }
+
+    printLine("[dongle] texto escrito no LCD");
+    return RESULT_OK;
+}
+
+uint8_t wrapper_dongle_lcd_clear() {
+    if (g_ctx.peripherals == nullptr) {
+        return RESULT_ERROR;
+    }
+
+    const bool ok = g_ctx.peripherals->clearLcd();
+    if (!ok) {
+        printLine("[dongle] LCD nao inicializado");
+        return RESULT_ERROR;
+    }
+
+    printLine("[dongle] LCD limpo");
+    return RESULT_OK;
+}
+
+uint8_t wrapper_dongle_lcd_bl(int32_t on) {
+    if (g_ctx.peripherals == nullptr) {
+        return RESULT_ERROR;
+    }
+
+    const bool turnOn = (on == 0);
+    g_ctx.peripherals->setLcdBacklight(turnOn);
+    printLine(turnOn ? "[dongle] backlight ligado" : "[dongle] backlight desligado");
+    return RESULT_OK;
+}
+
+uint8_t wrapper_dongle_lcd_reinit() {
+    if (g_ctx.peripherals == nullptr) {
+        return RESULT_ERROR;
+    }
+
+    const bool ok = g_ctx.peripherals->reinitLcd(1);
+    if (!ok) {
+        printLine("[dongle] falha ao reinicializar LCD");
+        return RESULT_ERROR;
+    }
+
+    printLine("[dongle] LCD reinicializado");
+    return RESULT_OK;
+}
+
+uint8_t wrapper_dongle_lcd_bl_inv(int32_t activeHigh) {
+    if (g_ctx.peripherals == nullptr) {
+        return RESULT_ERROR;
+    }
+
+    g_ctx.peripherals->setLcdBacklightPolarity(activeHigh != 0);
+    if (activeHigh != 0) {
+        printLine("[dongle] polaridade backlight: HIGH=ON");
+    } else {
+        printLine("[dongle] polaridade backlight: LOW=ON");
+    }
+    return RESULT_OK;
+}
+
+uint8_t wrapper_dongle_sd_init() {
+    if (g_ctx.peripherals == nullptr) {
+        return RESULT_ERROR;
+    }
+
+    const bool ok = g_ctx.peripherals->beginSd(false);
+    if (!ok) {
+        printLine("[dongle] falha ao iniciar SD");
+        return RESULT_ERROR;
+    }
+
+    printLine("[dongle] SD inicializado");
+    return RESULT_OK;
+}
+
+uint8_t wrapper_dongle_sd_status() {
+    if (g_ctx.peripherals == nullptr) {
+        return RESULT_ERROR;
+    }
+
+    if (!g_ctx.peripherals->isSdReady()) {
+        printLine("[dongle] SD nao inicializado");
+        return RESULT_OK;
+    }
+
+    const String type = g_ctx.peripherals->sdCardTypeName();
+    const uint64_t total = g_ctx.peripherals->sdTotalMB();
+    const uint64_t used = g_ctx.peripherals->sdUsedMB();
+
+    char line[160] = {0};
+    std::snprintf(
+        line,
+        sizeof(line),
+        "[dongle] SD %s total=%lluMB usado=%lluMB",
+        type.c_str(),
+        static_cast<unsigned long long>(total),
+        static_cast<unsigned long long>(used)
+    );
+    printLine(line);
     return RESULT_OK;
 }
 
@@ -272,7 +417,7 @@ uint8_t wrapper_espnow_send_all(string command) {
 namespace ShellConfig {
 
 bool bind(const Context& context) {
-    if (context.shell == nullptr || context.espNow == nullptr || context.io == nullptr) {
+    if (context.shell == nullptr || context.espNow == nullptr || context.peripherals == nullptr || context.io == nullptr) {
         return false;
     }
 
@@ -295,6 +440,15 @@ uint8_t registerDefaultModules() {
 
     g_ctx.shell->add(wrapper_dongle_ping, "ping", "teste rapido local", "dongle");
     g_ctx.shell->add(wrapper_dongle_run, "run", "executa comando local (placeholder)", "dongle");
+    g_ctx.shell->add(wrapper_dongle_led, "led", "define LED RGB: <r>, <g>, <b>", "dongle");
+    g_ctx.shell->add(wrapper_dongle_led_off, "led_off", "desliga o LED", "dongle");
+    g_ctx.shell->add(wrapper_dongle_lcd, "lcd", "escreve texto no LCD: <texto>", "dongle");
+    g_ctx.shell->add(wrapper_dongle_lcd_clear, "lcd_clear", "limpa o LCD", "dongle");
+    g_ctx.shell->add(wrapper_dongle_lcd_bl, "lcd_bl", "backlight LCD: <0=ON|1=OFF>", "dongle");
+    g_ctx.shell->add(wrapper_dongle_lcd_bl_inv, "lcd_bl_inv", "polaridade backlight: <1=HIGH_ON|0=LOW_ON>", "dongle");
+    g_ctx.shell->add(wrapper_dongle_lcd_reinit, "lcd_reinit", "reinicializa o LCD", "dongle");
+    g_ctx.shell->add(wrapper_dongle_sd_init, "sd_init", "inicia o SD", "dongle");
+    g_ctx.shell->add(wrapper_dongle_sd_status, "sd_status", "mostra status do SD", "dongle");
 
     g_ctx.shell->add(wrapper_espnow_list, "list", "lista dispositivos cadastrados", "espnow");
     g_ctx.shell->add(wrapper_espnow_add, "add", "adiciona peer: <mac>, <nome>, <descricao>", "espnow");
