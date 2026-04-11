@@ -10,6 +10,7 @@ namespace {
 using std::string;
 
 ShellConfig::Context g_ctx = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+string g_commandOutputBuffer;
 
 string trimCopy(const string& text) {
     const auto first = std::find_if_not(text.begin(), text.end(), [](unsigned char ch) {
@@ -124,6 +125,9 @@ uint16_t lcdColorForLine(const string& text) {
 }
 
 void printLine(const string& text) {
+    g_commandOutputBuffer += text;
+    g_commandOutputBuffer += "\n";
+
     if (g_ctx.io != nullptr) {
         g_ctx.io->println(text.c_str());
     }
@@ -184,6 +188,7 @@ uint8_t wrapper_help_e() {
     printLine("Exemplo local LED: dongle -led 255, 0, 0");
     printLine("Exemplo espnow unicast: espnow -send_to 1, \"dongle -run status\"");
     printLine("Exemplo espnow broadcast: espnow -send_to \"dongle -run status\"");
+    printLine("Editar peer: espnow -update 1, \"nome novo\", \"descricao nova\"");
     printLine("Banco sqlite no SD: database -status | database -tables | database -read peers, 20");
     return RESULT_OK;
 }
@@ -560,6 +565,32 @@ uint8_t wrapper_espnow_remove_mac(string macText) {
     return RESULT_OK;
 }
 
+uint8_t wrapper_espnow_update(int32_t deviceNumber, string name, string description) {
+    if (g_ctx.espNow == nullptr || deviceNumber <= 0) {
+        return RESULT_ERROR;
+    }
+
+    const size_t index = static_cast<size_t>(deviceNumber - 1);
+    const string safeName = stripOuterQuotes(name);
+    const string safeDescription = stripOuterQuotes(description);
+
+    const bool ok = g_ctx.espNow->updateDeviceByIndex(index, safeName.c_str(), safeDescription.c_str());
+    if (!ok) {
+        printLine("[espnow] indice invalido para update");
+        return RESULT_ERROR;
+    }
+
+    EspNowManager::deviceInfo updated = {};
+    if (g_ctx.espNow->deviceAt(index, updated) && g_ctx.database != nullptr && g_ctx.database->isReady()) {
+        if (!g_ctx.database->updatePeerMetadata(updated.mac, safeName.c_str(), safeDescription.c_str())) {
+            printLine("[database] aviso: peer atualizado em memoria, mas nao persistido");
+        }
+    }
+
+    printLine("[espnow] peer atualizado");
+    return RESULT_OK;
+}
+
 uint8_t wrapper_espnow_send_to(int32_t deviceNumber, string command) {
     if (g_ctx.espNow == nullptr || deviceNumber <= 0) {
         return RESULT_ERROR;
@@ -575,14 +606,21 @@ uint8_t wrapper_espnow_send_to(int32_t deviceNumber, string command) {
     std::strncpy(outgoing.msg, msg.c_str(), sizeof(outgoing.msg) - 1);
     outgoing.msg[sizeof(outgoing.msg) - 1] = '\0';
 
-    const bool ok = g_ctx.espNow->sendToDevice(index, outgoing);
-    if (!ok) {
-        printLine("[espnow] falha ao enviar para dispositivo especifico");
+    bool delivered = false;
+    const bool gotStatus = g_ctx.espNow->sendToDeviceWithStatus(index, outgoing, delivered, 700);
+
+    EspNowManager::deviceInfo target = {};
+    if (g_ctx.database != nullptr && g_ctx.database->isReady() && g_ctx.espNow->deviceAt(index, target)) {
+        g_ctx.database->logOutgoingEspNow(target.mac, outgoing, gotStatus && delivered);
+    }
+
+    if (!gotStatus) {
+        printLine("[espnow] status=false (sem callback/timeout)");
         return RESULT_ERROR;
     }
 
-    printLine("[espnow] mensagem enviada para dispositivo especifico");
-    return RESULT_OK;
+    printLine(delivered ? "[espnow] status=true" : "[espnow] status=false");
+    return delivered ? RESULT_OK : RESULT_ERROR;
 }
 
 uint8_t wrapper_espnow_send_all(string command) {
@@ -598,14 +636,27 @@ uint8_t wrapper_espnow_send_all(string command) {
     std::strncpy(outgoing.msg, msg.c_str(), sizeof(outgoing.msg) - 1);
     outgoing.msg[sizeof(outgoing.msg) - 1] = '\0';
 
-    const bool ok = g_ctx.espNow->sendToAll(outgoing);
-    if (!ok) {
-        printLine("[espnow] falha ao enviar em broadcast");
+    size_t deliveredCount = 0;
+    size_t triedCount = 0;
+    const bool attempted = g_ctx.espNow->sendToAllWithStatus(outgoing, deliveredCount, triedCount, 700);
+
+    if (!attempted || triedCount == 0) {
+        printLine("[espnow] status=false (nenhum peer/timeout)");
         return RESULT_ERROR;
     }
 
-    printLine("[espnow] mensagem enviada para todos os dispositivos");
-    return RESULT_OK;
+    char line[120] = {0};
+    std::snprintf(
+        line,
+        sizeof(line),
+        "[espnow] status=%s delivered=%u/%u",
+        (deliveredCount == triedCount) ? "true" : "false",
+        static_cast<unsigned>(deliveredCount),
+        static_cast<unsigned>(triedCount)
+    );
+    printLine(line);
+
+    return (deliveredCount == triedCount) ? RESULT_OK : RESULT_ERROR;
 }
 
 uint8_t wrapper_database_init() {
@@ -752,6 +803,7 @@ uint8_t registerDefaultModules() {
     g_ctx.shell->add(wrapper_espnow_add, "add", "adiciona peer: <mac>, <nome>, <descricao>", "espnow");
     g_ctx.shell->add(wrapper_espnow_remove, "remove", "remove peer por indice: <numero>", "espnow");
     g_ctx.shell->add(wrapper_espnow_remove_mac, "remove_mac", "remove peer por mac: <mac>", "espnow");
+    g_ctx.shell->add(wrapper_espnow_update, "update", "atualiza peer: <numero>, <nome>, <descricao>", "espnow");
     g_ctx.shell->add(wrapper_espnow_send_to, "send_to", "envia para indice: <numero>, <comando>", "espnow");
     g_ctx.shell->add(wrapper_espnow_send_all, "send_all", "envia para todos: <comando>", "espnow");
 
@@ -772,12 +824,29 @@ std::string runLine(const std::string& command) {
     }
 
     const std::string normalized = normalizeCommand(command);
+    g_commandOutputBuffer.clear();
+
+    const std::string output = g_ctx.shell->run_line_command(normalized);
 
     if (g_ctx.database != nullptr && g_ctx.database->isReady()) {
-        g_ctx.database->logCommand(normalized.c_str(), "serial");
+        std::string persistedOutput = g_commandOutputBuffer;
+        if (!output.empty()) {
+            if (!persistedOutput.empty()) {
+                persistedOutput += "\n";
+            }
+            persistedOutput += output;
+        }
+
+        if (persistedOutput.empty()) {
+            persistedOutput = "(sem saida textual)";
+        }
+
+        g_ctx.database->logCommandWithOutput(normalized.c_str(), persistedOutput.c_str(), "serial");
     }
 
-    return g_ctx.shell->run_line_command(normalized);
+    g_commandOutputBuffer.clear();
+
+    return output;
 }
 
 } // namespace ShellConfig

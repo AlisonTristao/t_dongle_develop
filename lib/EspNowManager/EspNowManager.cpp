@@ -13,7 +13,12 @@ EspNowManager::EspNowManager()
       channel_(0),
       encrypt_(false),
       receiveCallback_(nullptr),
-      sendCallback_(nullptr) {
+    sendCallback_(nullptr),
+    sendWaitPending_(false),
+    sendWaitCompleted_(false),
+    sendWaitStatus_(ESP_NOW_SEND_FAIL),
+    sendWaitMac_{0, 0, 0, 0, 0, 0},
+    sendWaitHasMac_(false) {
 }
 
 // Initialize Wi-Fi station mode and register ESP-NOW callbacks.
@@ -115,6 +120,27 @@ bool EspNowManager::removeDeviceByMac(const uint8_t mac[6]) {
     return removeDeviceByIndex(static_cast<size_t>(index));
 }
 
+// Update one device metadata by index.
+bool EspNowManager::updateDeviceByIndex(size_t index, const char* name, const char* description) {
+    if (index >= deviceCount_) {
+        return false;
+    }
+
+    copyText(devices_[index].name, sizeof(devices_[index].name), name);
+    copyText(devices_[index].description, sizeof(devices_[index].description), description);
+    return true;
+}
+
+// Update one device metadata by MAC.
+bool EspNowManager::updateDeviceByMac(const uint8_t mac[6], const char* name, const char* description) {
+    const int index = findDeviceIndexByMac(mac);
+    if (index < 0) {
+        return false;
+    }
+
+    return updateDeviceByIndex(static_cast<size_t>(index), name, description);
+}
+
 // Remove all devices from both local storage and ESP-NOW peer table.
 void EspNowManager::clearDevices() {
     if (initialized_) {
@@ -163,6 +189,11 @@ size_t EspNowManager::copyDeviceList(deviceInfo* outList, size_t maxItems) const
     return total;
 }
 
+// Public lookup helper for MAC address.
+int EspNowManager::deviceIndexByMac(const uint8_t mac[6]) const {
+    return findDeviceIndexByMac(mac);
+}
+
 // Send one message to every registered device.
 bool EspNowManager::sendToAll(const message& outgoing) const {
     if (!initialized_ || deviceCount_ == 0) {
@@ -195,6 +226,85 @@ bool EspNowManager::sendToMac(const uint8_t mac[6], const message& outgoing) con
     }
 
     return esp_now_send(mac, reinterpret_cast<const uint8_t*>(&outgoing), sizeof(outgoing)) == ESP_OK;
+}
+
+// Send to one index and wait for callback delivery status.
+bool EspNowManager::sendToDeviceWithStatus(size_t index, const message& outgoing, bool& outDelivered, uint32_t timeoutMs) const {
+    outDelivered = false;
+    if (index >= deviceCount_) {
+        return false;
+    }
+
+    return sendToMacWithStatus(devices_[index].mac, outgoing, outDelivered, timeoutMs);
+}
+
+// Send to one MAC and wait for callback delivery status.
+bool EspNowManager::sendToMacWithStatus(const uint8_t mac[6], const message& outgoing, bool& outDelivered, uint32_t timeoutMs) const {
+    outDelivered = false;
+    if (!initialized_ || mac == nullptr) {
+        return false;
+    }
+
+    sendWaitPending_ = true;
+    sendWaitCompleted_ = false;
+    sendWaitStatus_ = ESP_NOW_SEND_FAIL;
+    memcpy(sendWaitMac_, mac, sizeof(sendWaitMac_));
+    sendWaitHasMac_ = true;
+
+    if (esp_now_send(mac, reinterpret_cast<const uint8_t*>(&outgoing), sizeof(outgoing)) != ESP_OK) {
+        sendWaitPending_ = false;
+        sendWaitHasMac_ = false;
+        return false;
+    }
+
+    const uint32_t start = millis();
+    while (sendWaitPending_) {
+        if ((millis() - start) >= timeoutMs) {
+            sendWaitPending_ = false;
+            sendWaitHasMac_ = false;
+            return false;
+        }
+
+        delay(1);
+    }
+
+    sendWaitHasMac_ = false;
+    if (!sendWaitCompleted_) {
+        return false;
+    }
+
+    outDelivered = (sendWaitStatus_ == ESP_NOW_SEND_SUCCESS);
+    return true;
+}
+
+// Send to all peers and aggregate delivery status.
+bool EspNowManager::sendToAllWithStatus(
+    const message& outgoing,
+    size_t& outDeliveredCount,
+    size_t& outTriedCount,
+    uint32_t timeoutMs
+) const {
+    outDeliveredCount = 0;
+    outTriedCount = 0;
+
+    if (!initialized_ || deviceCount_ == 0) {
+        return false;
+    }
+
+    for (size_t i = 0; i < deviceCount_; ++i) {
+        bool delivered = false;
+        const bool gotStatus = sendToDeviceWithStatus(i, outgoing, delivered, timeoutMs);
+        if (!gotStatus) {
+            continue;
+        }
+
+        ++outTriedCount;
+        if (delivered) {
+            ++outDeliveredCount;
+        }
+    }
+
+    return outTriedCount > 0;
 }
 
 // Register high-level receive callback.
@@ -235,7 +345,19 @@ void EspNowManager::handleReceiveStatic(const uint8_t* mac, const uint8_t* incom
 
 // Dispatch low-level send result to user callback.
 void EspNowManager::handleSendStatic(const uint8_t* mac, esp_now_send_status_t status) {
-    if (activeInstance_ == nullptr || activeInstance_->sendCallback_ == nullptr) {
+    if (activeInstance_ == nullptr) {
+        return;
+    }
+
+    if (activeInstance_->sendWaitPending_ && activeInstance_->sendWaitHasMac_ && mac != nullptr) {
+        if (memcmp(activeInstance_->sendWaitMac_, mac, 6) == 0) {
+            activeInstance_->sendWaitStatus_ = status;
+            activeInstance_->sendWaitCompleted_ = true;
+            activeInstance_->sendWaitPending_ = false;
+        }
+    }
+
+    if (activeInstance_->sendCallback_ == nullptr) {
         return;
     }
 

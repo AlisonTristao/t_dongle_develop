@@ -5,6 +5,7 @@
 
 #include <cctype>
 #include <cstdio>
+#include <ctime>
 
 namespace {
 
@@ -23,6 +24,40 @@ CREATE TABLE IF NOT EXISTS command_log (
     command TEXT NOT NULL,
     source TEXT NOT NULL DEFAULT 'serial',
     created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+
+CREATE TABLE IF NOT EXISTS command_log_output (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    log_id INTEGER NOT NULL,
+    output TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    FOREIGN KEY(log_id) REFERENCES command_log(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS espnow_incoming_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    peer_id INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    payload_type INTEGER NOT NULL DEFAULT 0,
+    received_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    FOREIGN KEY(peer_id) REFERENCES peers(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS espnow_outgoing_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    peer_id INTEGER,
+    mac TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    payload_type INTEGER NOT NULL DEFAULT 0,
+    delivered INTEGER NOT NULL DEFAULT 0,
+    sent_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    FOREIGN KEY(peer_id) REFERENCES peers(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS boot_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reason TEXT NOT NULL,
+    boot_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
 
 CREATE TABLE IF NOT EXISTS kv_store (
@@ -118,6 +153,12 @@ bool DatabaseStore::begin(EspNowManager& espNow, Stream* io) {
         return false;
     }
 
+    if (!applyRuntimeMigrations()) {
+        closeDatabase();
+        logLine("[database] falha ao aplicar migracoes da base");
+        return false;
+    }
+
     ready_ = true;
 
     if (!loadPeersFromDatabase(espNow)) {
@@ -151,23 +192,28 @@ bool DatabaseStore::upsertPeer(const uint8_t mac[6], const char* name, const cha
         return false;
     }
 
+    const int64_t now = currentEpochSeconds();
     const String macText = macToText(mac);
     const String peerName = (name != nullptr) ? name : "";
     const String peerDescription = (description != nullptr) ? description : "";
 
     String sql;
-    sql.reserve(320);
-    sql += "INSERT INTO peers(mac,name,description,updated_at) VALUES('";
+    sql.reserve(420);
+    sql += "INSERT INTO peers(mac,name,description,created_at,updated_at) VALUES('";
     sql += escapeSqlText(macText);
     sql += "','";
     sql += escapeSqlText(peerName);
     sql += "','";
     sql += escapeSqlText(peerDescription);
-    sql += "',strftime('%s','now')) ";
+    sql += "',";
+    sql += String(static_cast<long long>(now));
+    sql += ",";
+    sql += String(static_cast<long long>(now));
+    sql += ") ";
     sql += "ON CONFLICT(mac) DO UPDATE SET ";
     sql += "name=excluded.name, ";
     sql += "description=excluded.description, ";
-    sql += "updated_at=strftime('%s','now');";
+    sql += "updated_at=excluded.updated_at;";
 
     return executeNoResult(sql);
 }
@@ -184,20 +230,141 @@ bool DatabaseStore::removePeer(const uint8_t mac[6]) {
     return executeNoResult(sql);
 }
 
+bool DatabaseStore::updatePeerMetadata(const uint8_t mac[6], const char* name, const char* description) {
+    if (!ready_ || mac == nullptr) {
+        return false;
+    }
+
+    int32_t existingId = -1;
+    if (!peerIdByMac(mac, existingId)) {
+        return false;
+    }
+
+    const int64_t now = currentEpochSeconds();
+    String sql;
+    sql.reserve(320);
+    sql += "UPDATE peers SET name='";
+    sql += escapeSqlText(String((name != nullptr) ? name : ""));
+    sql += "', description='";
+    sql += escapeSqlText(String((description != nullptr) ? description : ""));
+    sql += "', updated_at=";
+    sql += String(static_cast<long long>(now));
+    sql += " WHERE mac='";
+    sql += escapeSqlText(macToText(mac));
+    sql += "';";
+
+    return executeNoResult(sql);
+}
+
 bool DatabaseStore::logCommand(const char* command, const char* source) {
     if (!ready_ || command == nullptr || command[0] == '\0') {
         return false;
     }
 
+    return logCommandWithOutput(command, "", source);
+}
+
+bool DatabaseStore::logCommandWithOutput(const char* command, const char* output, const char* source) {
+    if (!ready_ || command == nullptr || command[0] == '\0') {
+        return false;
+    }
+
+    const int64_t now = currentEpochSeconds();
     const String sourceText = (source != nullptr) ? source : "serial";
+    const String outputText = (output != nullptr) ? output : "";
 
     String sql;
-    sql.reserve(320);
+    sql.reserve(760);
     sql += "INSERT INTO command_log(command,source,created_at) VALUES('";
     sql += escapeSqlText(String(command));
     sql += "','";
     sql += escapeSqlText(sourceText);
-    sql += "',strftime('%s','now'));";
+    sql += "',";
+    sql += String(static_cast<long long>(now));
+    sql += ");";
+    sql += "INSERT INTO command_log_output(log_id,output,created_at) VALUES(last_insert_rowid(),'";
+    sql += escapeSqlText(outputText);
+    sql += "',";
+    sql += String(static_cast<long long>(now));
+    sql += ");";
+
+    return executeNoResult(sql);
+}
+
+bool DatabaseStore::logIncomingEspNow(const uint8_t mac[6], const EspNowManager::message& incoming) {
+    if (!ready_ || mac == nullptr) {
+        return false;
+    }
+
+    int32_t peerId = -1;
+    if (!ensurePeerExistsWithDefaults(mac, peerId)) {
+        return false;
+    }
+
+    const int64_t now = currentEpochSeconds();
+    String sql;
+    sql.reserve(640);
+    sql += "INSERT INTO espnow_incoming_log(peer_id,payload,payload_type,received_at) VALUES(";
+    sql += String(static_cast<long>(peerId));
+    sql += ",'";
+    sql += escapeSqlText(String(incoming.msg));
+    sql += "',";
+    sql += String(static_cast<int>(incoming.type));
+    sql += ",";
+    sql += String(static_cast<long long>(now));
+    sql += ");";
+
+    return executeNoResult(sql);
+}
+
+bool DatabaseStore::logOutgoingEspNow(const uint8_t mac[6], const EspNowManager::message& outgoing, bool delivered) {
+    if (!ready_ || mac == nullptr) {
+        return false;
+    }
+
+    int32_t peerId = -1;
+    if (!peerIdByMac(mac, peerId)) {
+        ensurePeerExistsWithDefaults(mac, peerId);
+    }
+
+    const int64_t now = currentEpochSeconds();
+    String sql;
+    sql.reserve(760);
+    sql += "INSERT INTO espnow_outgoing_log(peer_id,mac,payload,payload_type,delivered,sent_at) VALUES(";
+    if (peerId > 0) {
+        sql += String(static_cast<long>(peerId));
+    } else {
+        sql += "NULL";
+    }
+    sql += ",'";
+    sql += escapeSqlText(macToText(mac));
+    sql += "','";
+    sql += escapeSqlText(String(outgoing.msg));
+    sql += "',";
+    sql += String(static_cast<int>(outgoing.type));
+    sql += ",";
+    sql += delivered ? "1" : "0";
+    sql += ",";
+    sql += String(static_cast<long long>(now));
+    sql += ");";
+
+    return executeNoResult(sql);
+}
+
+bool DatabaseStore::logBootEvent(const char* reason) {
+    if (!ready_) {
+        return false;
+    }
+
+    const int64_t now = currentEpochSeconds();
+
+    String sql;
+    sql.reserve(280);
+    sql += "INSERT INTO boot_events(reason,boot_at) VALUES('";
+    sql += escapeSqlText(String((reason != nullptr) ? reason : "power_on"));
+    sql += "',";
+    sql += String(static_cast<long long>(now));
+    sql += ");";
 
     return executeNoResult(sql);
 }
@@ -232,17 +399,26 @@ bool DatabaseStore::getStatus(String& outText) {
 
     int32_t peerRows = -1;
     int32_t commandRows = -1;
+    int32_t incomingRows = -1;
+    int32_t outgoingRows = -1;
+    int32_t bootRows = -1;
     const bool peersOk = querySingleInt("SELECT COUNT(*) FROM peers;", peerRows);
     const bool commandsOk = querySingleInt("SELECT COUNT(*) FROM command_log;", commandRows);
+    const bool incomingOk = querySingleInt("SELECT COUNT(*) FROM espnow_incoming_log;", incomingRows);
+    const bool outgoingOk = querySingleInt("SELECT COUNT(*) FROM espnow_outgoing_log;", outgoingRows);
+    const bool bootsOk = querySingleInt("SELECT COUNT(*) FROM boot_events;", bootRows);
 
-    char line[200] = {0};
+    char line[280] = {0};
     std::snprintf(
         line,
         sizeof(line),
-        "[database] pronto arquivo=%s peers=%ld comandos=%ld",
+        "[database] pronto arquivo=%s peers=%ld comandos=%ld rx=%ld tx=%ld boots=%ld",
         kSqliteDatabasePath,
         peersOk ? static_cast<long>(peerRows) : -1L,
-        commandsOk ? static_cast<long>(commandRows) : -1L
+        commandsOk ? static_cast<long>(commandRows) : -1L,
+        incomingOk ? static_cast<long>(incomingRows) : -1L,
+        outgoingOk ? static_cast<long>(outgoingRows) : -1L,
+        bootsOk ? static_cast<long>(bootRows) : -1L
     );
 
     outText = String(line);
@@ -396,6 +572,93 @@ bool DatabaseStore::applyBootstrapScript() {
     return executeNoResult(script);
 }
 
+bool DatabaseStore::applyRuntimeMigrations() {
+    // Keep migrations idempotent, so existing SD cards are upgraded safely.
+    return executeNoResult(
+        "CREATE TABLE IF NOT EXISTS command_log_output ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "log_id INTEGER NOT NULL,"
+        "output TEXT NOT NULL,"
+        "created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),"
+        "FOREIGN KEY(log_id) REFERENCES command_log(id) ON DELETE CASCADE"
+        ");"
+        "CREATE TABLE IF NOT EXISTS espnow_incoming_log ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "peer_id INTEGER NOT NULL,"
+        "payload TEXT NOT NULL,"
+        "payload_type INTEGER NOT NULL DEFAULT 0,"
+        "received_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),"
+        "FOREIGN KEY(peer_id) REFERENCES peers(id) ON DELETE CASCADE"
+        ");"
+        "CREATE TABLE IF NOT EXISTS espnow_outgoing_log ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "peer_id INTEGER,"
+        "mac TEXT NOT NULL,"
+        "payload TEXT NOT NULL,"
+        "payload_type INTEGER NOT NULL DEFAULT 0,"
+        "delivered INTEGER NOT NULL DEFAULT 0,"
+        "sent_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),"
+        "FOREIGN KEY(peer_id) REFERENCES peers(id) ON DELETE SET NULL"
+        ");"
+        "CREATE TABLE IF NOT EXISTS boot_events ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "reason TEXT NOT NULL,"
+        "boot_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_peers_mac ON peers(mac);"
+        "CREATE INDEX IF NOT EXISTS idx_incoming_peer ON espnow_incoming_log(peer_id);"
+        "CREATE INDEX IF NOT EXISTS idx_outgoing_peer ON espnow_outgoing_log(peer_id);"
+        "CREATE INDEX IF NOT EXISTS idx_log_output_log_id ON command_log_output(log_id);"
+    );
+}
+
+bool DatabaseStore::peerIdByMac(const uint8_t mac[6], int32_t& outPeerId) {
+    if (!ready_ || mac == nullptr) {
+        return false;
+    }
+
+    String sql = "SELECT id FROM peers WHERE mac='";
+    sql += escapeSqlText(macToText(mac));
+    sql += "' LIMIT 1;";
+
+    return querySingleInt(sql, outPeerId);
+}
+
+bool DatabaseStore::ensurePeerExistsWithDefaults(const uint8_t mac[6], int32_t& outPeerId) {
+    outPeerId = -1;
+    if (!ready_ || mac == nullptr) {
+        return false;
+    }
+
+    if (peerIdByMac(mac, outPeerId)) {
+        return true;
+    }
+
+    char defaultName[24] = {0};
+    std::snprintf(defaultName, sizeof(defaultName), "peer-%02X%02X", mac[4], mac[5]);
+
+    const int64_t now = currentEpochSeconds();
+    String sql;
+    sql.reserve(360);
+    sql += "INSERT OR IGNORE INTO peers(mac,name,description,created_at,updated_at) VALUES('";
+    sql += escapeSqlText(macToText(mac));
+    sql += "','";
+    sql += escapeSqlText(String(defaultName));
+    sql += "','";
+    sql += "adicionado automaticamente por RX ESP-NOW";
+    sql += "',";
+    sql += String(static_cast<long long>(now));
+    sql += ",";
+    sql += String(static_cast<long long>(now));
+    sql += ");";
+
+    if (!executeNoResult(sql)) {
+        return false;
+    }
+
+    return peerIdByMac(mac, outPeerId);
+}
+
 bool DatabaseStore::loadPeersFromDatabase(EspNowManager& espNow) {
     if (!ready_ || db_ == nullptr) {
         return false;
@@ -536,6 +799,15 @@ bool DatabaseStore::queryToText(const String& sql, size_t maxRows, String& outTe
     }
 
     return true;
+}
+
+int64_t DatabaseStore::currentEpochSeconds() {
+    const time_t now = time(nullptr);
+    if (now > 0) {
+        return static_cast<int64_t>(now);
+    }
+
+    return static_cast<int64_t>(millis() / 1000ULL);
 }
 
 void DatabaseStore::logLine(const String& text) const {

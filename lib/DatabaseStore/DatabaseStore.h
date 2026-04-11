@@ -47,9 +47,34 @@ public:
     bool removePeer(const uint8_t mac[6]);
 
     /**
+     * @brief Updates peer metadata by MAC.
+     */
+    bool updatePeerMetadata(const uint8_t mac[6], const char* name, const char* description);
+
+    /**
      * @brief Logs one executed command in command_log table.
      */
     bool logCommand(const char* command, const char* source = "serial");
+
+    /**
+     * @brief Logs command and stores output in related table.
+     */
+    bool logCommandWithOutput(const char* command, const char* output, const char* source = "serial");
+
+    /**
+     * @brief Stores one incoming ESP-NOW payload and relates it to peers table.
+     */
+    bool logIncomingEspNow(const uint8_t mac[6], const EspNowManager::message& incoming);
+
+    /**
+     * @brief Stores one outgoing ESP-NOW payload with delivery status.
+     */
+    bool logOutgoingEspNow(const uint8_t mac[6], const EspNowManager::message& outgoing, bool delivered);
+
+    /**
+     * @brief Stores one boot event timestamp.
+     */
+    bool logBootEvent(const char* reason = "power_on");
 
     /**
      * @brief Persists all peers currently registered in EspNowManager.
@@ -96,11 +121,16 @@ private:
 
     bool ensureBootstrapAssets();
     bool applyBootstrapScript();
+    bool applyRuntimeMigrations();
     bool loadPeersFromDatabase(EspNowManager& espNow);
+    bool ensurePeerExistsWithDefaults(const uint8_t mac[6], int32_t& outPeerId);
+    bool peerIdByMac(const uint8_t mac[6], int32_t& outPeerId);
 
     bool executeNoResult(const String& sql);
     bool querySingleInt(const String& sql, int32_t& outValue);
     bool queryToText(const String& sql, size_t maxRows, String& outText);
+
+    static int64_t currentEpochSeconds();
 
     void logLine(const String& text) const;
 
