@@ -1,4 +1,5 @@
 #include "shell_config.h"
+#include "error_codes.h"
 
 #include <algorithm>
 #include <cctype>
@@ -250,11 +251,38 @@ void resolveDefaultBroadcastMac(uint8_t outMac[6]) {
     }
 }
 
+uint8_t failWithCode(AppError::Code code, const string& detail) {
+    char line[320] = {0};
+    std::snprintf(
+        line,
+        sizeof(line),
+        "erro(%u/%s) %s",
+        static_cast<unsigned>(AppError::value(code)),
+        AppError::name(code),
+        detail.c_str()
+    );
+    printLine(line);
+    return RESULT_ERROR;
+}
+
+void warnWithCode(AppError::Code code, const string& detail) {
+    char line[320] = {0};
+    std::snprintf(
+        line,
+        sizeof(line),
+        "aviso(%u/%s) %s",
+        static_cast<unsigned>(AppError::value(code)),
+        AppError::name(code),
+        detail.c_str()
+    );
+    printLine(line);
+}
+
 uint8_t wrapper_espnow_send_all(string command);
 
 uint8_t wrapper_help_h() {
     if (g_ctx.shell == nullptr) {
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::SHELL_NOT_READY, "shell nao configurada para help -h");
     }
 
     printLine(g_ctx.shell->get_help(""));
@@ -263,7 +291,7 @@ uint8_t wrapper_help_h() {
 
 uint8_t wrapper_help_l(string module = "") {
     if (g_ctx.shell == nullptr) {
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::SHELL_NOT_READY, "shell nao configurada para help -l");
     }
 
     printLine(g_ctx.shell->get_help(module));
@@ -309,8 +337,7 @@ uint8_t wrapper_dongle_clock() {
 
     std::tm localTime = {};
     if (localtime_r(&nowEpoch, &localTime) == nullptr) {
-        printLine("[dongle] falha ao ler horario local");
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::RTC_READ_FAILED, "falha ao ler horario local");
     }
 
     char dateTime[32] = {0};
@@ -331,16 +358,14 @@ uint8_t wrapper_dongle_clock() {
 uint8_t wrapper_dongle_set_clock(string dateTimeText) {
     time_t epoch = 0;
     if (!parseDateTimeText(dateTimeText, epoch)) {
-        printLine("[dongle] formato invalido. Use: YYYY-MM-DD HH:MM:SS");
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::CLOCK_FORMAT_INVALID, "formato invalido. Use: YYYY-MM-DD HH:MM:SS");
     }
 
     timeval tv = {};
     tv.tv_sec = epoch;
     tv.tv_usec = 0;
     if (settimeofday(&tv, nullptr) != 0) {
-        printLine("[dongle] falha ao ajustar clock");
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::RTC_SET_FAILED, "falha ao ajustar clock");
     }
 
     std::tm adjusted = {};
@@ -365,7 +390,7 @@ uint8_t wrapper_dongle_set_clock(string dateTimeText) {
 
 uint8_t wrapper_dongle_led(int32_t r, int32_t g, int32_t b) {
     if (g_ctx.peripherals == nullptr) {
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::PERIPHERALS_NOT_READY, "perifericos indisponiveis para comando led");
     }
 
     g_ctx.peripherals->setLedColor(clampByte(r), clampByte(g), clampByte(b));
@@ -375,7 +400,7 @@ uint8_t wrapper_dongle_led(int32_t r, int32_t g, int32_t b) {
 
 uint8_t wrapper_dongle_led_off() {
     if (g_ctx.peripherals == nullptr) {
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::PERIPHERALS_NOT_READY, "perifericos indisponiveis para comando led_off");
     }
 
     g_ctx.peripherals->ledOff();
@@ -385,7 +410,7 @@ uint8_t wrapper_dongle_led_off() {
 
 uint8_t wrapper_dongle_lcd(string text) {
     if (g_ctx.peripherals == nullptr) {
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::PERIPHERALS_NOT_READY, "perifericos indisponiveis para comando lcd");
     }
 
     const String content = String(stripOuterQuotes(text).c_str());
@@ -398,8 +423,7 @@ uint8_t wrapper_dongle_lcd(string text) {
 
     const bool ok = g_ctx.peripherals->writeLcd(content, true);
     if (!ok) {
-        printLine("[dongle] LCD nao inicializado");
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::LCD_NOT_READY, "LCD nao inicializado");
     }
 
     printLine("[dongle] texto escrito no LCD");
@@ -408,7 +432,7 @@ uint8_t wrapper_dongle_lcd(string text) {
 
 uint8_t wrapper_dongle_lcd_clear() {
     if (g_ctx.peripherals == nullptr) {
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::PERIPHERALS_NOT_READY, "perifericos indisponiveis para comando lcd_clear");
     }
 
     if (g_ctx.lcdTerminal != nullptr && g_ctx.lcdTerminal->isReady()) {
@@ -419,8 +443,7 @@ uint8_t wrapper_dongle_lcd_clear() {
 
     const bool ok = g_ctx.peripherals->clearLcd();
     if (!ok) {
-        printLine("[dongle] LCD nao inicializado");
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::LCD_NOT_READY, "LCD nao inicializado");
     }
 
     printLine("[dongle] LCD limpo");
@@ -429,7 +452,7 @@ uint8_t wrapper_dongle_lcd_clear() {
 
 uint8_t wrapper_dongle_lcd_bl(int32_t on) {
     if (g_ctx.peripherals == nullptr) {
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::PERIPHERALS_NOT_READY, "perifericos indisponiveis para comando lcd_bl");
     }
 
     const bool turnOn = (on == 0);
@@ -440,13 +463,12 @@ uint8_t wrapper_dongle_lcd_bl(int32_t on) {
 
 uint8_t wrapper_dongle_lcd_reinit() {
     if (g_ctx.peripherals == nullptr) {
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::PERIPHERALS_NOT_READY, "perifericos indisponiveis para comando lcd_reinit");
     }
 
     const bool ok = g_ctx.peripherals->reinitLcd(g_ctx.peripherals->lcdRotation());
     if (!ok) {
-        printLine("[dongle] falha ao reinicializar LCD");
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::LCD_REINIT_FAILED, "falha ao reinicializar LCD");
     }
 
     if (g_ctx.lcdTerminal != nullptr) {
@@ -459,7 +481,7 @@ uint8_t wrapper_dongle_lcd_reinit() {
 
 uint8_t wrapper_dongle_lcd_rot(int32_t rotation) {
     if (g_ctx.peripherals == nullptr) {
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::PERIPHERALS_NOT_READY, "perifericos indisponiveis para comando lcd_rot");
     }
 
     const int32_t normalized = ((rotation % 4) + 4) % 4;
@@ -477,7 +499,7 @@ uint8_t wrapper_dongle_lcd_rot(int32_t rotation) {
 
 uint8_t wrapper_dongle_lcd_rot_get() {
     if (g_ctx.peripherals == nullptr) {
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::PERIPHERALS_NOT_READY, "perifericos indisponiveis para comando lcd_rot_get");
     }
 
     char line[80] = {0};
@@ -493,7 +515,7 @@ uint8_t wrapper_dongle_lcd_rot_get() {
 
 uint8_t wrapper_dongle_lcd_bl_inv(int32_t activeHigh) {
     if (g_ctx.peripherals == nullptr) {
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::PERIPHERALS_NOT_READY, "perifericos indisponiveis para comando lcd_bl_inv");
     }
 
     g_ctx.peripherals->setLcdBacklightPolarity(activeHigh != 0);
@@ -507,13 +529,12 @@ uint8_t wrapper_dongle_lcd_bl_inv(int32_t activeHigh) {
 
 uint8_t wrapper_dongle_sd_init() {
     if (g_ctx.peripherals == nullptr) {
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::PERIPHERALS_NOT_READY, "perifericos indisponiveis para comando sd_init");
     }
 
     const bool ok = g_ctx.peripherals->beginSd(false);
     if (!ok) {
-        printLine("[dongle] falha ao iniciar SD (verifique cartao, contato e pull-ups)");
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::SD_INIT_FAILED, "falha ao iniciar SD (verifique cartao, contato e pull-ups)");
     }
 
     char line[120] = {0};
@@ -530,7 +551,7 @@ uint8_t wrapper_dongle_sd_init() {
 
 uint8_t wrapper_dongle_sd_status() {
     if (g_ctx.peripherals == nullptr) {
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::PERIPHERALS_NOT_READY, "perifericos indisponiveis para comando sd_status");
     }
 
     if (!g_ctx.peripherals->isSdReady()) {
@@ -558,13 +579,16 @@ uint8_t wrapper_dongle_sd_status() {
 }
 
 uint8_t wrapper_dongle_sd_wipe() {
-    if (g_ctx.peripherals == nullptr || g_ctx.espNow == nullptr) {
-        return RESULT_ERROR;
+    if (g_ctx.peripherals == nullptr) {
+        return failWithCode(AppError::Code::PERIPHERALS_NOT_READY, "perifericos indisponiveis para comando sd_wipe");
+    }
+
+    if (g_ctx.espNow == nullptr) {
+        return failWithCode(AppError::Code::ESPNOW_NOT_READY, "espnow indisponivel para rebuild do banco");
     }
 
     if (!g_ctx.peripherals->isSdReady()) {
-        printLine("[dongle] SD nao inicializado");
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::SD_NOT_READY, "SD nao inicializado");
     }
 
     if (g_ctx.database != nullptr && g_ctx.database->isReady()) {
@@ -573,25 +597,24 @@ uint8_t wrapper_dongle_sd_wipe() {
 
     const bool wipeOk = g_ctx.peripherals->wipeSdContents();
     if (!wipeOk) {
-        printLine("[dongle] falha ao apagar conteudo do SD");
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::SD_WIPE_FAILED, "falha ao apagar conteudo do SD");
     }
 
     const bool sdReinitOk = g_ctx.peripherals->beginSd(false);
     if (!sdReinitOk) {
-        printLine("[dongle] SD limpo, mas falhou reinit");
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::SD_REINIT_FAILED, "SD limpo, mas falhou reinit");
     }
 
     if (g_ctx.database != nullptr) {
         if (g_ctx.database->begin(*g_ctx.espNow, g_ctx.io)) {
-            g_ctx.database->syncPeersFromManager(*g_ctx.espNow);
+            if (!g_ctx.database->syncPeersFromManager(*g_ctx.espNow)) {
+                warnWithCode(AppError::Code::DATABASE_PEER_SYNC_FAILED, "database recriado, mas falhou ao sincronizar peers");
+            }
             printLine("[dongle] SD limpo e database recriado");
             return RESULT_OK;
         }
 
-        printLine("[dongle] SD limpo, mas falhou ao recriar database");
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::SD_DB_RECREATE_FAILED, "SD limpo, mas falhou ao recriar database");
     }
 
     printLine("[dongle] SD limpo");
@@ -600,7 +623,7 @@ uint8_t wrapper_dongle_sd_wipe() {
 
 uint8_t wrapper_espnow_list() {
     if (g_ctx.espNow == nullptr) {
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::ESPNOW_NOT_READY, "espnow indisponivel para comando list");
     }
 
     printLine("[000] todos - FF:FF:FF:FF:FF:FF (alias broadcast)");
@@ -644,13 +667,12 @@ uint8_t wrapper_espnow_list() {
 
 uint8_t wrapper_espnow_add(string macText, string name, string description) {
     if (g_ctx.espNow == nullptr) {
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::ESPNOW_NOT_READY, "espnow indisponivel para comando add");
     }
 
     uint8_t mac[6] = {0};
     if (!parseMacAddress(macText, mac)) {
-        printLine("[espnow] MAC invalido. Use formato AA:BB:CC:DD:EE:FF");
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::INVALID_MAC_FORMAT, "MAC invalido. Use formato AA:BB:CC:DD:EE:FF");
     }
 
     const bool ok = g_ctx.espNow->addDevice(
@@ -660,13 +682,12 @@ uint8_t wrapper_espnow_add(string macText, string name, string description) {
     );
 
     if (!ok) {
-        printLine("[espnow] falha ao adicionar dispositivo");
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::PEER_ADD_FAILED, "falha ao adicionar dispositivo");
     }
 
     if (g_ctx.database != nullptr && g_ctx.database->isReady()) {
         if (!g_ctx.database->upsertPeer(mac, stripOuterQuotes(name).c_str(), stripOuterQuotes(description).c_str())) {
-            printLine("[database] aviso: peer adicionado, mas nao persistido");
+            warnWithCode(AppError::Code::DATABASE_PEER_NOT_PERSISTED, "peer adicionado, mas nao persistido");
         }
     }
 
@@ -675,8 +696,12 @@ uint8_t wrapper_espnow_add(string macText, string name, string description) {
 }
 
 uint8_t wrapper_espnow_remove(int32_t deviceNumber) {
-    if (g_ctx.espNow == nullptr || deviceNumber <= 0) {
-        return RESULT_ERROR;
+    if (g_ctx.espNow == nullptr) {
+        return failWithCode(AppError::Code::ESPNOW_NOT_READY, "espnow indisponivel para comando remove");
+    }
+
+    if (deviceNumber <= 0) {
+        return failWithCode(AppError::Code::INVALID_DEVICE_INDEX, "indice invalido. Use valores >= 1");
     }
 
     const size_t index = static_cast<size_t>(deviceNumber - 1);
@@ -685,13 +710,12 @@ uint8_t wrapper_espnow_remove(int32_t deviceNumber) {
 
     const bool ok = g_ctx.espNow->removeDeviceByIndex(index);
     if (!ok) {
-        printLine("[espnow] indice invalido");
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::PEER_REMOVE_FAILED, "indice invalido");
     }
 
     if (hadDevice && g_ctx.database != nullptr && g_ctx.database->isReady()) {
         if (!g_ctx.database->removePeer(removed.mac)) {
-            printLine("[database] aviso: peer removido, mas persistencia nao atualizada");
+            warnWithCode(AppError::Code::DATABASE_PEER_REMOVE_NOT_PERSISTED, "peer removido, mas persistencia nao atualizada");
         }
     }
 
@@ -701,24 +725,22 @@ uint8_t wrapper_espnow_remove(int32_t deviceNumber) {
 
 uint8_t wrapper_espnow_remove_mac(string macText) {
     if (g_ctx.espNow == nullptr) {
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::ESPNOW_NOT_READY, "espnow indisponivel para comando remove_mac");
     }
 
     uint8_t mac[6] = {0};
     if (!parseMacAddress(macText, mac)) {
-        printLine("[espnow] MAC invalido. Use formato AA:BB:CC:DD:EE:FF");
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::INVALID_MAC_FORMAT, "MAC invalido. Use formato AA:BB:CC:DD:EE:FF");
     }
 
     const bool ok = g_ctx.espNow->removeDeviceByMac(mac);
     if (!ok) {
-        printLine("[espnow] MAC nao encontrado");
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::PEER_NOT_FOUND, "MAC nao encontrado");
     }
 
     if (g_ctx.database != nullptr && g_ctx.database->isReady()) {
         if (!g_ctx.database->removePeer(mac)) {
-            printLine("[database] aviso: peer removido, mas persistencia nao atualizada");
+            warnWithCode(AppError::Code::DATABASE_PEER_REMOVE_NOT_PERSISTED, "peer removido, mas persistencia nao atualizada");
         }
     }
 
@@ -727,8 +749,12 @@ uint8_t wrapper_espnow_remove_mac(string macText) {
 }
 
 uint8_t wrapper_espnow_update(int32_t deviceNumber, string name, string description) {
-    if (g_ctx.espNow == nullptr || deviceNumber <= 0) {
-        return RESULT_ERROR;
+    if (g_ctx.espNow == nullptr) {
+        return failWithCode(AppError::Code::ESPNOW_NOT_READY, "espnow indisponivel para comando update");
+    }
+
+    if (deviceNumber <= 0) {
+        return failWithCode(AppError::Code::INVALID_DEVICE_INDEX, "indice invalido. Use valores >= 1");
     }
 
     const size_t index = static_cast<size_t>(deviceNumber - 1);
@@ -737,14 +763,13 @@ uint8_t wrapper_espnow_update(int32_t deviceNumber, string name, string descript
 
     const bool ok = g_ctx.espNow->updateDeviceByIndex(index, safeName.c_str(), safeDescription.c_str());
     if (!ok) {
-        printLine("[espnow] indice invalido para update");
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::PEER_UPDATE_FAILED, "indice invalido para update");
     }
 
     EspNowManager::deviceInfo updated = {};
     if (g_ctx.espNow->deviceAt(index, updated) && g_ctx.database != nullptr && g_ctx.database->isReady()) {
         if (!g_ctx.database->updatePeerMetadata(updated.mac, safeName.c_str(), safeDescription.c_str())) {
-            printLine("[database] aviso: peer atualizado em memoria, mas nao persistido");
+            warnWithCode(AppError::Code::DATABASE_PEER_UPDATE_NOT_PERSISTED, "peer atualizado em memoria, mas nao persistido");
         }
     }
 
@@ -753,8 +778,12 @@ uint8_t wrapper_espnow_update(int32_t deviceNumber, string name, string descript
 }
 
 uint8_t wrapper_espnow_send_to(int32_t deviceNumber, string command) {
-    if (g_ctx.espNow == nullptr || deviceNumber < 0) {
-        return RESULT_ERROR;
+    if (g_ctx.espNow == nullptr) {
+        return failWithCode(AppError::Code::ESPNOW_NOT_READY, "espnow indisponivel para comando send_to");
+    }
+
+    if (deviceNumber < 0) {
+        return failWithCode(AppError::Code::INVALID_DEVICE_INDEX, "indice invalido. Use 000 ou valores >= 1");
     }
 
     EspNowManager::message outgoing = {};
@@ -777,8 +806,7 @@ uint8_t wrapper_espnow_send_to(int32_t deviceNumber, string command) {
         }
 
         if (!queued) {
-            printLine("[espnow] 000 status=false");
-            return RESULT_ERROR;
+            return failWithCode(AppError::Code::BROADCAST_QUEUE_FAILED, "000 status=false");
         }
 
         printLine("[espnow] 000 status=true");
@@ -796,17 +824,20 @@ uint8_t wrapper_espnow_send_to(int32_t deviceNumber, string command) {
     }
 
     if (!gotStatus) {
-        printLine("[espnow] status=false (sem callback/timeout)");
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::SEND_STATUS_TIMEOUT, "status=false (sem callback/timeout)");
     }
 
-    printLine(delivered ? "[espnow] status=true" : "[espnow] status=false");
-    return delivered ? RESULT_OK : RESULT_ERROR;
+    if (!delivered) {
+        return failWithCode(AppError::Code::SEND_DELIVERY_FAILED, "status=false");
+    }
+
+    printLine("[espnow] status=true");
+    return RESULT_OK;
 }
 
 uint8_t wrapper_espnow_send_all(string command) {
     if (g_ctx.espNow == nullptr) {
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::ESPNOW_NOT_READY, "espnow indisponivel para comando send_all");
     }
 
     EspNowManager::message outgoing = {};
@@ -831,8 +862,7 @@ uint8_t wrapper_espnow_send_all(string command) {
         }
 
         if (!queued) {
-            printLine("[espnow] status=false (nenhum peer e broadcast falhou)");
-            return RESULT_ERROR;
+            return failWithCode(AppError::Code::BROADCAST_QUEUE_FAILED, "status=false (nenhum peer e broadcast falhou)");
         }
 
         printLine("[espnow] status=true (broadcast 000)");
@@ -850,68 +880,94 @@ uint8_t wrapper_espnow_send_all(string command) {
     );
     printLine(line);
 
-    return (deliveredCount == triedCount) ? RESULT_OK : RESULT_ERROR;
+    if (deliveredCount != triedCount) {
+        return failWithCode(AppError::Code::SEND_PARTIAL_DELIVERY, "entrega parcial no envio para todos os peers");
+    }
+
+    return RESULT_OK;
 }
 
 uint8_t wrapper_database_init() {
-    if (g_ctx.database == nullptr || g_ctx.espNow == nullptr) {
-        return RESULT_ERROR;
+    if (g_ctx.database == nullptr) {
+        return failWithCode(AppError::Code::DATABASE_NOT_READY, "database indisponivel para comando init");
+    }
+
+    if (g_ctx.espNow == nullptr) {
+        return failWithCode(AppError::Code::ESPNOW_NOT_READY, "espnow indisponivel para bootstrap do database");
     }
 
     if (g_ctx.database->begin(*g_ctx.espNow, g_ctx.io)) {
-        g_ctx.database->syncPeersFromManager(*g_ctx.espNow);
-        printLine("[database] inicializado e sincronizado com peers");
+        const bool syncOk = g_ctx.database->syncPeersFromManager(*g_ctx.espNow);
+        if (!syncOk) {
+            warnWithCode(AppError::Code::DATABASE_PEER_SYNC_FAILED, "database inicializado, mas falhou ao sincronizar peers");
+        }
+
+        if (syncOk) {
+            printLine("[database] inicializado e sincronizado com peers");
+        } else {
+            printLine("[database] inicializado (sync de peers com aviso)");
+        }
         return RESULT_OK;
     }
 
-    printLine("[database] falha ao inicializar (confira SD e sqlite)");
-    return RESULT_ERROR;
+    return failWithCode(AppError::Code::DATABASE_INIT_FAILED, "falha ao inicializar (confira SD e sqlite)");
 }
 
 uint8_t wrapper_database_status() {
     if (g_ctx.database == nullptr) {
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::DATABASE_NOT_READY, "database indisponivel para comando status");
     }
 
     String status;
     const bool ok = g_ctx.database->getStatus(status);
     printLine(status.c_str());
-    return ok ? RESULT_OK : RESULT_ERROR;
+    if (!ok) {
+        return failWithCode(AppError::Code::DATABASE_QUERY_FAILED, "falha ao consultar status do database");
+    }
+
+    return RESULT_OK;
 }
 
 uint8_t wrapper_database_tables() {
     if (g_ctx.database == nullptr) {
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::DATABASE_NOT_READY, "database indisponivel para comando tables");
     }
 
     String output;
     const bool ok = g_ctx.database->listTables(output);
     printLine(output.c_str());
-    return ok ? RESULT_OK : RESULT_ERROR;
+    if (!ok) {
+        return failWithCode(AppError::Code::DATABASE_QUERY_FAILED, "falha ao listar tabelas");
+    }
+
+    return RESULT_OK;
 }
 
 uint8_t wrapper_database_read(string tableName, int32_t limit = 20) {
     if (g_ctx.database == nullptr) {
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::DATABASE_NOT_READY, "database indisponivel para comando read");
     }
 
     String output;
     const size_t boundedLimit = (limit > 0) ? static_cast<size_t>(limit) : 20U;
     const bool ok = g_ctx.database->readTable(stripOuterQuotes(tableName).c_str(), boundedLimit, output);
     printLine(output.c_str());
-    return ok ? RESULT_OK : RESULT_ERROR;
+    if (!ok) {
+        return failWithCode(AppError::Code::DATABASE_QUERY_FAILED, "falha ao ler tabela");
+    }
+
+    return RESULT_OK;
 }
 
 uint8_t wrapper_database_drop(string tableName) {
     if (g_ctx.database == nullptr) {
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::DATABASE_NOT_READY, "database indisponivel para comando drop");
     }
 
     const String safeName = String(stripOuterQuotes(tableName).c_str());
     const bool ok = g_ctx.database->dropTable(safeName);
     if (!ok) {
-        printLine("[database] falha ao remover tabela");
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::DATABASE_DROP_FAILED, "falha ao remover tabela");
     }
 
     printLine("[database] tabela removida");
@@ -920,52 +976,69 @@ uint8_t wrapper_database_drop(string tableName) {
 
 uint8_t wrapper_database_logs(int32_t limit = 20) {
     if (g_ctx.database == nullptr) {
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::DATABASE_NOT_READY, "database indisponivel para comando logs");
     }
 
     const size_t boundedLimit = (limit > 0) ? static_cast<size_t>(limit) : 20U;
     String output;
     const bool ok = g_ctx.database->readCommandLogsWithOutput(boundedLimit, output);
     printLine(output.c_str());
-    return ok ? RESULT_OK : RESULT_ERROR;
+    if (!ok) {
+        return failWithCode(AppError::Code::DATABASE_QUERY_FAILED, "falha ao ler logs de comandos");
+    }
+
+    return RESULT_OK;
 }
 
 uint8_t wrapper_database_espnow_history(int32_t limit = 30) {
     if (g_ctx.database == nullptr) {
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::DATABASE_NOT_READY, "database indisponivel para comando espnow_history");
     }
 
     const size_t boundedLimit = (limit > 0) ? static_cast<size_t>(limit) : 30U;
     String output;
     const bool ok = g_ctx.database->readEspNowHistory(boundedLimit, output);
     printLine(output.c_str());
-    return ok ? RESULT_OK : RESULT_ERROR;
+    if (!ok) {
+        return failWithCode(AppError::Code::DATABASE_QUERY_FAILED, "falha ao ler historico ESP-NOW");
+    }
+
+    return RESULT_OK;
 }
 
 uint8_t wrapper_database_rebuild() {
-    if (g_ctx.database == nullptr || g_ctx.espNow == nullptr) {
-        return RESULT_ERROR;
+    if (g_ctx.database == nullptr) {
+        return failWithCode(AppError::Code::DATABASE_NOT_READY, "database indisponivel para comando rebuild");
+    }
+
+    if (g_ctx.espNow == nullptr) {
+        return failWithCode(AppError::Code::ESPNOW_NOT_READY, "espnow indisponivel para comando rebuild");
     }
 
     if (g_ctx.database->rebuild(*g_ctx.espNow)) {
-        g_ctx.database->syncPeersFromManager(*g_ctx.espNow);
+        if (!g_ctx.database->syncPeersFromManager(*g_ctx.espNow)) {
+            warnWithCode(AppError::Code::DATABASE_PEER_SYNC_FAILED, "banco recriado, mas falhou ao sincronizar peers");
+        }
         printLine("[database] banco recriado com bootstrap.sql");
         return RESULT_OK;
     }
 
-    printLine("[database] falha ao recriar banco");
-    return RESULT_ERROR;
+    return failWithCode(AppError::Code::DATABASE_REBUILD_FAILED, "falha ao recriar banco");
 }
 
 uint8_t wrapper_database_exec(string sql) {
     if (g_ctx.database == nullptr) {
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::DATABASE_NOT_READY, "database indisponivel para comando exec");
     }
 
     String output;
     const bool ok = g_ctx.database->executeSql(stripOuterQuotes(sql).c_str(), output);
     printLine(output.c_str());
-    return ok ? RESULT_OK : RESULT_ERROR;
+    if (!ok) {
+        return failWithCode(AppError::Code::DATABASE_EXEC_FAILED, "falha ao executar SQL");
+    }
+
+    return RESULT_OK;
 }
 
 } // namespace
@@ -990,7 +1063,7 @@ bool bind(const Context& context) {
 
 uint8_t registerDefaultModules() {
     if (g_ctx.shell == nullptr) {
-        return RESULT_ERROR;
+        return failWithCode(AppError::Code::SHELL_NOT_READY, "shell nao configurada para registrar modulos");
     }
 
     g_ctx.shell->create_module("help", "ajuda e informacoes");
@@ -1042,7 +1115,15 @@ uint8_t registerDefaultModules() {
 
 std::string runLine(const std::string& command) {
     if (g_ctx.shell == nullptr) {
-        return "Shell nao configurada.";
+        char line[96] = {0};
+        std::snprintf(
+            line,
+            sizeof(line),
+            "erro(%u/%s) Shell nao configurada.",
+            static_cast<unsigned>(AppError::value(AppError::Code::SHELL_NOT_READY)),
+            AppError::name(AppError::Code::SHELL_NOT_READY)
+        );
+        return line;
     }
 
     const std::string normalized = normalizeCommand(command);
@@ -1063,7 +1144,9 @@ std::string runLine(const std::string& command) {
             persistedOutput = "(sem saida textual)";
         }
 
-        g_ctx.database->logCommandWithOutput(normalized.c_str(), persistedOutput.c_str(), "serial");
+        if (!g_ctx.database->logCommandWithOutput(normalized.c_str(), persistedOutput.c_str(), "serial")) {
+            warnWithCode(AppError::Code::DATABASE_COMMAND_LOG_FAILED, "falha ao persistir log de comando");
+        }
     }
 
     g_commandOutputBuffer.clear();
