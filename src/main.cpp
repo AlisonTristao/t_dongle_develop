@@ -1,32 +1,22 @@
 #include <WiFi.h>
-#include <esp_now.h>
 #include "config.h"
+#include <ShellSerial.h>
+#include <EspNowManager.h>
+#include <TinyShell.h>
+#include "shell_config.h"
 
-// types of logs 
-enum class logType {
-    NONE,
-    INFO,
-    TELEMETRY,
-    ERROR,
-    DEBUG
-};
-
-// message structure
-typedef struct {
-    uint32_t timer;
-    char msg[231];
-    logType type;
-} message; 
 // 80:B5:4E:C6:D8:C8
-#define PEER_MAC {0x80, 0xB5, 0x4E, 0xC6, 0xD8, 0xC8} // mac of the other esp
+static constexpr uint8_t PEER_MAC[] = {0x80, 0xB5, 0x4E, 0xC6, 0xD8, 0xC8};
 
-message myData;
-uint8_t peerAddress[] = PEER_MAC;
-String commandBuffer = "";
+EspNowManager::message myData = {};
+ShellSerial serialShell;
+EspNowManager espNowManager;
+TinyShell tinyShell;
 
 // callback for incoming esp-now data
-void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
-    memcpy(&myData, incomingData, sizeof(myData));
+void OnDataRecv(const uint8_t *mac, const EspNowManager::message& incomingData) {
+    myData = incomingData;
+    serialShell.addLog(String(myData.msg));
     Serial.printf("%s\n", myData.msg);
 }
 
@@ -38,56 +28,46 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 void setup() {
     BoardConfig::initBoardPins(false);
 
-    Serial.begin(921600);
+    serialShell.begin(Serial, 921600);
+    serialShell.setPrompt("$ ");
     while (!Serial); // wait for serial to be ready
 
     // print mac address
     Serial.print("mac: ");
     Serial.println(WiFi.macAddress());
 
-    // set wifi to station mode
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect(); // avoid trying to connect
+    espNowManager.setReceiveCallback(OnDataRecv);
+    espNowManager.setSendCallback(OnDataSent);
 
-    // init esp-now
-    if (esp_now_init() != ESP_OK) return;
+    if (!espNowManager.begin(0, false)) {
+        Serial.println("esp-now init failed");
+        return;
+    }
 
-    // register callbacks
-    esp_now_register_recv_cb(OnDataRecv);
-    esp_now_register_send_cb(OnDataSent);
+    espNowManager.addDevice(PEER_MAC, "peer-main", "peer principal para mensagens esp-now");
 
-    // add peer
-    esp_now_peer_info_t peerInfo = {};
-    memcpy(peerInfo.peer_addr, peerAddress, 6);
-    peerInfo.channel = 0; // same channel for both esp
-    peerInfo.encrypt = false;
-    esp_now_add_peer(&peerInfo);
+    const bool shellBound = ShellConfig::bind({&tinyShell, &espNowManager, &Serial});
+    if (!shellBound) {
+        Serial.println("shell bind failed");
+        return;
+    }
+
+    if (ShellConfig::registerDefaultModules() != RESULT_OK) {
+        Serial.println("shell module registration failed");
+        return;
+    }
+
+    Serial.println("shell ready: <module> -<command> [args]");
+    Serial.println("use: help -e");
 }
 
 void loop() {
-    // read serial input and send via esp-now
-    while (Serial.available()) {
-        char c = Serial.read();
-
-        // echo character to serial
-        Serial.write(c);
-
-        // handle backspace/delete
-        if (c == 8 || c == 127) {
-            if (!commandBuffer.isEmpty()) {
-                commandBuffer.remove(commandBuffer.length() - 1);
-            }
-            continue;
-        }
-
-        if (c == '\n') {
-            commandBuffer.trim();
-            if (commandBuffer.length() > 0) {
-                esp_now_send(peerAddress, (uint8_t *)commandBuffer.c_str(), commandBuffer.length());
-            }
-            commandBuffer = "";
-        } else {
-            commandBuffer += c;
+    String command;
+    if (serialShell.readInputLine(command)) {
+        const std::string response = ShellConfig::runLine(std::string(command.c_str()));
+        if (!response.empty()) {
+            Serial.println(response.c_str());
+            serialShell.addLog(String(response.c_str()));
         }
     }
 
