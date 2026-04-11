@@ -13,8 +13,6 @@
 #include <DatabaseStore.h>
 #include <TinyShell.h>
 
-static constexpr uint8_t PEER_MAC[] = {0x80, 0xB5, 0x4E, 0xC6, 0xD8, 0xC8};
-
 ShellSerial serialShell;
 EspNowManager espNowManager;
 DonglePeripherals donglePeripherals;
@@ -33,8 +31,7 @@ void setup() {
     // Hold startup until serial terminal is attached, with LED rainbow animation.
     StartupConfig::waitForSerialAndAnimateLed(donglePeripherals);
 
-    // Bring up onboard peripherals only after serial monitor is open.
-    donglePeripherals.begin();
+    // Startup visuals already initialize LED/LCD; continue with remaining peripherals.
     donglePeripherals.beginSd(false);
 
     Serial.print("mac: ");
@@ -53,12 +50,6 @@ void setup() {
         Serial.println("database init failed (continuando sem persistencia)");
     } else {
         databaseStore.logBootEvent("power_on");
-    }
-
-    if (espNowManager.addDevice(PEER_MAC, "peer-main", "peer principal para mensagens esp-now")) {
-        if (databaseStore.isReady()) {
-            databaseStore.upsertPeer(PEER_MAC, "peer-main", "peer principal para mensagens esp-now");
-        }
     }
 
     const bool shellBound = ShellConfig::bind({

@@ -4,6 +4,8 @@
 #include <cctype>
 #include <cstring>
 #include <cstdio>
+#include <ctime>
+#include <sys/time.h>
 
 namespace {
 
@@ -11,6 +13,7 @@ using std::string;
 
 ShellConfig::Context g_ctx = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
 string g_commandOutputBuffer;
+constexpr uint8_t kFallbackBroadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 string trimCopy(const string& text) {
     const auto first = std::find_if_not(text.begin(), text.end(), [](unsigned char ch) {
@@ -56,6 +59,40 @@ bool parseMacAddress(const string& text, uint8_t outMac[6]) {
     for (size_t i = 0; i < 6; ++i) {
         outMac[i] = static_cast<uint8_t>(bytes[i]);
     }
+    return true;
+}
+
+bool parseDateTimeText(const string& text, time_t& outEpoch) {
+    int year = 0;
+    int month = 0;
+    int day = 0;
+    int hour = 0;
+    int minute = 0;
+    int second = 0;
+
+    const string clean = stripOuterQuotes(text);
+    if (std::sscanf(clean.c_str(), "%d-%d-%d %d:%d:%d", &year, &month, &day, &hour, &minute, &second) != 6) {
+        return false;
+    }
+
+    if (year < 2024 || month < 1 || month > 12 || day < 1 || day > 31 || hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) {
+        return false;
+    }
+
+    std::tm tmValue = {};
+    tmValue.tm_year = year - 1900;
+    tmValue.tm_mon = month - 1;
+    tmValue.tm_mday = day;
+    tmValue.tm_hour = hour;
+    tmValue.tm_min = minute;
+    tmValue.tm_sec = second;
+
+    const time_t epoch = mktime(&tmValue);
+    if (epoch <= 0) {
+        return false;
+    }
+
+    outEpoch = epoch;
     return true;
 }
 
@@ -161,6 +198,8 @@ uint8_t clampByte(int32_t value) {
     return static_cast<uint8_t>(value);
 }
 
+uint8_t wrapper_espnow_send_all(string command);
+
 uint8_t wrapper_help_h() {
     if (g_ctx.shell == nullptr) {
         return RESULT_ERROR;
@@ -182,12 +221,15 @@ uint8_t wrapper_help_l(string module = "") {
 uint8_t wrapper_help_e() {
     printLine("[help] comandos gerais");
     printLine("Uso: <module> -<command> [args]");
+    printLine("Horario RTC local: dongle -clock");
+    printLine("Ajustar RTC local: dongle -set_clock \"YYYY-MM-DD HH:MM:SS\"");
     printLine("Exemplo local LCD: dongle -lcd \"Ola dongle\"");
     printLine("Se LCD nao aparecer: dongle -lcd_bl 1 e depois dongle -lcd_reinit");
     printLine("Se LCD estiver invertido: dongle -lcd_rot 0..3");
     printLine("Exemplo local LED: dongle -led 255, 0, 0");
     printLine("Exemplo espnow unicast: espnow -send_to 1, \"dongle -run status\"");
-    printLine("Exemplo espnow broadcast: espnow -send_to \"dongle -run status\"");
+    printLine("Exemplo espnow broadcast: espnow -send_to 000, \"dongle -run status\"");
+    printLine("Alias 000 no send_to = envia para todos os peers");
     printLine("Editar peer: espnow -update 1, \"nome novo\", \"descricao nova\"");
     printLine("Banco sqlite no SD: database -status | database -tables | database -read peers, 20");
     return RESULT_OK;
@@ -201,6 +243,69 @@ uint8_t wrapper_dongle_run(string command) {
 
 uint8_t wrapper_dongle_ping() {
     printLine("[dongle] pong");
+    return RESULT_OK;
+}
+
+uint8_t wrapper_dongle_clock() {
+    const time_t nowEpoch = time(nullptr);
+    if (nowEpoch <= 0) {
+        printLine("[dongle] clock sem ajuste (epoch invalido)");
+        return RESULT_OK;
+    }
+
+    std::tm localTime = {};
+    if (localtime_r(&nowEpoch, &localTime) == nullptr) {
+        printLine("[dongle] falha ao ler horario local");
+        return RESULT_ERROR;
+    }
+
+    char dateTime[32] = {0};
+    std::strftime(dateTime, sizeof(dateTime), "%Y-%m-%d %H:%M:%S", &localTime);
+
+    char line[120] = {0};
+    std::snprintf(
+        line,
+        sizeof(line),
+        "[dongle] clock=%s epoch=%lld",
+        dateTime,
+        static_cast<long long>(nowEpoch)
+    );
+    printLine(line);
+    return RESULT_OK;
+}
+
+uint8_t wrapper_dongle_set_clock(string dateTimeText) {
+    time_t epoch = 0;
+    if (!parseDateTimeText(dateTimeText, epoch)) {
+        printLine("[dongle] formato invalido. Use: YYYY-MM-DD HH:MM:SS");
+        return RESULT_ERROR;
+    }
+
+    timeval tv = {};
+    tv.tv_sec = epoch;
+    tv.tv_usec = 0;
+    if (settimeofday(&tv, nullptr) != 0) {
+        printLine("[dongle] falha ao ajustar clock");
+        return RESULT_ERROR;
+    }
+
+    std::tm adjusted = {};
+    if (localtime_r(&epoch, &adjusted) == nullptr) {
+        printLine("[dongle] clock ajustado");
+        return RESULT_OK;
+    }
+
+    char dateTime[32] = {0};
+    std::strftime(dateTime, sizeof(dateTime), "%Y-%m-%d %H:%M:%S", &adjusted);
+
+    char line[120] = {0};
+    std::snprintf(
+        line,
+        sizeof(line),
+        "[dongle] clock ajustado para %s",
+        dateTime
+    );
+    printLine(line);
     return RESULT_OK;
 }
 
@@ -444,9 +549,11 @@ uint8_t wrapper_espnow_list() {
         return RESULT_ERROR;
     }
 
+    printLine("[000] todos - FF:FF:FF:FF:FF:FF (alias broadcast)");
+
     const size_t total = g_ctx.espNow->deviceCount();
     if (total == 0) {
-        printLine("[espnow] nenhum dispositivo cadastrado");
+        printLine("[espnow] nenhum peer real cadastrado");
         return RESULT_OK;
     }
 
@@ -469,7 +576,7 @@ uint8_t wrapper_espnow_list() {
         std::snprintf(
             line,
             sizeof(line),
-            "[%u] %s - %s - %s",
+            "[%03u] %s - %s - %s",
             static_cast<unsigned>(i + 1),
             item.name,
             item.description,
@@ -592,11 +699,9 @@ uint8_t wrapper_espnow_update(int32_t deviceNumber, string name, string descript
 }
 
 uint8_t wrapper_espnow_send_to(int32_t deviceNumber, string command) {
-    if (g_ctx.espNow == nullptr || deviceNumber <= 0) {
+    if (g_ctx.espNow == nullptr || deviceNumber < 0) {
         return RESULT_ERROR;
     }
-
-    const size_t index = static_cast<size_t>(deviceNumber - 1);
 
     EspNowManager::message outgoing = {};
     outgoing.timer = millis();
@@ -605,6 +710,41 @@ uint8_t wrapper_espnow_send_to(int32_t deviceNumber, string command) {
     const string msg = stripOuterQuotes(command);
     std::strncpy(outgoing.msg, msg.c_str(), sizeof(outgoing.msg) - 1);
     outgoing.msg[sizeof(outgoing.msg) - 1] = '\0';
+
+    if (deviceNumber == 0) {
+        // Peer virtual 000: route to default broadcast MAC (stored in DB, with FF fallback).
+        uint8_t broadcastMac[6] = {
+            kFallbackBroadcastMac[0],
+            kFallbackBroadcastMac[1],
+            kFallbackBroadcastMac[2],
+            kFallbackBroadcastMac[3],
+            kFallbackBroadcastMac[4],
+            kFallbackBroadcastMac[5]
+        };
+        if (g_ctx.database != nullptr && g_ctx.database->isReady()) {
+            uint8_t dbMac[6] = {0};
+            if (g_ctx.database->getDefaultBroadcastMac(dbMac)) {
+                memcpy(broadcastMac, dbMac, sizeof(broadcastMac));
+            }
+        }
+
+        bool delivered = false;
+        const bool gotStatus = g_ctx.espNow->sendToMacWithStatus(broadcastMac, outgoing, delivered, 700);
+
+        if (g_ctx.database != nullptr && g_ctx.database->isReady()) {
+            g_ctx.database->logOutgoingEspNow(broadcastMac, outgoing, gotStatus && delivered);
+        }
+
+        if (!gotStatus) {
+            printLine("[espnow] 000 status=false (sem callback/timeout)");
+            return RESULT_ERROR;
+        }
+
+        printLine(delivered ? "[espnow] 000 status=true" : "[espnow] 000 status=false");
+        return delivered ? RESULT_OK : RESULT_ERROR;
+    }
+
+    const size_t index = static_cast<size_t>(deviceNumber - 1);
 
     bool delivered = false;
     const bool gotStatus = g_ctx.espNow->sendToDeviceWithStatus(index, outgoing, delivered, 700);
@@ -785,6 +925,8 @@ uint8_t registerDefaultModules() {
     g_ctx.shell->add(wrapper_help_e, "e", "explica o uso dos comandos", "help");
 
     g_ctx.shell->add(wrapper_dongle_ping, "ping", "teste rapido local", "dongle");
+    g_ctx.shell->add(wrapper_dongle_clock, "clock", "mostra horario atual do RTC", "dongle");
+    g_ctx.shell->add(wrapper_dongle_set_clock, "set_clock", "ajusta RTC: <\"YYYY-MM-DD HH:MM:SS\">", "dongle");
     g_ctx.shell->add(wrapper_dongle_run, "run", "executa comando local (placeholder)", "dongle");
     g_ctx.shell->add(wrapper_dongle_led, "led", "define LED RGB: <r>, <g>, <b>", "dongle");
     g_ctx.shell->add(wrapper_dongle_led_off, "led_off", "desliga o LED", "dongle");
@@ -804,7 +946,7 @@ uint8_t registerDefaultModules() {
     g_ctx.shell->add(wrapper_espnow_remove, "remove", "remove peer por indice: <numero>", "espnow");
     g_ctx.shell->add(wrapper_espnow_remove_mac, "remove_mac", "remove peer por mac: <mac>", "espnow");
     g_ctx.shell->add(wrapper_espnow_update, "update", "atualiza peer: <numero>, <nome>, <descricao>", "espnow");
-    g_ctx.shell->add(wrapper_espnow_send_to, "send_to", "envia para indice: <numero>, <comando>", "espnow");
+    g_ctx.shell->add(wrapper_espnow_send_to, "send_to", "envia para indice: <numero|000>, <comando> (000=todos)", "espnow");
     g_ctx.shell->add(wrapper_espnow_send_all, "send_all", "envia para todos: <comando>", "espnow");
 
     g_ctx.shell->add(wrapper_database_init, "init", "abre o banco e aplica bootstrap.sql", "database");
