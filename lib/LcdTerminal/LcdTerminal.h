@@ -10,7 +10,7 @@
  *
  * Visual style:
  * - 2px border on all sides
- * - gray background inside border
+ * - black background inside border
  * - colored text lines with automatic wrap/scroll reset
  */
 class LcdTerminal final {

@@ -4,9 +4,9 @@ LcdTerminal::LcdTerminal()
     : peripherals_(nullptr),
       tft_(nullptr),
       ready_(false),
-      borderColor_(ST77XX_WHITE),
-      backgroundColor_(0x7BEF), // neutral gray (RGB565)
-      infoColor_(ST77XX_CYAN),
+            borderColor_(ST77XX_WHITE),
+            backgroundColor_(ST77XX_WHITE),
+            infoColor_(ST77XX_BLACK),
       warningColor_(ST77XX_YELLOW),
       errorColor_(ST77XX_RED),
       textX_(0),

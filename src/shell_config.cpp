@@ -59,25 +59,68 @@ bool parseMacAddress(const string& text, uint8_t outMac[6]) {
 }
 
 uint16_t lcdColorForLine(const string& text) {
+    // This panel is currently running with inverted visual polarity,
+    // so semantic colors are compensated before drawing.
+    constexpr bool kPanelInvertedColors = true;
+    constexpr bool kPanelSwapRedBlue = true;
+    const auto toPanelColor = [](uint16_t desiredColor) -> uint16_t {
+        auto swapRedBlue565 = [](uint16_t color) -> uint16_t {
+            const uint16_t r = static_cast<uint16_t>((color >> 11) & 0x1F);
+            const uint16_t g = static_cast<uint16_t>((color >> 5) & 0x3F);
+            const uint16_t b = static_cast<uint16_t>(color & 0x1F);
+            return static_cast<uint16_t>((b << 11) | (g << 5) | r);
+        };
+
+        uint16_t panelColor = desiredColor;
+        if (kPanelInvertedColors) {
+            panelColor = static_cast<uint16_t>(~panelColor);
+        }
+        if (kPanelSwapRedBlue) {
+            panelColor = swapRedBlue565(panelColor);
+        }
+
+        return panelColor;
+    };
+
     string lower = text;
     std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) {
         return static_cast<char>(std::tolower(ch));
     });
 
-    if (lower.find("erro") != string::npos || lower.find("falha") != string::npos) {
-        return ST77XX_RED;
-    }
-    if (lower.rfind("[espnow]", 0) == 0) {
-        return ST77XX_CYAN;
-    }
-    if (lower.rfind("[dongle]", 0) == 0) {
-        return ST77XX_GREEN;
-    }
-    if (lower.rfind("[help]", 0) == 0) {
-        return ST77XX_YELLOW;
+    const auto hasAny = [&lower](std::initializer_list<const char*> terms) {
+        for (const char* term : terms) {
+            if (lower.find(term) != string::npos) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    if (hasAny({"erro", "error", "falha", "failed", "invalid", "invalido"})) {
+        return toPanelColor(ST77XX_RED);
     }
 
-    return ST77XX_WHITE;
+    if (hasAny({"warning", "warn", "aviso", "atencao"}) || lower.rfind("[help]", 0) == 0) {
+        return toPanelColor(ST77XX_YELLOW);
+    }
+
+    if (hasAny({
+            "sucesso",
+            "success",
+            "inicializado",
+            "atualizado",
+            "enviado",
+            "adicionado",
+            "removido",
+            "ligado",
+            "desligado",
+            "limpo",
+            "pong"
+        })) {
+        return toPanelColor(ST77XX_GREEN);
+    }
+
+    return toPanelColor(ST77XX_WHITE);
 }
 
 void printLine(const string& text) {
@@ -183,7 +226,7 @@ uint8_t wrapper_dongle_lcd(string text) {
     const String content = String(stripOuterQuotes(text).c_str());
 
     if (g_ctx.lcdTerminal != nullptr && g_ctx.lcdTerminal->isReady()) {
-        g_ctx.lcdTerminal->writeText(content, ST77XX_WHITE);
+        g_ctx.lcdTerminal->writeText(content, ST77XX_BLACK);
         printLine("[dongle] texto escrito no terminal LCD");
         return RESULT_OK;
     }

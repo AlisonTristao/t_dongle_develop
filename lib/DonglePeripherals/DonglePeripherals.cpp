@@ -77,12 +77,28 @@ bool DonglePeripherals::beginLcd(uint8_t rotation) {
         static_cast<int8_t>(BoardConfig::TFT_ROW_START)
     );
     tft_.setRotation(lcdRotation_);
-    tft_.fillScreen(ST77XX_BLACK);
-    tft_.setTextColor(ST77XX_WHITE);
+    tft_.fillScreen(ST77XX_WHITE);
+    tft_.setTextColor(ST77XX_BLACK);
     tft_.setTextSize(1);
     tft_.setTextWrap(true);
-    tft_.setCursor(0, 0);
-    tft_.println("LCD ready");
+    const char* bootMessage = "serial closed";
+    int16_t x1 = 0;
+    int16_t y1 = 0;
+    uint16_t textW = 0;
+    uint16_t textH = 0;
+    tft_.getTextBounds(bootMessage, 0, 0, &x1, &y1, &textW, &textH);
+
+    int16_t cursorX = static_cast<int16_t>((tft_.width() - static_cast<int16_t>(textW)) / 2);
+    int16_t cursorY = static_cast<int16_t>((tft_.height() - static_cast<int16_t>(textH)) / 2);
+    if (cursorX < 0) {
+        cursorX = 0;
+    }
+    if (cursorY < 0) {
+        cursorY = 0;
+    }
+
+    tft_.setCursor(cursorX, cursorY);
+    tft_.print(bootMessage);
 
     lcdReady_ = true;
     return true;
