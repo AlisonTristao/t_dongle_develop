@@ -27,10 +27,10 @@ const char* shellOutputPrefix(const String& text) {
     lower.toLowerCase();
 
     if (
-        lower.indexOf("falhou") >= 0 ||
-        lower.indexOf("erro") >= 0 ||
-        lower.indexOf("error") >= 0 ||
-        lower.indexOf("invalid") >= 0
+        lower.indexOf("falhou")     >= 0 ||
+        lower.indexOf("erro")       >= 0 ||
+        lower.indexOf("error")      >= 0 ||
+        lower.indexOf("invalid")    >= 0
     ) {
         return "! ";
     }

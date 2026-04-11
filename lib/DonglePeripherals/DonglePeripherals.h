@@ -129,6 +129,17 @@ public:
     bool isSdReady() const;
 
     /**
+     * @brief Returns active SD bus width mode.
+     * @return true when operating in 1-bit mode, false for 4-bit mode.
+     */
+    bool sdOneBitMode() const;
+
+    /**
+     * @brief Returns SD host clock frequency in kHz for the active mount.
+     */
+    uint32_t sdFrequencyKHz() const;
+
+    /**
      * @brief Returns SD card type as text.
      */
     String sdCardTypeName() const;
@@ -148,6 +159,8 @@ private:
     bool ledReady_;
     bool lcdReady_;
     bool sdReady_;
+    bool sdOneBitMode_;
+    uint32_t sdFrequencyKHz_;
     bool lcdBacklightOn_;
     bool lcdBacklightActiveHigh_;
     uint8_t lcdRotation_;

@@ -1,6 +1,7 @@
 #include "DonglePeripherals.h"
 
 #include <SD_MMC.h>
+#include <driver/gpio.h>
 
 #include "../../include/config.h"
 
@@ -14,10 +15,12 @@ DonglePeripherals::DonglePeripherals()
     ),
       ledReady_(false),
       lcdReady_(false),
-            sdReady_(false),
-        lcdBacklightOn_(false),
-        lcdBacklightActiveHigh_(false),
-        lcdRotation_(1) {
+      sdReady_(false),
+      sdOneBitMode_(false),
+      sdFrequencyKHz_(0),
+      lcdBacklightOn_(false),
+      lcdBacklightActiveHigh_(false),
+      lcdRotation_(1) {
 }
 
 void DonglePeripherals::begin() {
@@ -187,31 +190,110 @@ bool DonglePeripherals::clearLcd(uint16_t color) {
 }
 
 bool DonglePeripherals::beginSd(bool oneBitMode) {
+    sdReady_ = false;
+    sdOneBitMode_ = oneBitMode;
+    sdFrequencyKHz_ = 0;
+
+    // SD_MMC.setPins only works before begin(), so always unmount first.
+    SD_MMC.end();
+    delay(20);
+
+    // Software pull-ups help, but external pull-ups are still recommended.
+    pinMode(BoardConfig::PIN_SDMMC_CMD, INPUT_PULLUP);
+    pinMode(BoardConfig::PIN_SDMMC_D0, INPUT_PULLUP);
+    pinMode(BoardConfig::PIN_SDMMC_D1, INPUT_PULLUP);
+    pinMode(BoardConfig::PIN_SDMMC_D2, INPUT_PULLUP);
+    pinMode(BoardConfig::PIN_SDMMC_D3, INPUT_PULLUP);
+
+    gpio_pullup_en(static_cast<gpio_num_t>(BoardConfig::PIN_SDMMC_CMD));
+    gpio_pullup_en(static_cast<gpio_num_t>(BoardConfig::PIN_SDMMC_D0));
+    gpio_pullup_en(static_cast<gpio_num_t>(BoardConfig::PIN_SDMMC_D1));
+    gpio_pullup_en(static_cast<gpio_num_t>(BoardConfig::PIN_SDMMC_D2));
+    gpio_pullup_en(static_cast<gpio_num_t>(BoardConfig::PIN_SDMMC_D3));
+
 #if defined(ESP32)
-    if (!SD_MMC.setPins(
+    auto setSdPins = [](bool mode1bit) -> bool {
+        if (mode1bit) {
+            return SD_MMC.setPins(
+                BoardConfig::PIN_SDMMC_CLK,
+                BoardConfig::PIN_SDMMC_CMD,
+                BoardConfig::PIN_SDMMC_D0
+            );
+        }
+
+        return SD_MMC.setPins(
             BoardConfig::PIN_SDMMC_CLK,
             BoardConfig::PIN_SDMMC_CMD,
             BoardConfig::PIN_SDMMC_D0,
             BoardConfig::PIN_SDMMC_D1,
             BoardConfig::PIN_SDMMC_D2,
             BoardConfig::PIN_SDMMC_D3
-        )) {
-        sdReady_ = false;
-        return false;
-    }
+        );
+    };
 #endif
 
-    if (!SD_MMC.begin("/sdcard", oneBitMode)) {
-        sdReady_ = false;
-        return false;
+    struct SdAttempt {
+        bool mode1bit;
+        int frequencyKHz;
+    };
+
+    SdAttempt attempts[4] = {};
+    size_t attemptsCount = 0;
+
+    if (oneBitMode) {
+        attempts[0] = {true, SDMMC_FREQ_DEFAULT};
+        attempts[1] = {true, SDMMC_FREQ_PROBING};
+        attemptsCount = 2;
+    } else {
+        // Try stable 1-bit first to avoid noisy init failures on weak signal cards.
+        attempts[0] = {true, SDMMC_FREQ_DEFAULT};
+        attempts[1] = {false, SDMMC_FREQ_DEFAULT};
+        attempts[2] = {true, SDMMC_FREQ_PROBING};
+        attempts[3] = {false, SDMMC_FREQ_PROBING};
+        attemptsCount = 4;
     }
 
-    sdReady_ = (SD_MMC.cardType() != CARD_NONE);
-    return sdReady_;
+    for (size_t i = 0; i < attemptsCount; ++i) {
+        const SdAttempt& attempt = attempts[i];
+
+        SD_MMC.end();
+        delay(20);
+
+#if defined(ESP32)
+        if (!setSdPins(attempt.mode1bit)) {
+            continue;
+        }
+#endif
+
+        if (!SD_MMC.begin("/sdcard", attempt.mode1bit, false, attempt.frequencyKHz)) {
+            continue;
+        }
+
+        if (SD_MMC.cardType() == CARD_NONE) {
+            SD_MMC.end();
+            continue;
+        }
+
+        sdReady_ = true;
+        sdOneBitMode_ = attempt.mode1bit;
+        sdFrequencyKHz_ = static_cast<uint32_t>(attempt.frequencyKHz);
+        return true;
+    }
+
+    Serial.println("[dongle] SD init falhou (tentou 4-bit/1-bit e clock reduzido)");
+    return false;
 }
 
 bool DonglePeripherals::isSdReady() const {
     return sdReady_;
+}
+
+bool DonglePeripherals::sdOneBitMode() const {
+    return sdOneBitMode_;
+}
+
+uint32_t DonglePeripherals::sdFrequencyKHz() const {
+    return sdFrequencyKHz_;
 }
 
 String DonglePeripherals::sdCardTypeName() const {

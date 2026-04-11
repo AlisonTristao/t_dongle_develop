@@ -347,11 +347,19 @@ uint8_t wrapper_dongle_sd_init() {
 
     const bool ok = g_ctx.peripherals->beginSd(false);
     if (!ok) {
-        printLine("[dongle] falha ao iniciar SD");
+        printLine("[dongle] falha ao iniciar SD (verifique cartao, contato e pull-ups)");
         return RESULT_ERROR;
     }
 
-    printLine("[dongle] SD inicializado");
+    char line[120] = {0};
+    std::snprintf(
+        line,
+        sizeof(line),
+        "[dongle] SD inicializado (%u-bit @ %lukHz)",
+        g_ctx.peripherals->sdOneBitMode() ? 1U : 4U,
+        static_cast<unsigned long>(g_ctx.peripherals->sdFrequencyKHz())
+    );
+    printLine(line);
     return RESULT_OK;
 }
 
@@ -373,8 +381,10 @@ uint8_t wrapper_dongle_sd_status() {
     std::snprintf(
         line,
         sizeof(line),
-        "[dongle] SD %s total=%lluMB usado=%lluMB",
+        "[dongle] SD %s %u-bit@%lukHz total=%lluMB usado=%lluMB",
         type.c_str(),
+        g_ctx.peripherals->sdOneBitMode() ? 1U : 4U,
+        static_cast<unsigned long>(g_ctx.peripherals->sdFrequencyKHz()),
         static_cast<unsigned long long>(total),
         static_cast<unsigned long long>(used)
     );
