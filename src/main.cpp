@@ -11,13 +11,13 @@ enum class logType {
 };
 
 // message structure
-typedef struct message {
+typedef struct {
     uint32_t timer;
     char msg[231];
     logType type;
 } message; 
-
-#define PEER_MAC {0x48, 0x27, 0xE2, 0x14, 0x70, 0xFC} // mac of the other esp
+// 80:B5:4E:C6:D8:C8
+#define PEER_MAC {0x80, 0xB5, 0x4E, 0xC6, 0xD8, 0xC8} // mac of the other esp
 
 message myData;
 uint8_t peerAddress[] = PEER_MAC;
@@ -26,7 +26,7 @@ String commandBuffer = "";
 // callback for incoming esp-now data
 void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
     memcpy(&myData, incomingData, sizeof(myData));
-    Serial.printf("[%u] %s\n", myData.timer, myData.msg);
+    Serial.printf("%s\n", myData.msg);
 }
 
 // callback for esp-now send status
