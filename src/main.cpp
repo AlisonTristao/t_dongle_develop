@@ -81,13 +81,6 @@ void espNowRxWorkerTask(void*) {
         if (EspNowConfig::dequeueRxMessage(event, 250)) {
             EspNowConfig::processRxMessage(event);
         }
-
-        const uint32_t dropped = EspNowConfig::takeDroppedRxCount();
-        if (dropped > 0) {
-            char line[64] = {0};
-            std::snprintf(line, sizeof(line), "rx_dropped=%lu", static_cast<unsigned long>(dropped));
-            ShellOutput::printTagged(Serial, "espnow", line);
-        }
     }
 }
 
@@ -177,9 +170,24 @@ void setup() {
 }
 
 void loop() {
+    bool needPromptRefresh = false;
+
     const size_t flushedBefore = EspNowConfig::flushRxDisplayLines(12);
     if (flushedBefore > 0) {
+        needPromptRefresh = true;
+    }
+
+    const uint32_t droppedBefore = EspNowConfig::takeDroppedRxCount();
+    if (droppedBefore > 0) {
+        char line[64] = {0};
+        std::snprintf(line, sizeof(line), "rx_dropped=%lu", static_cast<unsigned long>(droppedBefore));
+        ShellOutput::printTagged(Serial, "espnow", line);
+        needPromptRefresh = true;
+    }
+
+    if (needPromptRefresh) {
         serialShell.refreshLine();
+        needPromptRefresh = false;
     }
 
     String command;
@@ -194,10 +202,23 @@ void loop() {
         }
 
         Serial.println();
+        serialShell.refreshLine();
     }
 
     const size_t flushedAfter = EspNowConfig::flushRxDisplayLines(12);
     if (flushedAfter > 0) {
+        needPromptRefresh = true;
+    }
+
+    const uint32_t droppedAfter = EspNowConfig::takeDroppedRxCount();
+    if (droppedAfter > 0) {
+        char line[64] = {0};
+        std::snprintf(line, sizeof(line), "rx_dropped=%lu", static_cast<unsigned long>(droppedAfter));
+        ShellOutput::printTagged(Serial, "espnow", line);
+        needPromptRefresh = true;
+    }
+
+    if (needPromptRefresh) {
         serialShell.refreshLine();
     }
 

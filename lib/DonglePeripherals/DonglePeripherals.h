@@ -150,9 +150,19 @@ public:
     uint64_t sdTotalMB() const;
 
     /**
+     * @brief Total SD capacity in bytes.
+     */
+    uint64_t sdTotalBytes() const;
+
+    /**
      * @brief Used SD bytes in megabytes.
      */
     uint64_t sdUsedMB() const;
+
+    /**
+     * @brief Used SD capacity in bytes.
+     */
+    uint64_t sdUsedBytes() const;
 
     /**
      * @brief Removes all files/folders from SD root.

@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <ctime>
 #include <sys/time.h>
+#include <SD_MMC.h>
 
 namespace {
 
@@ -538,19 +539,45 @@ uint8_t wrapper_dongle_sd_status() {
     }
 
     const String type = g_ctx.peripherals->sdCardTypeName();
-    const uint64_t total = g_ctx.peripherals->sdTotalMB();
-    const uint64_t used = g_ctx.peripherals->sdUsedMB();
+    const uint64_t totalBytes = g_ctx.peripherals->sdTotalBytes();
+    const uint64_t usedBytes = g_ctx.peripherals->sdUsedBytes();
+    const uint64_t totalMB = g_ctx.peripherals->sdTotalMB();
+    const uint64_t usedMB = g_ctx.peripherals->sdUsedMB();
 
-    char line[160] = {0};
+    uint64_t percentInt = 0;
+    uint64_t percentFrac = 0;
+    if (totalBytes > 0) {
+        const uint64_t percent100 = (usedBytes * 10000ULL) / totalBytes;
+        percentInt = percent100 / 100ULL;
+        percentFrac = percent100 % 100ULL;
+    }
+
+    const bool dbExists = SD_MMC.exists("/database/dongle.db");
+    uint64_t dbBytes = 0;
+    if (dbExists) {
+        File dbFile = SD_MMC.open("/database/dongle.db", FILE_READ);
+        if (dbFile) {
+            dbBytes = static_cast<uint64_t>(dbFile.size());
+            dbFile.close();
+        }
+    }
+
+    char line[280] = {0};
     std::snprintf(
         line,
         sizeof(line),
-        "[dongle] SD %s %u-bit@%lukHz total=%lluMB usado=%lluMB",
+        "[dongle] SD %s %u-bit@%lukHz total=%lluMB(%lluB) usado=%lluMB(%lluB) uso=%llu.%02llu%% db=%s(%lluB)",
         type.c_str(),
         g_ctx.peripherals->sdOneBitMode() ? 1U : 4U,
         static_cast<unsigned long>(g_ctx.peripherals->sdFrequencyKHz()),
-        static_cast<unsigned long long>(total),
-        static_cast<unsigned long long>(used)
+        static_cast<unsigned long long>(totalMB),
+        static_cast<unsigned long long>(totalBytes),
+        static_cast<unsigned long long>(usedMB),
+        static_cast<unsigned long long>(usedBytes),
+        static_cast<unsigned long long>(percentInt),
+        static_cast<unsigned long long>(percentFrac),
+        dbExists ? "presente" : "ausente",
+        static_cast<unsigned long long>(dbBytes)
     );
     printLine(line);
     return RESULT_OK;

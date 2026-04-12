@@ -375,17 +375,27 @@ String DonglePeripherals::sdCardTypeName() const {
 }
 
 uint64_t DonglePeripherals::sdTotalMB() const {
+    return sdTotalBytes() / (1024ULL * 1024ULL);
+}
+
+uint64_t DonglePeripherals::sdTotalBytes() const {
     if (!sdReady_) {
         return 0;
     }
-    return SD_MMC.totalBytes() / (1024ULL * 1024ULL);
+
+    return SD_MMC.totalBytes();
 }
 
 uint64_t DonglePeripherals::sdUsedMB() const {
+    return sdUsedBytes() / (1024ULL * 1024ULL);
+}
+
+uint64_t DonglePeripherals::sdUsedBytes() const {
     if (!sdReady_) {
         return 0;
     }
-    return SD_MMC.usedBytes() / (1024ULL * 1024ULL);
+
+    return SD_MMC.usedBytes();
 }
 
 bool DonglePeripherals::wipeSdContents() {
