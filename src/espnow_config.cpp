@@ -206,6 +206,9 @@ void onDataRecv(const uint8_t* mac, const EspNowManager::message& incomingData) 
         EspNowConfig::RxMessageEvent event = {};
         std::memcpy(event.mac, mac, sizeof(event.mac));
         event.incoming = incomingData;
+    #if ESP_NOW_RX_LATENCY_DEBUG
+        event.receivedAtUs = micros();
+    #endif
 
         if (xQueueSend(g_rxQueue, &event, 0) == pdTRUE) {
             return;
@@ -288,7 +291,27 @@ bool dequeueRxMessage(RxMessageEvent& outEvent, uint32_t timeoutMs) {
 }
 
 void processRxMessage(const RxMessageEvent& event) {
+#if ESP_NOW_RX_LATENCY_DEBUG
+    const uint32_t startedAtUs = event.receivedAtUs;
+#endif
     processRxMessageInternal(event.mac, event.incoming);
+
+#if ESP_NOW_RX_LATENCY_DEBUG
+    if (g_rxDisplayQueue != nullptr) {
+        RxDisplayLine debugItem = {};
+        const uint32_t elapsedUs = static_cast<uint32_t>(micros() - startedAtUs);
+        std::snprintf(
+            debugItem.header,
+            sizeof(debugItem.header),
+            "[debug][rx] livre_us=%lu",
+            static_cast<unsigned long>(elapsedUs)
+        );
+        debugItem.payload[0] = '\0';
+        debugItem.payloadLen = 0;
+        debugItem.color = ST77XX_YELLOW;
+        (void)xQueueSend(g_rxDisplayQueue, &debugItem, 0);
+    }
+#endif
 }
 
 size_t flushRxDisplayLines(size_t maxLines) {

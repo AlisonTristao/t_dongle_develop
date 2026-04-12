@@ -6,11 +6,20 @@
 
 class LcdTerminal;
 
+#if defined(DEBUG)
+#define ESP_NOW_RX_LATENCY_DEBUG 1
+#else
+#define ESP_NOW_RX_LATENCY_DEBUG 0
+#endif
+
 namespace EspNowConfig {
 
 struct RxMessageEvent {
 	uint8_t mac[6];
 	EspNowManager::message incoming;
+#if ESP_NOW_RX_LATENCY_DEBUG
+	uint32_t receivedAtUs;
+#endif
 };
 
 void attachCallbacks(
