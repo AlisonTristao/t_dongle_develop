@@ -1,4 +1,5 @@
 #include "shell_config.h"
+#include "espnow_config.h"
 #include "error_codes.h"
 #include "shell_output.h"
 
@@ -8,6 +9,7 @@
 #include <cstdio>
 #include <ctime>
 #include <sys/time.h>
+#include <Esp.h>
 #include <SD_MMC.h>
 
 namespace {
@@ -288,6 +290,8 @@ uint8_t wrapper_help_e() {
     printLine("Exemplo local LED: dongle -led 255, 0, 0");
     printLine("Exemplo espnow unicast: espnow -send_to 1, \"dongle -run status\"");
     printLine("Exemplo espnow broadcast: espnow -send_to 000, \"dongle -run status\"");
+    printLine("Status buffer RX->DB: espnow -flush_status");
+    printLine("Flush manual RX->DB (modo high frequency): espnow -flush_db [limite]");
     printLine("Alias 000 no send_to = envia para todos os peers");
     printLine("Editar peer: espnow -update 1, \"nome novo\", \"descricao nova\"");
     printLine("Banco sqlite no SD: database -status | database -tables | database -read peers, 20");
@@ -892,6 +896,70 @@ uint8_t wrapper_espnow_send_all(string command) {
     return RESULT_OK;
 }
 
+uint8_t wrapper_espnow_flush_db(int32_t limit = 0) {
+    if (g_ctx.database == nullptr || !g_ctx.database->isReady()) {
+        return failWithCode(AppError::Code::DATABASE_NOT_READY, "database indisponivel para flush do buffer RX");
+    }
+
+    const size_t pendingBefore = EspNowConfig::pendingRxDbLogCount();
+    const size_t maxItems = (limit > 0) ? static_cast<size_t>(limit) : 0U;
+    const size_t flushed = EspNowConfig::flushRxDbLogBuffer(maxItems);
+    const size_t pendingAfter = EspNowConfig::pendingRxDbLogCount();
+    const size_t capacity = EspNowConfig::rxDbLogCapacity();
+    const size_t threshold = (capacity * RX_DB_AUTO_FLUSH_PERCENT + 99U) / 100U;
+
+        char line[256] = {0};
+    std::snprintf(
+        line,
+        sizeof(line),
+        "[espnow] flush_db modo=%s antes=%lu gravados=%lu depois=%lu cap=%lu thr=%lu heap=%lu min=%lu",
+#if HIGH_FREQUENCY_INCOMMING_ESPNOW
+        "buffer_ram",
+#else
+        "normal",
+#endif
+        static_cast<unsigned long>(pendingBefore),
+        static_cast<unsigned long>(flushed),
+        static_cast<unsigned long>(pendingAfter),
+        static_cast<unsigned long>(capacity),
+        static_cast<unsigned long>(threshold),
+        static_cast<unsigned long>(ESP.getFreeHeap()),
+        static_cast<unsigned long>(ESP.getMinFreeHeap())
+    );
+    printLine(line);
+    return RESULT_OK;
+}
+
+uint8_t wrapper_espnow_flush_status() {
+    const size_t pending = EspNowConfig::pendingRxDbLogCount();
+    const size_t capacity = EspNowConfig::rxDbLogCapacity();
+    const size_t threshold = (capacity * RX_DB_AUTO_FLUSH_PERCENT + 99U) / 100U;
+    const unsigned long percent = (capacity > 0U)
+        ? static_cast<unsigned long>((pending * 100U) / capacity)
+        : 0UL;
+
+    char line[288] = {0};
+    std::snprintf(
+        line,
+        sizeof(line),
+        "[espnow] flush_status modo=%s pending=%lu cap=%lu thr=%lu (%u%%) occ=%lu%% heap=%lu min=%lu",
+#if HIGH_FREQUENCY_INCOMMING_ESPNOW
+        "buffer_ram",
+#else
+        "normal",
+#endif
+        static_cast<unsigned long>(pending),
+        static_cast<unsigned long>(capacity),
+        static_cast<unsigned long>(threshold),
+        static_cast<unsigned>(RX_DB_AUTO_FLUSH_PERCENT),
+        percent,
+        static_cast<unsigned long>(ESP.getFreeHeap()),
+        static_cast<unsigned long>(ESP.getMinFreeHeap())
+    );
+    printLine(line);
+    return RESULT_OK;
+}
+
 uint8_t wrapper_database_init() {
     if (g_ctx.database == nullptr) {
         return failWithCode(AppError::Code::DATABASE_NOT_READY, "database indisponivel para comando init");
@@ -1134,6 +1202,8 @@ uint8_t registerDefaultModules() {
     g_ctx.shell->add(wrapper_espnow_update, "update", "atualiza peer: <numero>, <nome>, <descricao>", "espnow");
     g_ctx.shell->add(wrapper_espnow_send_to, "send_to", "envia para indice: <numero|000>, <comando> (000=todos)", "espnow");
     g_ctx.shell->add(wrapper_espnow_send_all, "send_all", "envia para todos: <comando>", "espnow");
+    g_ctx.shell->add(wrapper_espnow_flush_status, "flush_status", "mostra status do buffer RX->DB", "espnow");
+    g_ctx.shell->add(wrapper_espnow_flush_db, "flush_db", "persiste buffer RX->DB: <limite opcional>", "espnow");
 
     g_ctx.shell->add(wrapper_database_init, "init", "abre o banco e aplica bootstrap.sql", "database");
     g_ctx.shell->add(wrapper_database_status, "status", "status geral do sqlite", "database");

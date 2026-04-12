@@ -18,8 +18,11 @@ DatabaseStore* g_database = nullptr;
 LcdTerminal* g_lcdTerminal = nullptr;
 QueueHandle_t g_rxQueue = nullptr;
 QueueHandle_t g_rxDisplayQueue = nullptr;
+QueueHandle_t g_rxDbLogQueue = nullptr;
 volatile uint32_t g_droppedRxCount = 0;
+volatile uint32_t g_droppedRxDbLogCount = 0;
 bool g_asyncRxEnabled = false;
+bool g_asyncDbLogEnabled = false;
 
 struct RxDisplayLine {
     char header[96];
@@ -178,12 +181,14 @@ void processRxMessageInternal(const uint8_t mac[6], const EspNowManager::message
             ensurePayloadTerminator(g_io, payload, payloadLen);
         }
 
+#if !HIGH_FREQUENCY_INCOMMING_ESPNOW
         if (g_lcdTerminal != nullptr && g_lcdTerminal->isReady()) {
             g_lcdTerminal->writeText(String(header), color);
             if (payloadLen > 0) {
                 g_lcdTerminal->writeText(String(payload), color);
             }
         }
+#endif
     }
 
     if (mac != nullptr && g_manager != nullptr && g_manager->deviceIndexByMac(mac) < 0) {
@@ -193,7 +198,16 @@ void processRxMessageInternal(const uint8_t mac[6], const EspNowManager::message
     }
 
     if (g_database != nullptr && g_database->isReady() && mac != nullptr) {
-        g_database->logIncomingEspNow(mac, incomingData);
+        if (g_asyncDbLogEnabled && g_rxDbLogQueue != nullptr) {
+            EspNowConfig::RxDbLogEvent dbLogEvent = {};
+            std::memcpy(dbLogEvent.mac, mac, sizeof(dbLogEvent.mac));
+            dbLogEvent.incoming = incomingData;
+            if (xQueueSend(g_rxDbLogQueue, &dbLogEvent, 0) != pdTRUE) {
+                ++g_droppedRxDbLogCount;
+            }
+        } else if (!g_database->logIncomingEspNow(mac, incomingData)) {
+            ++g_droppedRxDbLogCount;
+        }
     }
 }
 
@@ -206,9 +220,6 @@ void onDataRecv(const uint8_t* mac, const EspNowManager::message& incomingData) 
         EspNowConfig::RxMessageEvent event = {};
         std::memcpy(event.mac, mac, sizeof(event.mac));
         event.incoming = incomingData;
-    #if ESP_NOW_RX_LATENCY_DEBUG
-        event.receivedAtUs = micros();
-    #endif
 
         if (xQueueSend(g_rxQueue, &event, 0) == pdTRUE) {
             return;
@@ -261,20 +272,33 @@ bool enableAsyncRx(size_t queueDepth) {
         }
     }
 
+    if (g_rxDbLogQueue == nullptr) {
+        g_rxDbLogQueue = xQueueCreate(static_cast<UBaseType_t>(RX_DB_LOG_QUEUE_DEPTH), sizeof(RxDbLogEvent));
+    }
+
     xQueueReset(g_rxQueue);
     xQueueReset(g_rxDisplayQueue);
+    if (g_rxDbLogQueue != nullptr) {
+        xQueueReset(g_rxDbLogQueue);
+    }
     g_droppedRxCount = 0;
+    g_droppedRxDbLogCount = 0;
+    g_asyncDbLogEnabled = false;
     g_asyncRxEnabled = true;
     return true;
 }
 
 void disableAsyncRx() {
     g_asyncRxEnabled = false;
+    g_asyncDbLogEnabled = false;
     if (g_rxQueue != nullptr) {
         xQueueReset(g_rxQueue);
     }
     if (g_rxDisplayQueue != nullptr) {
         xQueueReset(g_rxDisplayQueue);
+    }
+    if (g_rxDbLogQueue != nullptr) {
+        xQueueReset(g_rxDbLogQueue);
     }
 }
 
@@ -291,27 +315,75 @@ bool dequeueRxMessage(RxMessageEvent& outEvent, uint32_t timeoutMs) {
 }
 
 void processRxMessage(const RxMessageEvent& event) {
-#if ESP_NOW_RX_LATENCY_DEBUG
-    const uint32_t startedAtUs = event.receivedAtUs;
-#endif
     processRxMessageInternal(event.mac, event.incoming);
+}
 
-#if ESP_NOW_RX_LATENCY_DEBUG
-    if (g_rxDisplayQueue != nullptr) {
-        RxDisplayLine debugItem = {};
-        const uint32_t elapsedUs = static_cast<uint32_t>(micros() - startedAtUs);
-        std::snprintf(
-            debugItem.header,
-            sizeof(debugItem.header),
-            "[debug][rx] livre_us=%lu",
-            static_cast<unsigned long>(elapsedUs)
-        );
-        debugItem.payload[0] = '\0';
-        debugItem.payloadLen = 0;
-        debugItem.color = ST77XX_YELLOW;
-        (void)xQueueSend(g_rxDisplayQueue, &debugItem, 0);
+bool dequeueRxDbLog(RxDbLogEvent& outEvent, uint32_t timeoutMs) {
+    if (g_rxDbLogQueue == nullptr) {
+        return false;
     }
-#endif
+
+    const TickType_t waitTicks = (timeoutMs == 0)
+        ? static_cast<TickType_t>(0)
+        : pdMS_TO_TICKS(timeoutMs);
+
+    return xQueueReceive(g_rxDbLogQueue, &outEvent, waitTicks) == pdTRUE;
+}
+
+void processRxDbLog(const RxDbLogEvent& event) {
+    if (g_database != nullptr && g_database->isReady()) {
+        if (!g_database->logIncomingEspNow(event.mac, event.incoming)) {
+            ++g_droppedRxDbLogCount;
+        }
+    }
+}
+
+void setAsyncDbLogEnabled(bool enabled) {
+    g_asyncDbLogEnabled = enabled && (g_rxDbLogQueue != nullptr);
+}
+
+size_t flushRxDbLogBuffer(size_t maxItems) {
+    if (g_rxDbLogQueue == nullptr || g_database == nullptr || !g_database->isReady()) {
+        return 0;
+    }
+
+    const size_t limit = (maxItems == 0) ? static_cast<size_t>(-1) : maxItems;
+    const bool wantsBatch = (maxItems == 0) || (maxItems > 1);
+    const bool hasTransaction = wantsBatch && g_database->beginTransaction();
+    size_t flushed = 0;
+    RxDbLogEvent event = {};
+
+    while (flushed < limit && dequeueRxDbLog(event, 0)) {
+        processRxDbLog(event);
+        ++flushed;
+    }
+
+    if (hasTransaction) {
+        if (!g_database->commitTransaction()) {
+            (void)g_database->rollbackTransaction();
+            g_droppedRxDbLogCount += static_cast<uint32_t>(flushed);
+        }
+    }
+
+    return flushed;
+}
+
+size_t pendingRxDbLogCount() {
+    if (g_rxDbLogQueue == nullptr) {
+        return 0;
+    }
+
+    return static_cast<size_t>(uxQueueMessagesWaiting(g_rxDbLogQueue));
+}
+
+size_t rxDbLogCapacity() {
+    if (g_rxDbLogQueue == nullptr) {
+        return 0;
+    }
+
+    const size_t pending = static_cast<size_t>(uxQueueMessagesWaiting(g_rxDbLogQueue));
+    const size_t available = static_cast<size_t>(uxQueueSpacesAvailable(g_rxDbLogQueue));
+    return pending + available;
 }
 
 size_t flushRxDisplayLines(size_t maxLines) {
@@ -328,12 +400,14 @@ size_t flushRxDisplayLines(size_t maxLines) {
             ensurePayloadTerminator(g_io, item.payload, item.payloadLen);
         }
 
-        if (g_lcdTerminal != nullptr && g_lcdTerminal->isReady()) {
+#if !HIGH_FREQUENCY_INCOMMING_ESPNOW
+    if (g_lcdTerminal != nullptr && g_lcdTerminal->isReady()) {
             g_lcdTerminal->writeText(String(item.header), item.color);
             if (item.payloadLen > 0) {
                 g_lcdTerminal->writeText(String(item.payload), item.color);
             }
         }
+#endif
 
         ++drained;
     }
@@ -344,6 +418,12 @@ size_t flushRxDisplayLines(size_t maxLines) {
 uint32_t takeDroppedRxCount() {
     const uint32_t dropped = g_droppedRxCount;
     g_droppedRxCount = 0;
+    return dropped;
+}
+
+uint32_t takeDroppedRxDbLogCount() {
+    const uint32_t dropped = g_droppedRxDbLogCount;
+    g_droppedRxDbLogCount = 0;
     return dropped;
 }
 

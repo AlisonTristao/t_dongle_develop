@@ -139,6 +139,21 @@ public:
      */
     bool executeSql(const String& sql, String& outText);
 
+    /**
+     * @brief Starts an explicit SQLite transaction.
+     */
+    bool beginTransaction();
+
+    /**
+     * @brief Commits current SQLite transaction.
+     */
+    bool commitTransaction();
+
+    /**
+     * @brief Rolls back current SQLite transaction.
+     */
+    bool rollbackTransaction();
+
 private:
     sqlite3* db_;
     Stream* io_;

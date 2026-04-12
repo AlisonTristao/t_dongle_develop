@@ -1041,6 +1041,30 @@ bool DatabaseStore::executeSql(const String& sql, String& outText) {
     return queryToText(trimmed, 80, outText);
 }
 
+bool DatabaseStore::beginTransaction() {
+    if (!ready_) {
+        return false;
+    }
+
+    return executeNoResult("BEGIN IMMEDIATE;");
+}
+
+bool DatabaseStore::commitTransaction() {
+    if (!ready_) {
+        return false;
+    }
+
+    return executeNoResult("COMMIT;");
+}
+
+bool DatabaseStore::rollbackTransaction() {
+    if (!ready_) {
+        return false;
+    }
+
+    return executeNoResult("ROLLBACK;");
+}
+
 bool DatabaseStore::openDatabase() {
     if (!lockDb()) {
         return false;

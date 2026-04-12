@@ -6,10 +6,24 @@
 
 class LcdTerminal;
 
-#if defined(DEBUG)
-#define ESP_NOW_RX_LATENCY_DEBUG 1
+#ifndef HIGH_FREQUENCY_INCOMMING_ESPNOW
+#define HIGH_FREQUENCY_INCOMMING_ESPNOW 0
+#endif
+
+#ifndef RX_ASYNC_QUEUE_DEPTH
+#define RX_ASYNC_QUEUE_DEPTH 24
+#endif
+
+#ifndef RX_DB_LOG_QUEUE_DEPTH
+#if HIGH_FREQUENCY_INCOMMING_ESPNOW
+#define RX_DB_LOG_QUEUE_DEPTH 128
 #else
-#define ESP_NOW_RX_LATENCY_DEBUG 0
+#define RX_DB_LOG_QUEUE_DEPTH RX_ASYNC_QUEUE_DEPTH
+#endif
+#endif
+
+#ifndef RX_DB_AUTO_FLUSH_PERCENT
+#define RX_DB_AUTO_FLUSH_PERCENT 80
 #endif
 
 namespace EspNowConfig {
@@ -17,9 +31,11 @@ namespace EspNowConfig {
 struct RxMessageEvent {
 	uint8_t mac[6];
 	EspNowManager::message incoming;
-#if ESP_NOW_RX_LATENCY_DEBUG
-	uint32_t receivedAtUs;
-#endif
+};
+
+struct RxDbLogEvent {
+	uint8_t mac[6];
+	EspNowManager::message incoming;
 };
 
 void attachCallbacks(
@@ -37,8 +53,22 @@ bool dequeueRxMessage(RxMessageEvent& outEvent, uint32_t timeoutMs = 0);
 
 void processRxMessage(const RxMessageEvent& event);
 
+bool dequeueRxDbLog(RxDbLogEvent& outEvent, uint32_t timeoutMs = 0);
+
+void processRxDbLog(const RxDbLogEvent& event);
+
+void setAsyncDbLogEnabled(bool enabled);
+
+size_t flushRxDbLogBuffer(size_t maxItems = 0);
+
+size_t pendingRxDbLogCount();
+
+size_t rxDbLogCapacity();
+
 size_t flushRxDisplayLines(size_t maxLines = 8);
 
 uint32_t takeDroppedRxCount();
+
+uint32_t takeDroppedRxDbLogCount();
 
 } // namespace EspNowConfig
