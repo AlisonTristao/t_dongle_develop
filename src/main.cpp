@@ -71,7 +71,7 @@ void setup() {
 
     StartupConfig::promptAndSetDateTime(Serial);
 
-    EspNowConfig::attachCallbacks(espNowManager, Serial, &databaseStore);
+    EspNowConfig::attachCallbacks(espNowManager, Serial, &databaseStore, &lcdTerminal);
 
     const bool asyncRxEnabled = EspNowConfig::enableAsyncRx(24);
     if (!asyncRxEnabled) {
@@ -133,6 +133,8 @@ void setup() {
 }
 
 void loop() {
+    EspNowConfig::flushRxDisplayLines(12);
+
     String command;
     if (serialShell.readInputLine(command)) {
         // Keep command/output/result visually separated in the serial terminal.
@@ -146,6 +148,8 @@ void loop() {
 
         Serial.println();
     }
+
+    EspNowConfig::flushRxDisplayLines(12);
 
     // Small cooperative delay for non-blocking loop behavior.
     delay(1);
