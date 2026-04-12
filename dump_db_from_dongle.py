@@ -276,6 +276,10 @@ def exec_sql(
 
 
 def build_dump_select(columns: Sequence[str], table: str) -> str:
+    if table == "command_log_output":
+        # This table can be very large on serial; cap text size per row for stable dumps.
+        return "SELECT id, log_id, substr(output, 1, 512) AS output, created_at FROM command_log_output"
+
     return f"SELECT * FROM {table}"
 
 
@@ -525,6 +529,7 @@ def dump_table(
 
         total = fetch_table_count_upto_id(client, table, snapshot_max_id)
         last_id = 0
+        seen_ids: Set[int] = set()
 
         while last_id < snapshot_max_id:
             sql = (
@@ -557,23 +562,39 @@ def dump_table(
                 if expected_keys is None:
                     expected_keys = set(inferred_cols)
 
-            inserted = insert_rows(conn, table, rows, int(time.time()))
-            captured_total += inserted
-
-            row_ids: List[int] = []
+            # Serial noise can duplicate lines; keep at most one row per id.
+            filtered_rows: List[Dict[str, str]] = []
+            progress_ids: List[int] = []
             for row in rows:
                 raw_id = row.get("id")
                 if raw_id is None:
                     continue
+
                 try:
-                    row_ids.append(int(raw_id))
+                    id_value = int(raw_id)
                 except ValueError:
                     continue
 
-            if not row_ids:
+                if id_value <= 0 or id_value > snapshot_max_id:
+                    continue
+
+                progress_ids.append(id_value)
+                if id_value <= last_id or id_value in seen_ids:
+                    continue
+
+                seen_ids.add(id_value)
+                filtered_rows.append(row)
+
+            if not progress_ids:
                 raise RuntimeError(f"linhas sem coluna id parseavel em {table}")
 
-            last_id = max(row_ids)
+            inserted = insert_rows(conn, table, filtered_rows, int(time.time()))
+            captured_total += inserted
+
+            next_last_id = max(progress_ids)
+            if next_last_id <= last_id:
+                break
+            last_id = next_last_id
 
         return total, captured_total
 
