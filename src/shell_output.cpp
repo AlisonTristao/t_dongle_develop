@@ -1,8 +1,10 @@
 #include "shell_output.h"
 
+#include <cstring>
+
 namespace {
 
-const char* outputPrefix(const String& text) {
+bool isErrorLike(const String& text) {
     String lower = text;
     lower.toLowerCase();
 
@@ -12,15 +14,82 @@ const char* outputPrefix(const String& text) {
         lower.indexOf("error") >= 0 ||
         lower.indexOf("invalid") >= 0
     ) {
-        return "! ";
+        return true;
     }
 
-    return "> ";
+    return false;
+}
+
+String normalizeTag(const char* tag) {
+    String out = (tag != nullptr) ? String(tag) : String("shell");
+    out.trim();
+    if (out.length() == 0) {
+        out = "shell";
+    }
+
+    if (out.startsWith("[")) {
+        out.remove(0, 1);
+    }
+    if (out.endsWith("]")) {
+        out.remove(out.length() - 1, 1);
+    }
+
+    out.trim();
+    if (out.length() == 0) {
+        out = "shell";
+    }
+
+    return out;
 }
 
 } // namespace
 
 namespace ShellOutput {
+
+void writeLine(Stream& io, const String& line) {
+    writeLine(io, line.c_str());
+}
+
+void writeLine(Stream& io, const char* line) {
+    const char* safeLine = (line != nullptr) ? line : "";
+    const uint8_t* data = reinterpret_cast<const uint8_t*>(safeLine);
+    size_t remaining = std::strlen(safeLine);
+    uint32_t retries = 0;
+
+    while (remaining > 0) {
+        const size_t sent = io.write(data, remaining);
+        if (sent == 0) {
+            ++retries;
+            if (retries > 8) {
+                break;
+            }
+            delay(1);
+            continue;
+        }
+
+        data += sent;
+        remaining -= sent;
+    }
+
+    io.write('\r');
+    io.write('\n');
+}
+
+void printTagged(Stream& io, const char* tag, const String& message) {
+    const String safeTag = normalizeTag(tag);
+    String line = "[" + safeTag + "]";
+
+    if (message.length() > 0) {
+        line += " ";
+        line += message;
+    }
+
+    writeLine(io, line);
+}
+
+void printTagged(Stream& io, const char* tag, const char* message) {
+    printTagged(io, tag, (message != nullptr) ? String(message) : String(""));
+}
 
 void printResponse(Stream& io, const std::string& response) {
     // Normalize response into clean single-line chunks for terminal rendering.
@@ -45,9 +114,16 @@ void printResponse(Stream& io, const std::string& response) {
 
         line.trim();
         if (line.length() > 0) {
-            // Prefix each output line to clearly separate shell result from input.
-            io.print(outputPrefix(line));
-            io.println(line);
+            if (line.startsWith("[")) {
+                writeLine(io, line);
+                continue;
+            }
+
+            const bool error = isErrorLike(line);
+            const String tagged = error
+                ? String("[shell][erro] ") + line
+                : String("[shell][ok] ") + line;
+            writeLine(io, tagged);
         }
 
         if (newline < 0) {

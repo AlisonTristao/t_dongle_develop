@@ -2,6 +2,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+#include <cstdio>
+
 #include "config.h"
 #include "startup_config.h"
 #include "shell_config.h"
@@ -44,8 +46,9 @@ void espNowRxWorkerTask(void*) {
 
         const uint32_t dropped = EspNowConfig::takeDroppedRxCount();
         if (dropped > 0) {
-            Serial.print("espnow rx dropped=");
-            Serial.println(static_cast<unsigned long>(dropped));
+            char line[64] = {0};
+            std::snprintf(line, sizeof(line), "rx_dropped=%lu", static_cast<unsigned long>(dropped));
+            ShellOutput::printTagged(Serial, "espnow", line);
         }
     }
 }
@@ -66,8 +69,7 @@ void setup() {
     // Startup visuals already initialize LED/LCD; continue with remaining peripherals.
     donglePeripherals.beginSd(false);
 
-    Serial.print("mac: ");
-    Serial.println(WiFi.macAddress());
+    ShellOutput::printTagged(Serial, "startup", String("mac=") + WiFi.macAddress());
 
     StartupConfig::promptAndSetDateTime(Serial);
 
@@ -75,16 +77,16 @@ void setup() {
 
     const bool asyncRxEnabled = EspNowConfig::enableAsyncRx(24);
     if (!asyncRxEnabled) {
-        Serial.println("espnow async queue init failed (fallback no callback)");
+        ShellOutput::printTagged(Serial, "espnow", "async queue init failed (fallback no callback)");
     }
 
     if (!espNowManager.begin(0, false)) {
-        Serial.println("esp-now init failed");
+        ShellOutput::printTagged(Serial, "espnow", "init failed");
         return;
     }
 
     if (!databaseStore.begin(espNowManager, &Serial)) {
-        Serial.println("database init failed (continuando sem persistencia)");
+        ShellOutput::printTagged(Serial, "database", "init failed (continuando sem persistencia)");
     } else {
         databaseStore.logBootEvent("power_on");
     }
@@ -103,10 +105,11 @@ void setup() {
 
         if (taskOk != pdPASS) {
             EspNowConfig::disableAsyncRx();
-            Serial.println("espnow rx task create failed (fallback callback)");
+            ShellOutput::printTagged(Serial, "espnow", "rx task create failed (fallback callback)");
         } else {
-            Serial.print("espnow rx task core=");
-            Serial.println(static_cast<int>(workerCore));
+            char line[48] = {0};
+            std::snprintf(line, sizeof(line), "rx task core=%d", static_cast<int>(workerCore));
+            ShellOutput::printTagged(Serial, "espnow", line);
         }
     }
 
@@ -119,17 +122,17 @@ void setup() {
         &Serial
     });
     if (!shellBound) {
-        Serial.println("shell bind failed");
+        ShellOutput::printTagged(Serial, "shell", "bind failed");
         return;
     }
 
     if (ShellConfig::registerDefaultModules() != RESULT_OK) {
-        Serial.println("shell module registration failed");
+        ShellOutput::printTagged(Serial, "shell", "module registration failed");
         return;
     }
 
-    Serial.println("shell ready: <module> -<command> [args]");
-    Serial.println("use: help -e");
+    ShellOutput::printTagged(Serial, "shell", "ready: <module> -<command> [args]");
+    ShellOutput::printTagged(Serial, "shell", "use: help -e");
 }
 
 void loop() {

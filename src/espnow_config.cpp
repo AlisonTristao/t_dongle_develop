@@ -1,5 +1,6 @@
 #include "espnow_config.h"
 #include "LcdTerminal.h"
+#include "shell_output.h"
 
 #include <cctype>
 #include <cstdio>
@@ -128,34 +129,6 @@ void sanitizeIncomingText(const EspNowManager::message& incomingData, char* outT
     }
 }
 
-void writeLineToStream(Stream* io, const char* line) {
-    if (io == nullptr || line == nullptr) {
-        return;
-    }
-
-    const uint8_t* data = reinterpret_cast<const uint8_t*>(line);
-    size_t remaining = std::strlen(line);
-    uint32_t retries = 0;
-
-    while (remaining > 0) {
-        const size_t sent = io->write(data, remaining);
-        if (sent == 0) {
-            ++retries;
-            if (retries > 8) {
-                break;
-            }
-            delay(1);
-            continue;
-        }
-
-        data += sent;
-        remaining -= sent;
-    }
-
-    io->write('\r');
-    io->write('\n');
-}
-
 bool enqueueDisplayLine(const char* line, uint16_t color) {
     if (line == nullptr) {
         return false;
@@ -193,7 +166,7 @@ void processRxMessageInternal(const uint8_t mac[6], const EspNowManager::message
     if (!enqueueDisplayLine(line, color)) {
         // Fallback path when queue is unavailable/full.
         if (g_io != nullptr) {
-            writeLineToStream(g_io, line);
+            ShellOutput::writeLine(*g_io, line);
         }
 
         if (g_lcdTerminal != nullptr && g_lcdTerminal->isReady()) {
@@ -315,7 +288,7 @@ void flushRxDisplayLines(size_t maxLines) {
     size_t drained = 0;
     while (drained < maxLines && xQueueReceive(g_rxDisplayQueue, &item, 0) == pdTRUE) {
         if (g_io != nullptr) {
-            writeLineToStream(g_io, item.text);
+            ShellOutput::writeLine(*g_io, item.text);
         }
 
         if (g_lcdTerminal != nullptr && g_lcdTerminal->isReady()) {
