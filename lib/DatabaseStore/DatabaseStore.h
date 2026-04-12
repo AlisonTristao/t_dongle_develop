@@ -29,6 +29,11 @@ public:
     bool rebuild(EspNowManager& espNow);
 
     /**
+     * @brief Creates a timestamped database snapshot under /database/backups.
+     */
+    bool backup(String& outText);
+
+    /**
      * @brief Closes active SQLite handle.
      */
     void end();
@@ -141,6 +146,7 @@ private:
     SemaphoreHandle_t dbMutex_;
 
     static constexpr const char* kFsDatabaseDir = "/database";
+    static constexpr const char* kFsBackupDir = "/database/backups";
     static constexpr const char* kFsBootstrapPath = "/database/bootstrap.sql";
     static constexpr const char* kFsDatabasePath = "/database/dongle.db";
     static constexpr const char* kSqliteDatabasePath = "/sdcard/database/dongle.db";

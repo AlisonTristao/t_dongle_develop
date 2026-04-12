@@ -262,6 +262,120 @@ bool DatabaseStore::rebuild(EspNowManager& espNow) {
     return begin(espNow, io_);
 }
 
+bool DatabaseStore::backup(String& outText) {
+    outText = "";
+
+    if (!ready_) {
+        outText = "[database] nao inicializado";
+        return false;
+    }
+
+    File backupDir = SD_MMC.open(kFsBackupDir);
+    const bool hasBackupDir = backupDir && backupDir.isDirectory();
+    if (backupDir) {
+        backupDir.close();
+    }
+
+    if (!hasBackupDir && !SD_MMC.mkdir(kFsBackupDir)) {
+        outText = "[database] falha ao criar pasta de backup";
+        return false;
+    }
+
+    const int64_t nowEpoch = currentEpochSeconds();
+    const time_t nowRaw = static_cast<time_t>(nowEpoch);
+    std::tm localTime = {};
+    char timestamp[32] = {0};
+    if (nowRaw > 0 && localtime_r(&nowRaw, &localTime) != nullptr) {
+        std::strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", &localTime);
+    } else {
+        std::snprintf(timestamp, sizeof(timestamp), "epoch_%lld", static_cast<long long>(nowEpoch));
+    }
+
+    const String baseName = String("dongle_") + timestamp;
+    String fsBackupPath = String(kFsBackupDir) + "/" + baseName + ".db";
+    int suffix = 1;
+    while (SD_MMC.exists(fsBackupPath) && suffix < 1000) {
+        char suffixText[8] = {0};
+        std::snprintf(suffixText, sizeof(suffixText), "_%03d", suffix);
+        fsBackupPath = String(kFsBackupDir) + "/" + baseName + suffixText + ".db";
+        ++suffix;
+    }
+
+    if (SD_MMC.exists(fsBackupPath)) {
+        outText = "[database] falha ao gerar nome unico para backup";
+        return false;
+    }
+
+    const String sqliteBackupPath = String("/sdcard") + fsBackupPath;
+
+    if (!lockDb(5000)) {
+        outText = "[database] lock indisponivel para backup";
+        return false;
+    }
+
+    if (db_ == nullptr) {
+        outText = "[database] nao inicializado";
+        unlockDb();
+        return false;
+    }
+
+    char* checkpointError = nullptr;
+    sqlite3_exec(db_, "PRAGMA wal_checkpoint(FULL);", nullptr, nullptr, &checkpointError);
+    if (checkpointError != nullptr) {
+        sqlite3_free(checkpointError);
+    }
+
+    sqlite3* backupDb = nullptr;
+    const int openRc = sqlite3_open(sqliteBackupPath.c_str(), &backupDb);
+    if (openRc != SQLITE_OK || backupDb == nullptr) {
+        if (backupDb != nullptr) {
+            sqlite3_close(backupDb);
+        }
+        unlockDb();
+        outText = "[database] falha ao abrir arquivo de backup";
+        return false;
+    }
+
+    sqlite3_backup* backupHandle = sqlite3_backup_init(backupDb, "main", db_, "main");
+    if (backupHandle == nullptr) {
+        sqlite3_close(backupDb);
+        unlockDb();
+        outText = "[database] falha ao iniciar copia do backup";
+        return false;
+    }
+
+    const int stepRc = sqlite3_backup_step(backupHandle, -1);
+    const int finishRc = sqlite3_backup_finish(backupHandle);
+    const int destErr = sqlite3_errcode(backupDb);
+    sqlite3_close(backupDb);
+    unlockDb();
+
+    const bool copied = (stepRc == SQLITE_DONE) && (finishRc == SQLITE_OK) && (destErr == SQLITE_OK);
+    if (!copied) {
+        SD_MMC.remove(fsBackupPath);
+        outText = "[database] falha ao gerar backup";
+        return false;
+    }
+
+    uint64_t backupBytes = 0;
+    File backupFile = SD_MMC.open(fsBackupPath, FILE_READ);
+    if (backupFile) {
+        backupBytes = static_cast<uint64_t>(backupFile.size());
+        backupFile.close();
+    }
+
+    char line[256] = {0};
+    std::snprintf(
+        line,
+        sizeof(line),
+        "[database] backup salvo: %s (%lluB)",
+        fsBackupPath.c_str(),
+        static_cast<unsigned long long>(backupBytes)
+    );
+    outText = line;
+    return true;
+}
+
 void DatabaseStore::end() {
     closeDatabase();
 }

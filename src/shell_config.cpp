@@ -1031,6 +1031,21 @@ uint8_t wrapper_database_rebuild() {
     return failWithCode(AppError::Code::DATABASE_REBUILD_FAILED, "falha ao recriar banco");
 }
 
+uint8_t wrapper_database_backup() {
+    if (g_ctx.database == nullptr) {
+        return failWithCode(AppError::Code::DATABASE_NOT_READY, "database indisponivel para comando backup");
+    }
+
+    String output;
+    const bool ok = g_ctx.database->backup(output);
+    printLine(output.c_str());
+    if (!ok) {
+        return failWithCode(AppError::Code::DATABASE_QUERY_FAILED, "falha ao gerar backup do banco");
+    }
+
+    return RESULT_OK;
+}
+
 uint8_t wrapper_database_exec(string sql) {
     if (g_ctx.database == nullptr) {
         return failWithCode(AppError::Code::DATABASE_NOT_READY, "database indisponivel para comando exec");
@@ -1128,6 +1143,7 @@ uint8_t registerDefaultModules() {
     g_ctx.shell->add(wrapper_database_espnow_history, "espnow_history", "historico ESP-NOW RX/TX com status: <limite>", "database");
     g_ctx.shell->add(wrapper_database_drop, "drop", "remove tabela: <nome>", "database");
     g_ctx.shell->add(wrapper_database_rebuild, "rebuild", "recria banco a partir do bootstrap", "database");
+    g_ctx.shell->add(wrapper_database_backup, "backup", "salva snapshot do banco em /database/backups", "database");
     g_ctx.shell->add(wrapper_database_exec, "exec", "executa SQL livre: <sql>", "database");
     g_ctx.shell->add(wrapper_database_exec_nolog, "exec_nolog", "executa SQL sem salvar no command_log: <sql>", "database");
 
