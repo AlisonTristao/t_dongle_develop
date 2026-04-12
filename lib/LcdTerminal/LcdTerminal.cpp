@@ -14,7 +14,9 @@ LcdTerminal::LcdTerminal()
       textW_(0),
       textH_(0),
       cursorY_(0),
-      lineH_(8) {
+    lineH_(8),
+    maxVisibleLines_(1),
+        nextLineIndex_(0) {
 }
 
 bool LcdTerminal::begin(DonglePeripherals& peripherals) {
@@ -32,6 +34,10 @@ bool LcdTerminal::begin(DonglePeripherals& peripherals) {
     textW_ = static_cast<int16_t>(tft_->width() - (2 * (BORDER_PX + 2)));
     textH_ = static_cast<int16_t>(tft_->height() - (2 * (BORDER_PX + 2)));
     cursorY_ = textY_;
+
+    const int16_t rawVisibleLines = (lineH_ > 0) ? (textH_ / lineH_) : 0;
+    maxVisibleLines_ = (rawVisibleLines > 0) ? static_cast<size_t>(rawVisibleLines) : 1U;
+    nextLineIndex_ = 0;
 
     tft_->setTextSize(1);
     tft_->setTextWrap(false);
@@ -98,26 +104,28 @@ void LcdTerminal::drawFrame() {
         backgroundColor_
     );
     cursorY_ = textY_;
+    nextLineIndex_ = 0;
 }
 
 void LcdTerminal::writeLineInternal(const String& line, uint16_t color) {
-    if (cursorY_ + lineH_ > (textY_ + textH_)) {
-        tft_->fillRect(
-            BORDER_PX,
-            BORDER_PX,
-            static_cast<int16_t>(tft_->width() - (2 * BORDER_PX)),
-            static_cast<int16_t>(tft_->height() - (2 * BORDER_PX)),
-            backgroundColor_
-        );
-        cursorY_ = textY_;
+    const String fitted = fitLine(line);
+
+    if (maxVisibleLines_ == 0) {
+        return;
     }
 
-    tft_->fillRect(textX_, cursorY_, textW_, lineH_, backgroundColor_);
-    tft_->setCursor(textX_, cursorY_);
+    const int16_t lineY = static_cast<int16_t>(textY_ + static_cast<int16_t>(nextLineIndex_ * lineH_));
+    tft_->fillRect(textX_, lineY, textW_, lineH_, backgroundColor_);
+    tft_->setCursor(textX_, lineY);
     tft_->setTextColor(color, backgroundColor_);
-    tft_->print(fitLine(line));
+    tft_->print(fitted);
 
-    cursorY_ += lineH_;
+    ++nextLineIndex_;
+    if (nextLineIndex_ >= maxVisibleLines_) {
+        nextLineIndex_ = 0;
+    }
+
+    cursorY_ = static_cast<int16_t>(textY_ + static_cast<int16_t>(nextLineIndex_ * lineH_));
 }
 
 String LcdTerminal::fitLine(const String& line) const {

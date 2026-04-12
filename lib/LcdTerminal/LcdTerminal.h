@@ -72,6 +72,9 @@ private:
     int16_t cursorY_;
     uint8_t lineH_;
 
+    size_t maxVisibleLines_;
+    size_t nextLineIndex_;
+
     void drawFrame();
     void writeLineInternal(const String& line, uint16_t color);
     String fitLine(const String& line) const;
