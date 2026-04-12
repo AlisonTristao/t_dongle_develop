@@ -1046,6 +1046,21 @@ uint8_t wrapper_database_exec(string sql) {
     return RESULT_OK;
 }
 
+uint8_t wrapper_database_exec_nolog(string sql) {
+    if (g_ctx.database == nullptr) {
+        return failWithCode(AppError::Code::DATABASE_NOT_READY, "database indisponivel para comando exec_nolog");
+    }
+
+    String output;
+    const bool ok = g_ctx.database->executeSql(stripOuterQuotes(sql).c_str(), output);
+    printLine(output.c_str());
+    if (!ok) {
+        return failWithCode(AppError::Code::DATABASE_EXEC_FAILED, "falha ao executar SQL");
+    }
+
+    return RESULT_OK;
+}
+
 } // namespace
 
 namespace ShellConfig {
@@ -1114,6 +1129,7 @@ uint8_t registerDefaultModules() {
     g_ctx.shell->add(wrapper_database_drop, "drop", "remove tabela: <nome>", "database");
     g_ctx.shell->add(wrapper_database_rebuild, "rebuild", "recria banco a partir do bootstrap", "database");
     g_ctx.shell->add(wrapper_database_exec, "exec", "executa SQL livre: <sql>", "database");
+    g_ctx.shell->add(wrapper_database_exec_nolog, "exec_nolog", "executa SQL sem salvar no command_log: <sql>", "database");
 
     return RESULT_OK;
 }
@@ -1136,20 +1152,32 @@ std::string runLine(const std::string& command) {
 
     std::string output;
     const std::string databaseExecPrefix = "database -exec";
+    const std::string databaseExecNoLogPrefix = "database -exec_nolog";
+    bool skipCommandPersistence = false;
+
+    if (normalized == databaseExecNoLogPrefix || normalized.rfind(databaseExecNoLogPrefix + " ", 0) == 0) {
+        const std::string sql = trimCopy(normalized.substr(databaseExecNoLogPrefix.length()));
+        if (sql.empty()) {
+            failWithCode(AppError::Code::INVALID_ARGUMENT, "uso: database -exec_nolog \"<sql>\"");
+        } else {
+            wrapper_database_exec_nolog(sql);
+        }
+        skipCommandPersistence = true;
 
     // Bypass TinyShell tokenizer here so SQL can contain commas/quotes safely.
-    if (normalized == databaseExecPrefix || normalized.rfind(databaseExecPrefix + " ", 0) == 0) {
+    } else if (normalized == databaseExecPrefix || normalized.rfind(databaseExecPrefix + " ", 0) == 0) {
         const std::string sql = trimCopy(normalized.substr(databaseExecPrefix.length()));
         if (sql.empty()) {
             failWithCode(AppError::Code::INVALID_ARGUMENT, "uso: database -exec \"<sql>\"");
         } else {
             wrapper_database_exec(sql);
         }
+        skipCommandPersistence = true;
     } else {
         output = g_ctx.shell->run_line_command(normalized);
     }
 
-    if (g_ctx.database != nullptr && g_ctx.database->isReady()) {
+    if (!skipCommandPersistence && g_ctx.database != nullptr && g_ctx.database->isReady()) {
         std::string persistedOutput = g_commandOutputBuffer;
         if (!output.empty()) {
             if (!persistedOutput.empty()) {
