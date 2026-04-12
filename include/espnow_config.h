@@ -28,7 +28,7 @@ bool dequeueRxMessage(RxMessageEvent& outEvent, uint32_t timeoutMs = 0);
 
 void processRxMessage(const RxMessageEvent& event);
 
-void flushRxDisplayLines(size_t maxLines = 8);
+size_t flushRxDisplayLines(size_t maxLines = 8);
 
 uint32_t takeDroppedRxCount();
 

@@ -120,6 +120,10 @@ void ShellSerial::setPrompt(const String& text) {
 	redrawInput();
 }
 
+void ShellSerial::refreshLine() {
+	redrawInput();
+}
+
 bool ShellSerial::hasUnclosedDoubleQuote() const {
 	bool inDoubleQuote = false;
 	bool escaped = false;

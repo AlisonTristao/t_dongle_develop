@@ -90,6 +90,11 @@ public:
 	 */
 	void setPrompt(const String& text);
 
+	/**
+	 * @brief Redraws current prompt and input buffer.
+	 */
+	void refreshLine();
+
 private:
 	/**
 	 * @brief Internal hard limit for static log storage array.

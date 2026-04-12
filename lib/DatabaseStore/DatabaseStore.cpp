@@ -697,6 +697,66 @@ bool DatabaseStore::readCommandLogsWithOutput(size_t limit, String& outText) {
     return true;
 }
 
+bool DatabaseStore::readRecentCommands(size_t limit, String& outText) {
+    if (!lockDb()) {
+        outText = "[database] lock indisponivel";
+        return false;
+    }
+
+    if (!ready_ || db_ == nullptr) {
+        outText = "[database] nao inicializado";
+        unlockDb();
+        return false;
+    }
+
+    if (limit == 0) {
+        limit = 64;
+    }
+    if (limit > 256) {
+        limit = 256;
+    }
+
+    String sql;
+    sql.reserve(280);
+    sql += "SELECT command FROM (";
+    sql += "SELECT id, command FROM command_log ";
+    sql += "WHERE source='serial' ORDER BY id DESC LIMIT ";
+    sql += static_cast<unsigned long>(limit);
+    sql += ") t ORDER BY id ASC;";
+
+    sqlite3_stmt* stmt = nullptr;
+    const int prepareRc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr);
+    if (prepareRc != SQLITE_OK || stmt == nullptr) {
+        outText = String("[database] SQL error: ") + sqlite3_errmsg(db_);
+        unlockDb();
+        return false;
+    }
+
+    outText = "";
+    int stepRc = SQLITE_ROW;
+    while ((stepRc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const char* command = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        if (command == nullptr || command[0] == '\0') {
+            continue;
+        }
+
+        outText += command;
+        outText += "\n";
+    }
+
+    sqlite3_finalize(stmt);
+
+    if (stepRc != SQLITE_DONE) {
+        outText = String("[database] SQL error: ") + sqlite3_errmsg(db_);
+        unlockDb();
+        return false;
+    }
+
+    outText.trim();
+    unlockDb();
+    return true;
+}
+
 bool DatabaseStore::readEspNowHistory(size_t limit, String& outText) {
         if (!lockDb()) {
             outText = "[database] lock indisponivel";

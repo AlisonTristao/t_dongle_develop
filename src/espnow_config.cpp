@@ -2,7 +2,6 @@
 #include "LcdTerminal.h"
 #include "shell_output.h"
 
-#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -22,10 +21,10 @@ QueueHandle_t g_rxDisplayQueue = nullptr;
 volatile uint32_t g_droppedRxCount = 0;
 bool g_asyncRxEnabled = false;
 
-constexpr size_t kMaxDisplayPayload = 96;
-
 struct RxDisplayLine {
-    char text[320];
+    char header[96];
+    char payload[EspNowManager::MESSAGE_TEXT_SIZE + 1];
+    size_t payloadLen;
     uint16_t color;
 };
 
@@ -76,61 +75,69 @@ String arrivalTimeText() {
     return String(fallback);
 }
 
-void sanitizeIncomingText(const EspNowManager::message& incomingData, char* outText, size_t outSize) {
-    if (outText == nullptr || outSize == 0) {
+size_t copyIncomingPayload(const EspNowManager::message& incomingData, char* outPayload, size_t outSize) {
+    if (outPayload == nullptr || outSize == 0) {
+        return 0;
+    }
+
+    size_t length = 0;
+    while (length < EspNowManager::MESSAGE_TEXT_SIZE && incomingData.msg[length] != '\0') {
+        ++length;
+    }
+
+    const size_t copyLen = (length < (outSize - 1)) ? length : (outSize - 1);
+    if (copyLen > 0) {
+        std::memcpy(outPayload, incomingData.msg, copyLen);
+    }
+    outPayload[copyLen] = '\0';
+    return copyLen;
+}
+
+void writeRawToStream(Stream* io, const char* data, size_t len) {
+    if (io == nullptr || data == nullptr || len == 0) {
         return;
     }
 
-    const size_t payloadLimit = (outSize - 1 < EspNowManager::MESSAGE_TEXT_SIZE)
-        ? (outSize - 1)
-        : EspNowManager::MESSAGE_TEXT_SIZE;
+    const uint8_t* ptr = reinterpret_cast<const uint8_t*>(data);
+    size_t remaining = len;
+    uint32_t retries = 0;
 
-    std::memcpy(outText, incomingData.msg, payloadLimit);
-    outText[payloadLimit] = '\0';
-
-    for (size_t i = 0; i < payloadLimit; ++i) {
-        char& ch = outText[i];
-        if (ch == '\0') {
-            break;
+    while (remaining > 0) {
+        const size_t sent = io->write(ptr, remaining);
+        if (sent == 0) {
+            ++retries;
+            if (retries > 8) {
+                break;
+            }
+            delay(1);
+            continue;
         }
-        if (ch == '\r' || ch == '\n' || ch == '\t') {
-            ch = ' ';
-        }
-    }
 
-    size_t start = 0;
-    while (outText[start] != '\0' && std::isspace(static_cast<unsigned char>(outText[start])) != 0) {
-        ++start;
-    }
-
-    size_t end = std::strlen(outText);
-    while (end > start && std::isspace(static_cast<unsigned char>(outText[end - 1])) != 0) {
-        --end;
-    }
-
-    if (start > 0) {
-        std::memmove(outText, outText + start, end - start);
-    }
-    outText[end - start] = '\0';
-
-    const size_t len = std::strlen(outText);
-    if (len == 0) {
-        std::snprintf(outText, outSize, "(vazio)");
-        return;
-    }
-
-    if (len > kMaxDisplayPayload && kMaxDisplayPayload + 1 < outSize) {
-        outText[kMaxDisplayPayload] = '\0';
-        if (kMaxDisplayPayload >= 3) {
-            outText[kMaxDisplayPayload - 3] = '.';
-            outText[kMaxDisplayPayload - 2] = '.';
-            outText[kMaxDisplayPayload - 1] = '.';
-        }
+        ptr += sent;
+        remaining -= sent;
     }
 }
 
-bool enqueueDisplayLine(const char* line, uint16_t color) {
-    if (line == nullptr) {
+void ensurePayloadTerminator(Stream* io, const char* payload, size_t payloadLen) {
+    if (io == nullptr) {
+        return;
+    }
+
+    if (payloadLen == 0) {
+        io->write('\r');
+        io->write('\n');
+        return;
+    }
+
+    const char last = payload[payloadLen - 1];
+    if (last != '\n' && last != '\r') {
+        io->write('\r');
+        io->write('\n');
+    }
+}
+
+bool enqueueDisplayLine(const char* header, const char* payload, size_t payloadLen, uint16_t color) {
+    if (header == nullptr || payload == nullptr) {
         return false;
     }
 
@@ -139,7 +146,9 @@ bool enqueueDisplayLine(const char* line, uint16_t color) {
     }
 
     RxDisplayLine item = {};
-    std::snprintf(item.text, sizeof(item.text), "%s", line);
+    std::snprintf(item.header, sizeof(item.header), "%s", header);
+    std::snprintf(item.payload, sizeof(item.payload), "%s", payload);
+    item.payloadLen = payloadLen;
     item.color = color;
 
     return xQueueSend(g_rxDisplayQueue, &item, 0) == pdTRUE;
@@ -149,28 +158,31 @@ void processRxMessageInternal(const uint8_t mac[6], const EspNowManager::message
     const String arrivedAt = arrivalTimeText();
     const char* typeText = logTypeToText(incomingData.type);
     char payload[EspNowManager::MESSAGE_TEXT_SIZE + 1] = {0};
-    sanitizeIncomingText(incomingData, payload, sizeof(payload));
+    const size_t payloadLen = copyIncomingPayload(incomingData, payload, sizeof(payload));
 
-    // Keep line compact to avoid monitor visual wrap corruption on long terminals.
-    char line[320] = {0};
+    char header[96] = {0};
     std::snprintf(
-        line,
-        sizeof(line),
-        "[espnow][rx] t=%s tipo=%s msg=%s",
+        header,
+        sizeof(header),
+        "[espnow][rx] t=%s tipo=%s",
         arrivedAt.c_str(),
-        typeText,
-        payload
+        typeText
     );
 
     const uint16_t color = logTypeToLcdColor(incomingData.type);
-    if (!enqueueDisplayLine(line, color)) {
+    if (!enqueueDisplayLine(header, payload, payloadLen, color)) {
         // Fallback path when queue is unavailable/full.
         if (g_io != nullptr) {
-            ShellOutput::writeLine(*g_io, line);
+            ShellOutput::writeLine(*g_io, header);
+            writeRawToStream(g_io, payload, payloadLen);
+            ensurePayloadTerminator(g_io, payload, payloadLen);
         }
 
         if (g_lcdTerminal != nullptr && g_lcdTerminal->isReady()) {
-            g_lcdTerminal->writeText(String(line), color);
+            g_lcdTerminal->writeText(String(header), color);
+            if (payloadLen > 0) {
+                g_lcdTerminal->writeText(String(payload), color);
+            }
         }
     }
 
@@ -239,7 +251,7 @@ bool enableAsyncRx(size_t queueDepth) {
     }
 
     if (g_rxDisplayQueue == nullptr) {
-        g_rxDisplayQueue = xQueueCreate(static_cast<UBaseType_t>(queueDepth * 2), sizeof(RxDisplayLine));
+        g_rxDisplayQueue = xQueueCreate(static_cast<UBaseType_t>(queueDepth), sizeof(RxDisplayLine));
         if (g_rxDisplayQueue == nullptr) {
             g_asyncRxEnabled = false;
             return false;
@@ -279,24 +291,31 @@ void processRxMessage(const RxMessageEvent& event) {
     processRxMessageInternal(event.mac, event.incoming);
 }
 
-void flushRxDisplayLines(size_t maxLines) {
+size_t flushRxDisplayLines(size_t maxLines) {
     if (g_rxDisplayQueue == nullptr || maxLines == 0) {
-        return;
+        return 0;
     }
 
     RxDisplayLine item = {};
     size_t drained = 0;
     while (drained < maxLines && xQueueReceive(g_rxDisplayQueue, &item, 0) == pdTRUE) {
         if (g_io != nullptr) {
-            ShellOutput::writeLine(*g_io, item.text);
+            ShellOutput::writeLine(*g_io, item.header);
+            writeRawToStream(g_io, item.payload, item.payloadLen);
+            ensurePayloadTerminator(g_io, item.payload, item.payloadLen);
         }
 
         if (g_lcdTerminal != nullptr && g_lcdTerminal->isReady()) {
-            g_lcdTerminal->writeText(String(item.text), item.color);
+            g_lcdTerminal->writeText(String(item.header), item.color);
+            if (item.payloadLen > 0) {
+                g_lcdTerminal->writeText(String(item.payload), item.color);
+            }
         }
 
         ++drained;
     }
+
+    return drained;
 }
 
 uint32_t takeDroppedRxCount() {

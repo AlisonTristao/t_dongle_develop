@@ -28,6 +28,44 @@ namespace {
 
 TaskHandle_t g_espNowRxTaskHandle = nullptr;
 
+void restoreShellHistoryFromDatabase() {
+    if (!databaseStore.isReady()) {
+        return;
+    }
+
+    String historyText;
+    if (!databaseStore.readRecentCommands(ShellSerial::DEFAULT_LOG_CAPACITY, historyText)) {
+        return;
+    }
+
+    if (historyText.isEmpty()) {
+        return;
+    }
+
+    int32_t start = 0;
+    while (start <= static_cast<int32_t>(historyText.length())) {
+        const int32_t newline = historyText.indexOf('\n', start);
+        String line;
+
+        if (newline < 0) {
+            line = historyText.substring(start);
+        } else {
+            line = historyText.substring(start, newline);
+        }
+
+        line.trim();
+        if (!line.isEmpty()) {
+            serialShell.addLog(line);
+        }
+
+        if (newline < 0) {
+            break;
+        }
+
+        start = newline + 1;
+    }
+}
+
 BaseType_t selectEspNowWorkerCore() {
 #if defined(CONFIG_FREERTOS_UNICORE) && (CONFIG_FREERTOS_UNICORE == 1)
     return ARDUINO_RUNNING_CORE;
@@ -131,12 +169,18 @@ void setup() {
         return;
     }
 
+    restoreShellHistoryFromDatabase();
+
     ShellOutput::printTagged(Serial, "shell", "ready: <module> -<command> [args]");
     ShellOutput::printTagged(Serial, "shell", "use: help -e");
+    serialShell.refreshLine();
 }
 
 void loop() {
-    EspNowConfig::flushRxDisplayLines(12);
+    const size_t flushedBefore = EspNowConfig::flushRxDisplayLines(12);
+    if (flushedBefore > 0) {
+        serialShell.refreshLine();
+    }
 
     String command;
     if (serialShell.readInputLine(command)) {
@@ -152,7 +196,10 @@ void loop() {
         Serial.println();
     }
 
-    EspNowConfig::flushRxDisplayLines(12);
+    const size_t flushedAfter = EspNowConfig::flushRxDisplayLines(12);
+    if (flushedAfter > 0) {
+        serialShell.refreshLine();
+    }
 
     // Small cooperative delay for non-blocking loop behavior.
     delay(1);

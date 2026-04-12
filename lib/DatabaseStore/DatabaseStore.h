@@ -111,6 +111,13 @@ public:
     bool readCommandLogsWithOutput(size_t limit, String& outText);
 
     /**
+     * @brief Reads recent serial commands for shell history restoration.
+     *
+     * Returns one command per line in chronological order (oldest -> newest).
+     */
+    bool readRecentCommands(size_t limit, String& outText);
+
+    /**
      * @brief Reads unified ESP-NOW history (RX and TX) with delivery status.
      *
      * Output fields include formatted date/time and TX success/failure.
