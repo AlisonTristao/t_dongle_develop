@@ -2,6 +2,8 @@
 
 #include <Arduino.h>
 #include <EspNowManager.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 struct sqlite3;
 
@@ -129,6 +131,7 @@ private:
     sqlite3* db_;
     Stream* io_;
     bool ready_;
+    SemaphoreHandle_t dbMutex_;
 
     static constexpr const char* kFsDatabaseDir = "/database";
     static constexpr const char* kFsBootstrapPath = "/database/bootstrap.sql";
@@ -149,6 +152,9 @@ private:
     bool executeNoResult(const String& sql);
     bool querySingleInt(const String& sql, int32_t& outValue);
     bool queryToText(const String& sql, size_t maxRows, String& outText);
+
+    bool lockDb(uint32_t timeoutMs = 1000);
+    void unlockDb();
 
     static int64_t currentEpochSeconds();
 

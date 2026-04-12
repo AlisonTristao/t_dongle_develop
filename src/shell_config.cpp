@@ -1129,7 +1129,20 @@ std::string runLine(const std::string& command) {
     const std::string normalized = normalizeCommand(command);
     g_commandOutputBuffer.clear();
 
-    const std::string output = g_ctx.shell->run_line_command(normalized);
+    std::string output;
+    const std::string databaseExecPrefix = "database -exec";
+
+    // Bypass TinyShell tokenizer here so SQL can contain commas/quotes safely.
+    if (normalized == databaseExecPrefix || normalized.rfind(databaseExecPrefix + " ", 0) == 0) {
+        const std::string sql = trimCopy(normalized.substr(databaseExecPrefix.length()));
+        if (sql.empty()) {
+            failWithCode(AppError::Code::INVALID_ARGUMENT, "uso: database -exec \"<sql>\"");
+        } else {
+            wrapper_database_exec(sql);
+        }
+    } else {
+        output = g_ctx.shell->run_line_command(normalized);
+    }
 
     if (g_ctx.database != nullptr && g_ctx.database->isReady()) {
         std::string persistedOutput = g_commandOutputBuffer;

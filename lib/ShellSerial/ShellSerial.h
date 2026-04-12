@@ -95,6 +95,8 @@ private:
 	 * @brief Internal hard limit for static log storage array.
 	 */
 	static constexpr size_t MAX_LOG_STORAGE = 128;
+	static constexpr size_t MAX_INPUT_LENGTH = 512;
+	static constexpr size_t MAX_RENDER_COLUMNS = 72;
 
 	/**
 	 * @brief Parser state for ANSI escape sequence handling.
@@ -124,6 +126,21 @@ private:
 	 * @brief Processes one received byte and updates parsing state.
 	 */
 	void processChar(char c, bool& lineReady, String& outLine);
+
+	/**
+	 * @brief Returns true when the current line has an unclosed double quote.
+	 */
+	bool hasUnclosedDoubleQuote() const;
+
+	/**
+	 * @brief Returns true when prompt+input fits in a single render line.
+	 */
+	bool fitsSingleRenderLine() const;
+
+	/**
+	 * @brief Builds the text window shown on screen and cursor position in that window.
+	 */
+	void buildVisibleInput(String& visibleInput, size_t& cursorInVisible) const;
 
 	/**
 	 * @brief Re-renders the current prompt and input line.

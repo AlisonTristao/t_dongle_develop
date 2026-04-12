@@ -188,7 +188,26 @@ String sanitizeAndTruncateField(const String& input, size_t maxLen) {
 DatabaseStore::DatabaseStore()
     : db_(nullptr),
       io_(nullptr),
-      ready_(false) {
+      ready_(false),
+      dbMutex_(xSemaphoreCreateRecursiveMutex()) {
+}
+
+bool DatabaseStore::lockDb(uint32_t timeoutMs) {
+    if (dbMutex_ == nullptr) {
+        return true;
+    }
+
+    const TickType_t waitTicks = (timeoutMs == 0)
+        ? portMAX_DELAY
+        : pdMS_TO_TICKS(timeoutMs);
+
+    return xSemaphoreTakeRecursive(dbMutex_, waitTicks) == pdTRUE;
+}
+
+void DatabaseStore::unlockDb() {
+    if (dbMutex_ != nullptr) {
+        xSemaphoreGiveRecursive(dbMutex_);
+    }
 }
 
 bool DatabaseStore::begin(EspNowManager& espNow, Stream* io) {
@@ -262,8 +281,18 @@ bool DatabaseStore::upsertPeer(const uint8_t mac[6], const char* name, const cha
     const String peerDescription = (description != nullptr) ? description : "";
 
     String sql;
-    sql.reserve(420);
-    sql += "INSERT INTO peers(mac,name,description,created_at,updated_at) VALUES('";
+    sql.reserve(520);
+    sql += "UPDATE peers SET name='";
+    sql += escapeSqlText(peerName);
+    sql += "', description='";
+    sql += escapeSqlText(peerDescription);
+    sql += "', updated_at=";
+    sql += String(static_cast<long long>(now));
+    sql += " WHERE mac='";
+    sql += escapeSqlText(macText);
+    sql += "';";
+
+    sql += "INSERT OR IGNORE INTO peers(mac,name,description,created_at,updated_at) VALUES('";
     sql += escapeSqlText(macText);
     sql += "','";
     sql += escapeSqlText(peerName);
@@ -273,11 +302,7 @@ bool DatabaseStore::upsertPeer(const uint8_t mac[6], const char* name, const cha
     sql += String(static_cast<long long>(now));
     sql += ",";
     sql += String(static_cast<long long>(now));
-    sql += ") ";
-    sql += "ON CONFLICT(mac) DO UPDATE SET ";
-    sql += "name=excluded.name, ";
-    sql += "description=excluded.description, ";
-    sql += "updated_at=excluded.updated_at;";
+    sql += ");";
 
     return executeNoResult(sql);
 }
@@ -438,6 +463,10 @@ bool DatabaseStore::getDefaultBroadcastMac(uint8_t outMac[6]) {
         return false;
     }
 
+    if (!lockDb()) {
+        return false;
+    }
+
     struct MacQueryContext {
         uint8_t* out;
         bool found;
@@ -484,8 +513,11 @@ bool DatabaseStore::getDefaultBroadcastMac(uint8_t outMac[6]) {
         if (errorMessage != nullptr) {
             sqlite3_free(errorMessage);
         }
+        unlockDb();
         return false;
     }
+
+    unlockDb();
 
     return context.found;
 }
@@ -587,6 +619,11 @@ bool DatabaseStore::readTable(const String& tableName, size_t limit, String& out
 }
 
 bool DatabaseStore::readCommandLogsWithOutput(size_t limit, String& outText) {
+        if (!lockDb()) {
+            outText = "[database] lock indisponivel";
+            return false;
+        }
+
     if (!ready_) {
         outText = "[database] nao inicializado";
         return false;
@@ -612,6 +649,7 @@ bool DatabaseStore::readCommandLogsWithOutput(size_t limit, String& outText) {
     const int prepareRc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr);
     if (prepareRc != SQLITE_OK || stmt == nullptr) {
         outText = String("[database] SQL error: ") + sqlite3_errmsg(db_);
+        unlockDb();
         return false;
     }
 
@@ -646,6 +684,7 @@ bool DatabaseStore::readCommandLogsWithOutput(size_t limit, String& outText) {
 
     if (stepRc != SQLITE_DONE) {
         outText = String("[database] SQL error: ") + sqlite3_errmsg(db_);
+        unlockDb();
         return false;
     }
 
@@ -653,10 +692,17 @@ bool DatabaseStore::readCommandLogsWithOutput(size_t limit, String& outText) {
         outText = "[database] consulta sem linhas (ou comando executado com sucesso)";
     }
 
+    unlockDb();
+
     return true;
 }
 
 bool DatabaseStore::readEspNowHistory(size_t limit, String& outText) {
+        if (!lockDb()) {
+            outText = "[database] lock indisponivel";
+            return false;
+        }
+
     if (!ready_) {
         outText = "[database] nao inicializado";
         return false;
@@ -691,6 +737,7 @@ bool DatabaseStore::readEspNowHistory(size_t limit, String& outText) {
     int prepareRc = sqlite3_prepare_v2(db_, txSql.c_str(), -1, &txStmt, nullptr);
     if (prepareRc != SQLITE_OK || txStmt == nullptr) {
         outText = String("[database] SQL error: ") + sqlite3_errmsg(db_);
+        unlockDb();
         return false;
     }
 
@@ -728,6 +775,7 @@ bool DatabaseStore::readEspNowHistory(size_t limit, String& outText) {
 
     if (txStepRc != SQLITE_DONE) {
         outText = String("[database] SQL error: ") + sqlite3_errmsg(db_);
+        unlockDb();
         return false;
     }
 
@@ -739,6 +787,7 @@ bool DatabaseStore::readEspNowHistory(size_t limit, String& outText) {
     prepareRc = sqlite3_prepare_v2(db_, rxSql.c_str(), -1, &rxStmt, nullptr);
     if (prepareRc != SQLITE_OK || rxStmt == nullptr) {
         outText = String("[database] SQL error: ") + sqlite3_errmsg(db_);
+        unlockDb();
         return false;
     }
 
@@ -773,12 +822,15 @@ bool DatabaseStore::readEspNowHistory(size_t limit, String& outText) {
 
     if (rxStepRc != SQLITE_DONE) {
         outText = String("[database] SQL error: ") + sqlite3_errmsg(db_);
+        unlockDb();
         return false;
     }
 
     if (rxRows == 0) {
         outText += "(sem linhas)\n";
     }
+
+    unlockDb();
 
     return true;
 }
@@ -816,7 +868,12 @@ bool DatabaseStore::executeSql(const String& sql, String& outText) {
 }
 
 bool DatabaseStore::openDatabase() {
+    if (!lockDb()) {
+        return false;
+    }
+
     if (db_ != nullptr) {
+        unlockDb();
         return true;
     }
 
@@ -829,19 +886,27 @@ bool DatabaseStore::openDatabase() {
         } else {
             logLine("[database] sqlite open error: handle nulo");
         }
+        unlockDb();
         return false;
     }
+
+    unlockDb();
 
     return true;
 }
 
 void DatabaseStore::closeDatabase() {
+    if (!lockDb()) {
+        return;
+    }
+
     if (db_ != nullptr) {
         sqlite3_close(db_);
         db_ = nullptr;
     }
 
     ready_ = false;
+    unlockDb();
 }
 
 bool DatabaseStore::ensureBootstrapAssets() {
@@ -1012,6 +1077,10 @@ bool DatabaseStore::loadPeersFromDatabase(EspNowManager& espNow) {
         return false;
     }
 
+    if (!lockDb()) {
+        return false;
+    }
+
     struct PeerLoadContext {
         EspNowManager* manager;
         size_t loaded;
@@ -1086,6 +1155,7 @@ bool DatabaseStore::loadPeersFromDatabase(EspNowManager& espNow) {
             logLine(String("[database] erro carregando peers: ") + errorMessage);
             sqlite3_free(errorMessage);
         }
+        unlockDb();
         return false;
     }
 
@@ -1101,11 +1171,17 @@ bool DatabaseStore::loadPeersFromDatabase(EspNowManager& espNow) {
         static_cast<unsigned>(context.failed)
     );
     logLine(line);
+    unlockDb();
     return true;
 }
 
 bool DatabaseStore::executeNoResult(const String& sql) {
+    if (!lockDb()) {
+        return false;
+    }
+
     if (db_ == nullptr) {
+        unlockDb();
         return false;
     }
 
@@ -1116,14 +1192,22 @@ bool DatabaseStore::executeNoResult(const String& sql) {
             logLine(String("[database] SQL error: ") + errorMessage);
             sqlite3_free(errorMessage);
         }
+        unlockDb();
         return false;
     }
+
+    unlockDb();
 
     return true;
 }
 
 bool DatabaseStore::querySingleInt(const String& sql, int32_t& outValue) {
+    if (!lockDb()) {
+        return false;
+    }
+
     if (db_ == nullptr) {
+        unlockDb();
         return false;
     }
 
@@ -1135,20 +1219,29 @@ bool DatabaseStore::querySingleInt(const String& sql, int32_t& outValue) {
         if (errorMessage != nullptr) {
             sqlite3_free(errorMessage);
         }
+        unlockDb();
         return false;
     }
 
     if (!context.hasValue) {
+        unlockDb();
         return false;
     }
 
     outValue = context.value;
+    unlockDb();
     return true;
 }
 
 bool DatabaseStore::queryToText(const String& sql, size_t maxRows, String& outText) {
+    if (!lockDb()) {
+        outText = "[database] lock indisponivel";
+        return false;
+    }
+
     if (db_ == nullptr) {
         outText = "[database] nao inicializado";
+        unlockDb();
         return false;
     }
 
@@ -1165,6 +1258,7 @@ bool DatabaseStore::queryToText(const String& sql, size_t maxRows, String& outTe
         } else {
             outText = "[database] SQL error";
         }
+        unlockDb();
         return false;
     }
 
@@ -1175,6 +1269,8 @@ bool DatabaseStore::queryToText(const String& sql, size_t maxRows, String& outTe
     if (context.rowCount == 0 && !context.truncated) {
         outText = "[database] consulta sem linhas (ou comando executado com sucesso)";
     }
+
+    unlockDb();
 
     return true;
 }

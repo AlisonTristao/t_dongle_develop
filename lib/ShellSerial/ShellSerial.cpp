@@ -58,6 +58,19 @@ void ShellSerial::eraseLastChar() {
 		return;
 	}
 
+	const bool removeAtTail = (cursorIndex_ == inputBuffer_.length());
+	if (removeAtTail && serial_ != nullptr && fitsSingleRenderLine()) {
+		inputBuffer_.remove(cursorIndex_ - 1, 1);
+		--cursorIndex_;
+		historyCursor_ = -1;
+
+		serial_->print("\b \b");
+		if (renderedLength_ > 0) {
+			--renderedLength_;
+		}
+		return;
+	}
+
 	inputBuffer_.remove(cursorIndex_ - 1, 1);
 	--cursorIndex_;
 	historyCursor_ = -1;
@@ -107,6 +120,79 @@ void ShellSerial::setPrompt(const String& text) {
 	redrawInput();
 }
 
+bool ShellSerial::hasUnclosedDoubleQuote() const {
+	bool inDoubleQuote = false;
+	bool escaped = false;
+
+	for (size_t i = 0; i < inputBuffer_.length(); ++i) {
+		const char ch = inputBuffer_[i];
+
+		if (escaped) {
+			escaped = false;
+			continue;
+		}
+
+		if (ch == '\\') {
+			escaped = true;
+			continue;
+		}
+
+		if (ch == '"') {
+			inDoubleQuote = !inDoubleQuote;
+		}
+	}
+
+	return inDoubleQuote;
+}
+
+bool ShellSerial::fitsSingleRenderLine() const {
+	return (prompt_.length() + inputBuffer_.length()) <= MAX_RENDER_COLUMNS;
+}
+
+void ShellSerial::buildVisibleInput(String& visibleInput, size_t& cursorInVisible) const {
+	const size_t promptLen = prompt_.length();
+	size_t maxInputColumns = 8;
+	if (MAX_RENDER_COLUMNS > promptLen) {
+		maxInputColumns = MAX_RENDER_COLUMNS - promptLen;
+	}
+
+	const size_t inputLen = inputBuffer_.length();
+	if (inputLen <= maxInputColumns) {
+		visibleInput = inputBuffer_;
+		cursorInVisible = cursorIndex_;
+		return;
+	}
+
+	const size_t coreColumns = (maxInputColumns >= 3) ? (maxInputColumns - 2) : 1;
+	size_t start = 0;
+
+	if (cursorIndex_ > coreColumns / 2) {
+		start = cursorIndex_ - (coreColumns / 2);
+	}
+
+	if (start + coreColumns > inputLen) {
+		start = inputLen - coreColumns;
+	}
+
+	const size_t end = start + coreColumns;
+	const bool leftTruncated = (start > 0);
+	const bool rightTruncated = (end < inputLen);
+
+	visibleInput = "";
+	if (leftTruncated) {
+		visibleInput += "<";
+	}
+	visibleInput += inputBuffer_.substring(start, end);
+	if (rightTruncated) {
+		visibleInput += ">";
+	}
+
+	cursorInVisible = (leftTruncated ? 1U : 0U) + (cursorIndex_ - start);
+	if (cursorInVisible > visibleInput.length()) {
+		cursorInVisible = visibleInput.length();
+	}
+}
+
 void ShellSerial::processChar(char c, bool& lineReady, String& outLine) {
 	// Parse ANSI escape sequences, especially arrow keys.
 	if (escState_ != EscState::None) {
@@ -142,6 +228,19 @@ void ShellSerial::processChar(char c, bool& lineReady, String& outLine) {
 			ignoreNextLf_ = false;
 			return;
 		}
+
+		if (hasUnclosedDoubleQuote()) {
+			ignoreNextLf_ = (c == '\r');
+
+			if (inputBuffer_.length() < MAX_INPUT_LENGTH && !inputBuffer_.endsWith(" ")) {
+				inputBuffer_ += ' ';
+			}
+
+			cursorIndex_ = inputBuffer_.length();
+			renderedLength_ = prompt_.length() + inputBuffer_.length();
+			return;
+		}
+
 		ignoreNextLf_ = (c == '\r');
 
 		String line = inputBuffer_;
@@ -175,19 +274,34 @@ void ShellSerial::processChar(char c, bool& lineReady, String& outLine) {
 
 	// Append printable characters.
 	if (static_cast<uint8_t>(c) >= 32) {
+		if (inputBuffer_.length() >= MAX_INPUT_LENGTH) {
+			return;
+		}
+
 		if (historyCursor_ >= 0) {
 			historyCursor_ = -1;
 			draftBeforeHistory_ = "";
 		}
 
-		    if (cursorIndex_ >= inputBuffer_.length()) {
-			    inputBuffer_ += c;
-		    } else {
-			    const String left = inputBuffer_.substring(0, cursorIndex_);
-			    const String right = inputBuffer_.substring(cursorIndex_);
-			    inputBuffer_ = left + String(c) + right;
-		    }
-		    ++cursorIndex_;
+		const bool appendAtTail = (cursorIndex_ >= inputBuffer_.length());
+		if (appendAtTail) {
+			inputBuffer_ += c;
+			++cursorIndex_;
+
+			if (serial_ != nullptr && fitsSingleRenderLine()) {
+				serial_->print(c);
+				renderedLength_ = prompt_.length() + inputBuffer_.length();
+				return;
+			}
+
+			redrawInput();
+			return;
+		}
+
+		const String left = inputBuffer_.substring(0, cursorIndex_);
+		const String right = inputBuffer_.substring(cursorIndex_);
+		inputBuffer_ = left + String(c) + right;
+		++cursorIndex_;
 		redrawInput();
 	}
 }
@@ -198,7 +312,12 @@ void ShellSerial::redrawInput() {
 		return;
 	}
 
-	const String visibleLine = prompt_ + inputBuffer_;
+	String visibleInput;
+	size_t cursorInVisible = 0;
+	buildVisibleInput(visibleInput, cursorInVisible);
+
+	const String visibleLine = prompt_ + visibleInput;
+	const size_t cursorColumn = prompt_.length() + cursorInVisible;
 
 	serial_->print('\r');
 	serial_->print(visibleLine);
@@ -211,15 +330,9 @@ void ShellSerial::redrawInput() {
 	}
 
 	serial_->print('\r');
-	serial_->print(visibleLine);
-
-	   const size_t cursorColumn = prompt_.length() + cursorIndex_;
-	   if (cursorColumn < visibleLine.length()) {
-		    const size_t stepBack = visibleLine.length() - cursorColumn;
-		    for (size_t i = 0; i < stepBack; ++i) {
-			    serial_->print('\b');
-		    }
-	   }
+	for (size_t i = 0; i < cursorColumn && i < visibleLine.length(); ++i) {
+		serial_->print(visibleLine[i]);
+	}
 
 	renderedLength_ = visibleLine.length();
 }
@@ -263,21 +376,33 @@ void ShellSerial::onArrowDown() {
 // Move cursor one position to the left.
 void ShellSerial::onArrowLeft() {
 	if (cursorIndex_ == 0) {
-				return;
+		return;
 	}
 
 	--cursorIndex_;
-	redrawInput();
+
+	if (serial_ != nullptr && fitsSingleRenderLine()) {
+		// Move one column left without repainting the full line.
+		serial_->print('\b');
+	} else {
+		redrawInput();
+	}
 }
 
 // Move cursor one position to the right.
 void ShellSerial::onArrowRight() {
 	if (cursorIndex_ >= inputBuffer_.length()) {
-				return;
+		return;
 	}
 
-	++cursorIndex_;
-	redrawInput();
+	if (serial_ != nullptr && fitsSingleRenderLine()) {
+		// Advance by re-printing the character under the logical cursor.
+		serial_->print(inputBuffer_[cursorIndex_]);
+		++cursorIndex_;
+	} else {
+		++cursorIndex_;
+		redrawInput();
+	}
 }
 
 // Store normalized text in circular buffer and overwrite oldest on overflow.

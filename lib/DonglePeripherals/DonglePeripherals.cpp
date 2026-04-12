@@ -43,7 +43,25 @@ bool removeTree(fs::FS& fs, const String& rawPath) {
 
     File entry = directory.openNextFile();
     while (entry) {
-        String entryPath = normalizeFsPath(String(entry.name()));
+        String entryName = String(entry.name());
+        String entryPath;
+
+        if (!entryName.isEmpty() && path != "/" && entryName.startsWith(path + "/")) {
+            // Already absolute path under current directory.
+            entryPath = entryName;
+        } else {
+            if (entryName.startsWith("/")) {
+                entryName.remove(0, 1);
+            }
+
+            if (path == "/") {
+                entryPath = "/" + entryName;
+            } else {
+                entryPath = path + "/" + entryName;
+            }
+        }
+
+        entryPath = normalizeFsPath(entryPath);
         const bool entryIsDir = entry.isDirectory();
         entry.close();
 
