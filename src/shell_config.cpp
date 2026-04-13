@@ -906,7 +906,7 @@ uint8_t wrapper_espnow_flush_db(int32_t limit = 0) {
     const size_t flushed = EspNowConfig::flushRxDbLogBuffer(maxItems);
     const size_t pendingAfter = EspNowConfig::pendingRxDbLogCount();
     const size_t capacity = EspNowConfig::rxDbLogCapacity();
-    const size_t threshold = (capacity * RX_DB_AUTO_FLUSH_PERCENT + 99U) / 100U;
+    const size_t threshold = (capacity * RX_DB_WARNING_PERCENT + 99U) / 100U;
 
         char line[256] = {0};
     std::snprintf(
@@ -933,7 +933,7 @@ uint8_t wrapper_espnow_flush_db(int32_t limit = 0) {
 uint8_t wrapper_espnow_flush_status() {
     const size_t pending = EspNowConfig::pendingRxDbLogCount();
     const size_t capacity = EspNowConfig::rxDbLogCapacity();
-    const size_t threshold = (capacity * RX_DB_AUTO_FLUSH_PERCENT + 99U) / 100U;
+    const size_t threshold = (capacity * RX_DB_WARNING_PERCENT + 99U) / 100U;
     const unsigned long percent = (capacity > 0U)
         ? static_cast<unsigned long>((pending * 100U) / capacity)
         : 0UL;
@@ -951,7 +951,7 @@ uint8_t wrapper_espnow_flush_status() {
         static_cast<unsigned long>(pending),
         static_cast<unsigned long>(capacity),
         static_cast<unsigned long>(threshold),
-        static_cast<unsigned>(RX_DB_AUTO_FLUSH_PERCENT),
+        static_cast<unsigned>(RX_DB_WARNING_PERCENT),
         percent,
         static_cast<unsigned long>(ESP.getFreeHeap()),
         static_cast<unsigned long>(ESP.getMinFreeHeap())

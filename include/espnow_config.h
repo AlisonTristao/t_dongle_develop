@@ -22,8 +22,28 @@ class LcdTerminal;
 #endif
 #endif
 
+#ifndef RX_DB_LOG_DYNAMIC_ALLOC
+#if HIGH_FREQUENCY_INCOMMING_ESPNOW
+#define RX_DB_LOG_DYNAMIC_ALLOC 1
+#else
+#define RX_DB_LOG_DYNAMIC_ALLOC 0
+#endif
+#endif
+
+#ifndef RX_DB_LOG_HEAP_RESERVE_BYTES
+#define RX_DB_LOG_HEAP_RESERVE_BYTES 65536
+#endif
+
+#if defined(RX_DB_AUTO_FLUSH_PERCENT) && !defined(RX_DB_WARNING_PERCENT)
+#define RX_DB_WARNING_PERCENT RX_DB_AUTO_FLUSH_PERCENT
+#endif
+
+#ifndef RX_DB_WARNING_PERCENT
+#define RX_DB_WARNING_PERCENT 80
+#endif
+
 #ifndef RX_DB_AUTO_FLUSH_PERCENT
-#define RX_DB_AUTO_FLUSH_PERCENT 80
+#define RX_DB_AUTO_FLUSH_PERCENT RX_DB_WARNING_PERCENT
 #endif
 
 namespace EspNowConfig {

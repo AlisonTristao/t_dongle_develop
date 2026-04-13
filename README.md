@@ -185,6 +185,7 @@ Detalhes importantes:
 - `send_to 000` usa MAC default de broadcast do banco (fallback `FF:FF:FF:FF:FF:FF`)
 - `send_all` tenta peer a peer com status; se nao houver peers, cai em broadcast
 - shortcut: `espnow -send_to "mensagem"` e normalizado para `espnow -send_to 000, "mensagem"`
+- para usar virgula literal dentro de um argumento, use escape `\\,` (ex.: `espnow -send_to 2, HB -apply_pwm 50\\, 50`)
 
 ### 5.4 Modulo `database`
 

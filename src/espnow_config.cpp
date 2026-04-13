@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <Esp.h>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
@@ -35,6 +36,8 @@ const char* logTypeToText(EspNowManager::logType type) {
     switch (type) {
     case EspNowManager::logType::INFO:
         return "INFO";
+    case EspNowManager::logType::CMD:
+        return "CMD";
     case EspNowManager::logType::TELEMETRY:
         return "TELEMETRY";
     case EspNowManager::logType::ERROR:
@@ -157,6 +160,50 @@ bool enqueueDisplayLine(const char* header, const char* payload, size_t payloadL
     return xQueueSend(g_rxDisplayQueue, &item, 0) == pdTRUE;
 }
 
+bool createDbLogQueue() {
+    if (g_rxDbLogQueue != nullptr) {
+        return true;
+    }
+
+    const size_t minDepth = (RX_DB_LOG_QUEUE_DEPTH > 0U)
+        ? static_cast<size_t>(RX_DB_LOG_QUEUE_DEPTH)
+        : static_cast<size_t>(1U);
+
+#if RX_DB_LOG_DYNAMIC_ALLOC
+    const size_t entrySize = sizeof(EspNowConfig::RxDbLogEvent);
+    const size_t heapReserve = static_cast<size_t>(RX_DB_LOG_HEAP_RESERVE_BYTES);
+    const size_t freeHeap = static_cast<size_t>(ESP.getFreeHeap());
+
+    size_t targetDepth = minDepth;
+    if (freeHeap > heapReserve + entrySize) {
+        targetDepth = (freeHeap - heapReserve) / entrySize;
+        if (targetDepth < minDepth) {
+            targetDepth = minDepth;
+        }
+    }
+
+    size_t candidateDepth = targetDepth;
+    while (candidateDepth >= minDepth) {
+        g_rxDbLogQueue = xQueueCreate(static_cast<UBaseType_t>(candidateDepth), sizeof(EspNowConfig::RxDbLogEvent));
+        if (g_rxDbLogQueue != nullptr) {
+            return true;
+        }
+
+        if (candidateDepth == minDepth) {
+            break;
+        }
+
+        const size_t reducedDepth = (candidateDepth * 9U) / 10U;
+        candidateDepth = (reducedDepth < minDepth) ? minDepth : reducedDepth;
+    }
+
+    return g_rxDbLogQueue != nullptr;
+#else
+    g_rxDbLogQueue = xQueueCreate(static_cast<UBaseType_t>(minDepth), sizeof(EspNowConfig::RxDbLogEvent));
+    return g_rxDbLogQueue != nullptr;
+#endif
+}
+
 void processRxMessageInternal(const uint8_t mac[6], const EspNowManager::message& incomingData) {
     const String arrivedAt = arrivalTimeText();
     const char* typeText = logTypeToText(incomingData.type);
@@ -205,8 +252,15 @@ void processRxMessageInternal(const uint8_t mac[6], const EspNowManager::message
             if (xQueueSend(g_rxDbLogQueue, &dbLogEvent, 0) != pdTRUE) {
                 ++g_droppedRxDbLogCount;
             }
-        } else if (!g_database->logIncomingEspNow(mac, incomingData)) {
+        } else {
+#if HIGH_FREQUENCY_INCOMMING_ESPNOW
+            // High-frequency mode persists only through manual flush.
             ++g_droppedRxDbLogCount;
+#else
+            if (!g_database->logIncomingEspNow(mac, incomingData)) {
+                ++g_droppedRxDbLogCount;
+            }
+#endif
         }
     }
 }
@@ -272,10 +326,6 @@ bool enableAsyncRx(size_t queueDepth) {
         }
     }
 
-    if (g_rxDbLogQueue == nullptr) {
-        g_rxDbLogQueue = xQueueCreate(static_cast<UBaseType_t>(RX_DB_LOG_QUEUE_DEPTH), sizeof(RxDbLogEvent));
-    }
-
     xQueueReset(g_rxQueue);
     xQueueReset(g_rxDisplayQueue);
     if (g_rxDbLogQueue != nullptr) {
@@ -339,6 +389,10 @@ void processRxDbLog(const RxDbLogEvent& event) {
 }
 
 void setAsyncDbLogEnabled(bool enabled) {
+    if (enabled && g_rxDbLogQueue == nullptr) {
+        (void)createDbLogQueue();
+    }
+
     g_asyncDbLogEnabled = enabled && (g_rxDbLogQueue != nullptr);
 }
 

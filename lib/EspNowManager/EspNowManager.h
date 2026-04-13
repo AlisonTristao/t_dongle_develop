@@ -26,9 +26,11 @@ public:
     /**
      * @brief Message category used in ESP-NOW payloads.
      */
-    enum class logType : uint8_t {
+    // types of logs 
+    enum class logType {
         NONE,
         INFO,
+        CMD,
         TELEMETRY,
         ERROR,
         DEBUG
