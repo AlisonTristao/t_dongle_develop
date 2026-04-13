@@ -1,6 +1,6 @@
-#include "espnow_config.h"
+#include "EspNowConfig.h"
 #include "LcdTerminal.h"
-#include "shell_output.h"
+#include "ShellOutput.h"
 
 #include <cstdio>
 #include <cstring>
@@ -67,17 +67,20 @@ uint16_t logTypeToLcdColor(EspNowManager::logType type) {
 
 String arrivalTimeText() {
     const time_t nowEpoch = time(nullptr);
+    const unsigned long ms = static_cast<unsigned long>(millis() % 1000);
     if (nowEpoch > 0) {
         std::tm localTime = {};
         if (localtime_r(&nowEpoch, &localTime) != nullptr) {
-            char out[24] = {0};
+            char out[32] = {0};
             std::strftime(out, sizeof(out), "%H:%M:%S", &localTime);
-            return String(out);
+            char result[40] = {0};
+            std::snprintf(result, sizeof(result), "%s.%03lu", out, ms);
+            return String(result);
         }
     }
 
-    char fallback[20] = {0};
-    std::snprintf(fallback, sizeof(fallback), "ms%lu", static_cast<unsigned long>(millis()));
+    char fallback[32] = {0};
+    std::snprintf(fallback, sizeof(fallback), "ms%lu.%03lu", static_cast<unsigned long>(millis() / 1000), ms);
     return String(fallback);
 }
 
@@ -224,8 +227,9 @@ void processRxMessageInternal(const uint8_t mac[6], const EspNowManager::message
         // Fallback path when queue is unavailable/full.
         if (g_io != nullptr) {
             ShellOutput::writeLine(*g_io, header);
-            writeRawToStream(g_io, payload, payloadLen);
-            ensurePayloadTerminator(g_io, payload, payloadLen);
+            if (payloadLen > 0) {
+                ShellOutput::writeLines(*g_io, payload);
+            }
         }
 
 #if !HIGH_FREQUENCY_INCOMMING_ESPNOW
@@ -450,8 +454,9 @@ size_t flushRxDisplayLines(size_t maxLines) {
     while (drained < maxLines && xQueueReceive(g_rxDisplayQueue, &item, 0) == pdTRUE) {
         if (g_io != nullptr) {
             ShellOutput::writeLine(*g_io, item.header);
-            writeRawToStream(g_io, item.payload, item.payloadLen);
-            ensurePayloadTerminator(g_io, item.payload, item.payloadLen);
+            if (item.payloadLen > 0) {
+                ShellOutput::writeLines(*g_io, item.payload);
+            }
         }
 
 #if !HIGH_FREQUENCY_INCOMMING_ESPNOW

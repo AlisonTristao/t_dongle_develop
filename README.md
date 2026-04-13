@@ -47,10 +47,10 @@ A arquitetura esta dividida em camadas de responsabilidade:
 ```text
 Application Layer
   - src/main.cpp
-  - src/startup_config.cpp
-  - src/shell_config.cpp
-  - src/shell_output.cpp
-  - src/espnow_config.cpp
+  - src/StartupConfig.cpp
+  - src/ShellConfig.cpp
+  - src/ShellOutput.cpp
+  - src/EspNowConfig.cpp
 
 Service/Domain Layer (lib)
   - EspNowManager
@@ -342,10 +342,10 @@ Script auxiliar:
 include/
   config.h
   error_codes.h
-  espnow_config.h
-  shell_config.h
-  shell_output.h
-  startup_config.h
+  EspNowConfig.h
+  ShellConfig.h
+  ShellOutput.h
+  StartupConfig.h
 lib/
   DatabaseStore/
   DonglePeripherals/
@@ -354,10 +354,10 @@ lib/
   ShellSerial/
 src/
   main.cpp
-  espnow_config.cpp
-  shell_config.cpp
-  shell_output.cpp
-  startup_config.cpp
+  EspNowConfig.cpp
+  ShellConfig.cpp
+  ShellOutput.cpp
+  StartupConfig.cpp
 scripts/
   pio_warnings.py
 test/

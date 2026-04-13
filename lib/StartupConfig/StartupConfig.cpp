@@ -1,4 +1,4 @@
-#include "startup_config.h"
+#include "StartupConfig.h"
 
 #include <sys/time.h>
 
@@ -6,6 +6,8 @@
 #include <cstring>
 #include <cstdio>
 #include <ctime>
+
+#include "ShellOutput.h"
 
 namespace {
 
@@ -177,7 +179,7 @@ bool parseDateTime(const String& text, time_t& outEpoch) {
 
 } // namespace
 
-namespace StartupConfig {
+namespace StartupConfig{
 
 void waitForSerialAndAnimateLed(DonglePeripherals& peripherals) {
     peripherals.beginLed();
@@ -227,8 +229,8 @@ void waitForSerialAndAnimateLed(DonglePeripherals& peripherals) {
 
     drainSerialInput();
 
-    Serial.println("[startup] monitor conectado. pressione ENTER para iniciar");
-    Serial.print("[startup] > ");
+    ShellOutput::printTagged(Serial, "startup", "monitor conectado. pressione ENTER para iniciar");
+    Serial.print(ShellOutput::commandPrefix());
 
     bool enterConfirmed = false;
     uint32_t lastPromptMs = millis();
@@ -238,7 +240,7 @@ void waitForSerialAndAnimateLed(DonglePeripherals& peripherals) {
             if (value >= 0) {
                 const char c = static_cast<char>(value);
                 if (c == '\r' || c == '\n') {
-                    Serial.println();
+                    ShellOutput::writeRawLine(Serial, "");
 
                     while (Serial.available()) {
                         const int next = Serial.peek();
@@ -260,15 +262,16 @@ void waitForSerialAndAnimateLed(DonglePeripherals& peripherals) {
         }
 
         if ((millis() - lastPromptMs) >= 2000) {
-            Serial.print("\r[startup] > ");
+            Serial.print("\r");
+            Serial.print(ShellOutput::commandPrefix());
             lastPromptMs = millis();
         }
 
         delay(10);
     }
 
-    Serial.println();
-    Serial.println("[startup] iniciando...");
+    ShellOutput::writeRawLine(Serial, "");
+    ShellOutput::printTagged(Serial, "startup", "iniciando...");
 
     showSerialStatusOnLcd(peripherals, true);
 
@@ -279,27 +282,27 @@ void waitForSerialAndAnimateLed(DonglePeripherals& peripherals) {
 void promptAndSetDateTime(Stream& io, uint32_t timeoutMs) {
     drainSerialInput();
 
-    io.println("[clock] informe data/hora: YYYY-MM-DD HH:MM:SS");
-    io.println("[clock] ENTER vazio para pular (timeout 30s)");
-    io.print("[clock] > ");
+    ShellOutput::printTagged(io, "clock", "informe data/hora: YYYY-MM-DD HH:MM:SS");
+    ShellOutput::printTagged(io, "clock", "ENTER vazio para pular (timeout 30s)");
+    io.print(ShellOutput::commandPrefix());
 
     String line;
 
     const bool submitted = readLineWithEcho(io, line, timeoutMs);
     if (!submitted) {
-        io.println("[clock] timeout sem confirmacao, mantendo horario atual");
+        ShellOutput::printTagged(io, "clock", "timeout sem confirmacao, mantendo horario atual");
         return;
     }
 
     line.trim();
     if (line.isEmpty()) {
-        io.println("[clock] horario mantido");
+        ShellOutput::printTagged(io, "clock", "horario mantido");
         return;
     }
 
     time_t epoch = 0;
     if (!parseDateTime(line, epoch)) {
-        io.println("[clock] formato invalido, mantendo horario atual");
+        ShellOutput::printTagged(io, "clock", "formato invalido, mantendo horario atual");
         return;
     }
 
@@ -312,10 +315,9 @@ void promptAndSetDateTime(Stream& io, uint32_t timeoutMs) {
     std::tm* now = std::localtime(&epoch);
     if (now != nullptr) {
         std::strftime(out, sizeof(out), "%Y-%m-%d %H:%M:%S", now);
-        io.print("[clock] horario ajustado para ");
-        io.println(out);
+        ShellOutput::printTagged(io, "clock", String("horario ajustado para ") + out);
     } else {
-        io.println("[clock] horario ajustado");
+        ShellOutput::printTagged(io, "clock", "horario ajustado");
     }
 }
 

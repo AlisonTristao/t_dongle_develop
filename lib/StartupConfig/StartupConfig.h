@@ -3,7 +3,7 @@
 #include <Arduino.h>
 #include <DonglePeripherals.h>
 
-namespace StartupConfig {
+namespace StartupConfig{
 
 /**
  * @brief Waits for serial monitor attach while updating startup visuals.

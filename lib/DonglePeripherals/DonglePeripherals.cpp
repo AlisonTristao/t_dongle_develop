@@ -1,4 +1,5 @@
 #include "DonglePeripherals.h"
+#include "ShellOutput.h"
 
 #include <SD_MMC.h>
 #include <FS.h>
@@ -339,7 +340,7 @@ bool DonglePeripherals::beginSd(bool oneBitMode) {
         return true;
     }
 
-    Serial.println("[dongle] SD init falhou (tentou 4-bit/1-bit e clock reduzido)");
+    ShellOutput::printTagged(Serial, "dongle", "SD init falhou (tentou 4-bit/1-bit e clock reduzido)");
     return false;
 }
 

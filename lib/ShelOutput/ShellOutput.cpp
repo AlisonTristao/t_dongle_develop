@@ -1,23 +1,22 @@
-#include "shell_output.h"
+#include "ShellOutput.h"
 
 #include <cstring>
 
 namespace {
 
+constexpr const char* kCommandPrefix = "& ";
+constexpr const char* kOutputPrefix = "! ";
+
 bool isErrorLike(const String& text) {
     String lower = text;
     lower.toLowerCase();
 
-    if (
+    return (
         lower.indexOf("falhou") >= 0 ||
         lower.indexOf("erro") >= 0 ||
         lower.indexOf("error") >= 0 ||
         lower.indexOf("invalid") >= 0
-    ) {
-        return true;
-    }
-
-    return false;
+    );
 }
 
 String normalizeTag(const char* tag) {
@@ -42,15 +41,30 @@ String normalizeTag(const char* tag) {
     return out;
 }
 
-} // namespace
+bool hasVisualPrefix(const char* line) {
+    if (line == nullptr) {
+        return false;
+    }
 
-namespace ShellOutput {
-
-void writeLine(Stream& io, const String& line) {
-    writeLine(io, line.c_str());
+    return std::strncmp(line, kOutputPrefix, std::strlen(kOutputPrefix)) == 0 ||
+           std::strncmp(line, kCommandPrefix, std::strlen(kCommandPrefix)) == 0;
 }
 
-void writeLine(Stream& io, const char* line) {
+String normalizeNewlines(const char* text) {
+    if (text == nullptr) {
+        return String("");
+    }
+
+    String normalized = String(text);
+    normalized.replace("\r\n", "\n");
+    normalized.replace('\r', '\n');
+    return normalized;
+}
+
+void writeBufferWithNewLine(Stream& io, const char* line) {
+    // Ensure output starts at the beginning of the current terminal line.
+    io.write('\r');
+
     const char* safeLine = (line != nullptr) ? line : "";
     const uint8_t* data = reinterpret_cast<const uint8_t*>(safeLine);
     size_t remaining = std::strlen(safeLine);
@@ -75,6 +89,77 @@ void writeLine(Stream& io, const char* line) {
     io.write('\n');
 }
 
+} // namespace
+
+namespace ShellOutput {
+
+const char* commandPrefix() {
+    return kCommandPrefix;
+}
+
+String commandPrompt() {
+    return String(kCommandPrefix);
+}
+
+void writeRawLine(Stream& io, const String& line) {
+    writeRawLine(io, line.c_str());
+}
+
+void writeRawLine(Stream& io, const char* line) {
+    writeBufferWithNewLine(io, line);
+}
+
+void writeLine(Stream& io, const String& line) {
+    writeLine(io, line.c_str());
+}
+
+void writeLine(Stream& io, const char* line) {
+    const char* safeLine = (line != nullptr) ? line : "";
+    if (safeLine[0] == '\0') {
+        writeBufferWithNewLine(io, safeLine);
+        return;
+    }
+
+    if (hasVisualPrefix(safeLine)) {
+        writeBufferWithNewLine(io, safeLine);
+        return;
+    }
+
+    String prefixed = String(kOutputPrefix) + safeLine;
+    writeBufferWithNewLine(io, prefixed.c_str());
+}
+
+void writeLines(Stream& io, const char* text) {
+    String normalized = normalizeNewlines(text);
+    int32_t start = 0;
+
+    while (start <= static_cast<int32_t>(normalized.length())) {
+        const int32_t newline = normalized.indexOf('\n', start);
+        String line;
+
+        if (newline < 0) {
+            line = normalized.substring(start);
+        } else {
+            line = normalized.substring(start, newline);
+        }
+
+        line.trim();
+        if (line.length() > 0) {
+            writeLine(io, line.c_str());
+        }
+
+        if (newline < 0) {
+            break;
+        }
+
+        start = newline + 1;
+    }
+}
+
+void writeLines(Stream& io, const String& text) {
+    writeLines(io, text.c_str());
+}
+
 void printTagged(Stream& io, const char* tag, const String& message) {
     const String safeTag = normalizeTag(tag);
     String line = "[" + safeTag + "]";
@@ -92,7 +177,6 @@ void printTagged(Stream& io, const char* tag, const char* message) {
 }
 
 void printResponse(Stream& io, const std::string& response) {
-    // Normalize response into clean single-line chunks for terminal rendering.
     String text = String(response.c_str());
     text.replace("\r\n", "\n");
     text.replace('\r', '\n');
@@ -116,6 +200,10 @@ void printResponse(Stream& io, const std::string& response) {
         if (line.length() > 0) {
             if (line.startsWith("[")) {
                 writeLine(io, line);
+                if (newline < 0) {
+                    break;
+                }
+                start = newline + 1;
                 continue;
             }
 

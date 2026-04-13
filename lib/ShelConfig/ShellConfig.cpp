@@ -1,7 +1,7 @@
-#include "shell_config.h"
-#include "espnow_config.h"
+#include "ShellConfig.h"
+#include "EspNowConfig.h"
 #include "error_codes.h"
-#include "shell_output.h"
+#include "ShellOutput.h"
 
 #include <algorithm>
 #include <cctype>
