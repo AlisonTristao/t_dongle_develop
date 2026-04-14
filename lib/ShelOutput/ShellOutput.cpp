@@ -4,7 +4,7 @@
 
 namespace {
 
-constexpr const char* kCommandPrefix = "& ";
+constexpr const char* kCommandPrefix = "$ ";
 constexpr const char* kOutputPrefix = "! ";
 
 bool isErrorLike(const String& text) {
@@ -56,8 +56,8 @@ String normalizeNewlines(const char* text) {
     }
 
     String normalized = String(text);
-    normalized.replace("\r\n", "\n");
-    normalized.replace('\r', '\n');
+    //normalized.replace("\r\n", "\n");
+    //normalized.replace('\r', '\n');
     return normalized;
 }
 

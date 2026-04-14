@@ -616,8 +616,8 @@ bool DatabaseStore::getDefaultBroadcastMac(uint8_t outMac[6]) {
     const int rc = sqlite3_exec(
         db_,
         "SELECT mac FROM peers "
-        "WHERE name='000' OR mac='FF:FF:FF:FF:FF:FF' "
-        "ORDER BY CASE WHEN name='000' THEN 0 ELSE 1 END, id ASC LIMIT 1;",
+        "WHERE name='Default' OR mac='FF:FF:FF:FF:FF:FF' "
+        "ORDER BY CASE WHEN name='Default' THEN 0 ELSE 1 END, id ASC LIMIT 1;",
         callback,
         &context,
         &errorMessage
@@ -1204,7 +1204,7 @@ bool DatabaseStore::ensureDefaultBroadcastPeer() {
     insertSql.reserve(280);
     insertSql += "INSERT OR IGNORE INTO peers(mac,name,description,created_at,updated_at) VALUES('";
     insertSql += "FF:FF:FF:FF:FF:FF";
-    insertSql += "','000','peer virtual padrao para broadcast',";
+    insertSql += "','Default','peer virtual padrao para broadcast',";
     insertSql += String(static_cast<long long>(now));
     insertSql += ",";
     insertSql += String(static_cast<long long>(now));
@@ -1216,7 +1216,7 @@ bool DatabaseStore::ensureDefaultBroadcastPeer() {
 
     String updateSql;
     updateSql.reserve(240);
-    updateSql += "UPDATE peers SET name='000', description='peer virtual padrao para broadcast', updated_at=";
+    updateSql += "UPDATE peers SET name='Default', description='peer virtual padrao para broadcast', updated_at=";
     updateSql += String(static_cast<long long>(now));
     updateSql += " WHERE mac='FF:FF:FF:FF:FF:FF';";
 
