@@ -89,6 +89,10 @@ size_t flushRxDisplayLines(size_t maxLines = 8);
 
 uint32_t takeDroppedRxCount();
 
+uint32_t takeOverwrittenRxDisplayCount();
+
+uint32_t takeDroppedRxDisplayCount();
+
 uint32_t takeDroppedRxDbLogCount();
 
 } // namespace EspNowConfig

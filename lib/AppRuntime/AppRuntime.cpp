@@ -14,6 +14,7 @@
 namespace {
 
 constexpr uint8_t kRxDbWarningPercent = RX_DB_WARNING_PERCENT;
+constexpr size_t kRxDisplayFlushBurst = 24;
 
 } // namespace
 
@@ -219,7 +220,7 @@ void AppRuntime::processAsyncWarnings(bool& needPromptRefresh) {
 }
 
 void AppRuntime::flushPendingEspNowOutput(bool& needPromptRefresh) {
-    const size_t flushed = EspNowConfig::flushRxDisplayLines(12);
+    const size_t flushed = EspNowConfig::flushRxDisplayLines(kRxDisplayFlushBurst);
     if (flushed > 0) {
         needPromptRefresh = true;
     }
@@ -228,6 +229,14 @@ void AppRuntime::flushPendingEspNowOutput(bool& needPromptRefresh) {
     if (dropped > 0) {
         char line[64] = {0};
         std::snprintf(line, sizeof(line), "rx_dropped=%lu", static_cast<unsigned long>(dropped));
+        ShellOutput::printTagged(Serial, "espnow", line);
+        needPromptRefresh = true;
+    }
+
+    const uint32_t overwrittenDisplay = EspNowConfig::takeOverwrittenRxDisplayCount();
+    if (overwrittenDisplay > 0) {
+        char line[72] = {0};
+        std::snprintf(line, sizeof(line), "rx_display_overwritten=%lu", static_cast<unsigned long>(overwrittenDisplay));
         ShellOutput::printTagged(Serial, "espnow", line);
         needPromptRefresh = true;
     }

@@ -325,8 +325,7 @@ void EspNowManager::handleReceiveStatic(const uint8_t* mac, const uint8_t* incom
 
     message incoming = {};
 
-    // If sender used full struct, deserialize directly.
-    if (len >= static_cast<int>(sizeof(message))) {
+    if (len == static_cast<int>(sizeof(message))) {
         memcpy(&incoming, incomingData, sizeof(message));
         incoming.msg[sizeof(incoming.msg) - 1] = '\0';
     } else {
