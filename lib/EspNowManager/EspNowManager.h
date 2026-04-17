@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <esp_now.h>
+#include <SharedMessageTypes.h>
 
 /**
  * @brief EspNowManager wraps peer registration and messaging over ESP-NOW.
@@ -26,15 +27,7 @@ public:
     /**
      * @brief Message category used in ESP-NOW payloads.
      */
-    // types of logs 
-    enum class logType {
-        NONE,
-        INFO,
-        CMD,
-        TELEMETRY,
-        ERROR,
-        DEBUG
-    };
+    using logType = ::logType;
 
     /**
      * @brief Wire payload structure shared between sender and receiver.

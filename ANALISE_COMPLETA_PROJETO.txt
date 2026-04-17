@@ -1,0 +1,1075 @@
+================================================================================
+ANÁLISE COMPLETA DO PROJETO: t_dongle_develop (ESP32-S3 Terminal Embarcado)
+================================================================================
+
+Versão: Firmware T-Dongle-S3
+Plataforma: LILYGO T-Dongle-S3 (ESP32-S3, 240MHz, USB nativo)
+Build: PlatformIO com Arduino Framework
+Data da Análise: Abril 2026
+
+================================================================================
+1. PROPÓSITO GERAL DO PROJETO
+================================================================================
+
+O t_dongle_develop é um firmware para criar um **terminal embarcado de operação e 
+diagnóstico** para o LILYGO T-Dongle-S3.
+
+Objetivos principais:
+✓ Operar o dongle localmente através de shell interativo via Serial USB
+✓ Exibir feedback em monitor Serial E LCD ST7735 em tempo real
+✓ Comunicação sem fio via protocolo ESP-NOW (ponto-a-ponto, broadcast)
+✓ Persistência de histórico e configurações em banco SQLite no SD
+✓ Controle de periféricos embarcados (LED RGB, LCD, SD-MMC, clock)
+✓ Logging estruturado de todas comunicações e eventos
+✓ Resiliência e continuidade através de restarts
+
+Use Cases:
+- Diagnóstico de rede ESP-NOW em tempo real
+- Monitoramento de sensores remotos sem fio
+- Debug de dispositivos embarcados via shell
+- Manutenção e configuração de padrão de rede
+- Teste de integrações wireless de baixa potência
+
+
+================================================================================
+2. ARQUITETURA DE ALTO NÍVEL
+================================================================================
+
+A aplicação segue uma arquitetura em CAMADAS com separação clara de conceitos:
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ CAMADA DE APLICAÇÃO (main.cpp → AppRuntime)                                 │
+│ └─ AppRuntime: orquestrador central, inicializa e coordena tudo             │
+│                                                                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ CAMADA DE SHELL & I/O (ShellSerial → TinyShell)                             │
+│ ├─ ShellSerial: leitura de entrada com histórico (64 commands)              │
+│ ├─ TinyShell: parse de comandos modulares (lsd, espnow, database, etc)      │
+│ ├─ ShellConfig: registro de comandos suportados                             │
+│ └─ ShellOutput: formatação consistente de output com tags                   │
+│                                                                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ CAMADA DE COMUNICAÇÃO WIRELESS (EspNowManager → EspNowConfig)               │
+│ ├─ EspNowManager: registro de peers (até 16) e envio de mensagens           │
+│ ├─ EspNowConfig: queues async para RX, callbacks, logging                   │
+│ └─ Suporte para HIGH_FREQUENCY_INCOMMING (modo buffer em RAM)               │
+│                                                                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ CAMADA DE PERSISTÊNCIA (DatabaseStore)                                       │
+│ ├─ Tabelas: peers, command_log, espnow_*_log, boot_events, kv_store         │
+│ ├─ Sincronização: mutex recursivo FreeRTOS para thread-safety               │
+│ ├─ Backup automático com timestamps                                          │
+│ └─ SQL seguro (escape, validation, prepared statements)                      │
+│                                                                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ CAMADA DE PERIFÉRICOS (DonglePeripherals → LcdTerminal)                     │
+│ ├─ DonglePeripherals: LED RGB, LCD ST7735, SD-MMC                           │
+│ ├─ LcdTerminal: interface terminal com scroll, linhas de status              │
+│ └─ BoardConfig: mapeamento de pinos centralizado                             │
+│                                                                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ CAMADA DE INICIALIZAÇÃO (StartupConfig)                                      │
+│ └─ Sequência segura de boot com validação de estado do hardware             │
+│                                                                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Integração:
+  main.cpp (setup/loop)
+      ↓
+  AppRuntime::begin() ← aqui ocorrem todas inicializações
+      ├─ ShellSerial::begin()
+      ├─ EspNowManager::begin() + EspNowConfig::init()
+      ├─ DatabaseStore::begin()
+      ├─ DonglePeripherals::begin() + LcdTerminal::begin()
+      ├─ StartupConfig::run()
+      ├─ restoreShellHistoryFromDatabase()
+      └─ startEspNowWorkers() (FreeRTOS tasks)
+      
+      ↓
+  AppRuntime::tick() ← chamado a cada iteração do loop principal
+      ├─ handleShellInput() → processShellCommand()
+      ├─ processAsyncWarnings() → flush do buffer if needed
+      ├─ flushPendingEspNowOutput() → exibiliza resultado de RX
+      └─ lcdTerminal_.refresh() → atualiza display
+
+
+================================================================================
+3. HARDWARE ALVO: LILYGO T-Dongle-S3
+================================================================================
+
+Especificações do Microcontrolador:
+- SoC: ESP32-S3 (Dual-core Xtensa 32-bit @ 240MHz)
+- RAM: 512KB SRAM (8MB PSRAM disponível)
+- Flash: 16MB (configurado em platformio.ini)
+- USB: USB 2.0 Full-Speed nativo (CDC via pino DI/DP)
+- WiFi: 802.11 b/g/n (suporta ESP-NOW)
+- GPIO: 44 pinos (acesso via I2C/SPI/UART/ADC/PWM)
+
+Periféricos Conectados (via include/config.h):
+
+A. DISPLAY LCD - ST7735 (128x160 pixels)
+   ├─ Interface: SPI 3-wire
+   ├─ Pinos: CS=4, MOSI=3, SCLK=5, DC=2, Reset=1, BL=38
+   ├─ Resolução: 128x160 pixels
+   ├─ Offset calibração: col_start=26, row_start=1
+   └─ Uso: Exibição paralela com Serial (status, histórico, alerts)
+
+B. LED RGB Embarcado
+   ├─ Tipo: LED WS2812/SK6812 com signaling serial
+   ├─ Pinos: DI (data)=40, CI (clock)=39
+   ├─ Cores: 24-bit RGB (8 bits cada canal)
+   ├─ Brilho: 31 níveis via software
+   └─ Uso: Feedback visual (startup, status, alertas)
+
+C. Cartão SD/TF - SD_MMC (4-line)
+   ├─ Interface: 4-bit SDMMC bus
+   ├─ Pinos: D0=14, D1=17, D2=18, D3=21, CLK=12, CMD=16
+   ├─ Capacidade: Até 256GB (testado com 32GB)
+   ├─ Filesystem: FAT32
+   └─ Uso: Persistência SQLite, backups, configurações
+
+D. BOTÃO BOOT
+   ├─ Pino: GPIO0
+   ├─ Tipo: Ativo-baixo (pulled up)
+   ├─ Função: Reset (hardware) / Input livre (software)
+   └─ Não usado no firmware atual
+
+E. USB CDC (CDC-ACM Serial)
+   ├─ Conectores: D- e D+ (GPIO19 e GPIO20) - hardware automático
+   ├─ Velocidade: 921600 baud (configurável)
+   ├─ Função: Interface serial com PC
+   └─ Uso: Shell interativo, debug logs, monitoramento
+
+F. UART Secundaria
+   ├─ Pinos: TX=43, RX=44
+   ├─ Velocidade: Não utilizada aparentemente
+   └─ Função: Reserved para uso futuro
+
+Mapeamento Centralizado:
+O arquivo `include/config.h` contém namespace BoardConfig::
+- Todas as constantes de pinos
+- Función initBoardPins() para setup seguro de GPIO
+- Configurações de default (backlight OFF, SD pullup, etc)
+- Design pattern evita "magic numbers" no código
+
+
+================================================================================
+4. COMPONENTES PRINCIPAIS DO SOFTWARE
+================================================================================
+
+4.1. main.cpp (Ponto de Entrada)
+-----------------------------------
+Código mínimo:
+```cpp
+void setup() {
+    g_app.begin();           // Inicialização completa
+}
+
+void loop() {
+    g_app.tick();            // Processamento contínuo
+}
+```
+
+Padrão: 
+- Delegação total para AppRuntime (singleton global)
+- Máxima simplicidade - sem lógica em main
+
+
+4.2. AppRuntime (Orquestrador Central)
+---------------------------------------
+Classe: AppRuntime (arquivo: lib/AppRuntime/)
+
+Responsabilidades:
+a) Inicialização Coordenada (begin())
+   - Inicializa ShellSerial (USB CDC @ 921600 baud)
+   - Inicializa EspNowManager com callbacks
+   - Inicializa DatabaseStore (carrega schema SQLite)
+   - Inicializa DonglePeripherals (LED + LCD)
+   - Executa StartupConfig (diagnostics)
+   - Restaura histórico de comandos do banco
+   - Cria workers async se HIGH_FREQUENCY_INCOMMING ativado
+   - Exibe mensagens de boot via ShellOutput com tags
+
+b) Loop Principal (tick())
+   - Processamento contínuo, chamado em cada iteração
+   - handleShellInput(): lê comandos via ShellSerial
+   - Executa comando no TinyShell (parse + dispatch)
+   - processAsyncWarnings(): monitora fila RX, exibe warnings de overflow
+   - flushPendingEspNowOutput(): escreve log de RX via DatabaseStore
+   - Atualiza LCD com status
+
+c) FreeRTOS Task Management
+   - Cria 2 tasks opcionais se HIGH_FREQUENCY_INCOMMING=1:
+     * espNowRxWorkerTask: processa fila RX de mensagens
+     * espNowRxDbWorkerTask: escreve logs RX no banco
+   - Task priority=1, alocadas no segundo core
+   - Permitem processamento EP-NOW assíncrono sem bloquear shell
+
+d) Estrutura Interna:
+   ```
+   ShellSerial serialShell_;          // Leitura input + histórico
+   EspNowManager espNowManager_;      // Gerenciamento de peers
+   DonglePeripherals donglePeripherals_;  // LED, LCD, SD
+   LcdTerminal lcdTerminal_;          // Display interface
+   DatabaseStore databaseStore_;      // SQLite persistence
+   TinyShell tinyShell_;              // Command processor
+   TaskHandle_t espNowRxTaskHandle_;  // FreeRTOS task 1
+   TaskHandle_t espNowRxDbTaskHandle_; // FreeRTOS task 2
+   ```
+
+
+4.3. ShellSerial (Entrada de Shell com Histórico)
+--------------------------------------------------
+Arquivo: lib/ShellSerial/
+
+Responsabilidades:
+a) Leitura de Linha da Serial
+   - Ler bytes de stream até \r ou \n
+   - Echo caracteres para feedback
+   - Retorna bool: true se linha completa, false se buffer vazio
+
+b) Edição de Linha In-Place
+   - Backspace: remove último char, repaint
+   - Left/Right: movimento do cursor (ESC[C / ESC[D)
+   - Ctrl+U: clear linha inteira
+   - Ctrl+A: home, Ctrl+E: end
+
+c) Histórico Circular (até 64 linhas)
+   - Armazena últimos comandos em ring buffer
+   - Up/Down arrows navega histórico
+   - Pullback: modifica input atual sem perder edição
+   - addLog(): adiciona linha ao histórico
+
+d) Formatação de Output
+   - Processa caracteres de controle (escape sequences)
+   - Preserva format do prompt (geralmente "> ")
+   - ESC parsing para arrow keys
+
+Exemplo de Sessão:
+```
+> help                           [user types + Enter]
+> _                              [cursor ativa, pronto para input]
+[Up]                             [recupera "help" do histórico]
+> help                           [linha atualizada]
+[Backspace x4]                   [edita: "> "]
+hel                              [tipo novo: "hel"]
+[Backspace]                      [edita]
+he                               [tipo "he"]
+```
+
+
+4.4. EspNowManager e EspNowConfig
+---------------------------------
+Arquivos: lib/EspNowManager/, lib/EspNowConfig/
+
+EspNowManager (Core):
+- Registro local de até 16 peers (estrutura deviceInfo: MAC, name, description)
+- Métodos: addDevice(), removeDevice(), getDevice(), broadcast(), sendTo()
+- Callbacks: ReceiveCallback, SendCallback para eventos
+
+EspNowConfig (Socket Layer):
+- Inicializa stack ESP-NOW
+- Registra callbacks na HAL (esp_now_register_recv_cb, etc)
+- Gerencia 2 filas FreeRTOS:
+  * RxMessageQueue (tamanho: RX_ASYNC_QUEUE_DEPTH)
+  * RxDbLogQueue (tamanho: RX_DB_LOG_QUEUE_DEPTH)
+- Processa eventos RX:
+  * Callback de RX → enqueue message
+  * Worker task dequeue → processa, loga em DB
+- Modo HIGH_FREQUENCY: buffer em RAM evita perdas
+
+Estrutura de Mensagem ESP-NOW:
+```cpp
+struct message {
+    uint32_t timer;              // Timestamp à envio
+    char msg[231];               // Payload de até 231 bytes
+    enum logType type;           // Categoria: INFO, CMD, ERROR, DEBUG, etc
+};
+```
+
+Fluxo RX (Recebimento):
+1. Hardware recebe pacote
+2. ISR (Interrupt) chama esp_now_recv_cb
+3. Callback enqueue em RxMessageQueue
+4. Worker task dequeue + processa
+5. Escreve em DatabaseStore (async se HIGH_FREQUENCY)
+6. Exibe em LcdTerminal
+
+
+4.5. DatabaseStore (Persistência SQLite)
+-----------------------------------------
+Arquivo: lib/DatabaseStore/ (análise detalhada em arquivo anterior)
+
+Resumo ligeiro:
+- 7 tabelas: peers, command_log, command_log_output, espnow_*_log, boot_events, kv_store
+- Inicialização: bootstrap schema, runtime migrations, índices
+- Sync: mutex recursivo protege acesso
+- Operações: upsert peer, log command, log espnow messages, backup
+- Consultas safe: escapeSqlText(), isSafeIdentifier(), prepared statements
+- Backup: sqlite3_backup_init() com timestamping
+
+KV Store (não usado ainda, mas presente):
+- Table para pares chave-valor genéricos para configurações
+
+
+4.6. DonglePeripherals (Controle de Hardware)
+---------------------------------------------
+Arquivo: lib/DonglePeripherals/
+
+Responsabilidades:
+a) Gerenciamento do LED RGB
+   - Interface: SPI 3-fio (DI/CI pins)
+   - Cores: 24-bit RGB + brilho 31 níveis
+   - Métodos: setLedColor(), ledOff()
+   - Feedback visual: startup pulse, status colors
+
+b) Gerenciamento do LCD ST7735
+   - Interface: SPI 4-fio (CS/MOSI/SCLK/DC)
+   - Reset via pin 1
+   - Backlight ativo-baixo (configurable polarity)
+   - Rotação: 0..3 (portrait/landscape)
+   - Offset calibração: col_start=26, row_start=1
+   - Métodos: beginLcd(), setLcdRotation(), reinitLcd(), setLcdBacklight()
+
+c) Gerenciamento SD-MMC
+   - Interface: 4-line SDMMC protocol
+   - Não inicializado por DonglePeripherals (DatabaseStore faz)
+   - Pinos já em pullup configurados
+
+Derived Class:
+- DongleSt7735: wrapper Adafruit_ST7735 com setPanelOffset()
+
+
+4.7. LcdTerminal (Interface de Display)
+---------------------------------------
+Arquivo: lib/LcdTerminal/
+
+Responsabilidades:
+- Abstração terminal para LCD (como VT100 para console)
+- Buffer de linhas com scroll
+- Operações: println(), write(), clear(), scroll()
+- Formatação: diferentes estilos de texto (invertido, bold)
+- Status line: exibição de mode/estado
+- Refresh: sincroniza buffer com hardware
+
+Integração com AppRuntime:
+- Espelha output de Shell
+- Exibe histórico de comandos
+- Mostra status ESP-NOW (peers, mensagens RX/TX)
+- Atualiza em tempo real via tick()
+
+
+4.8. TinyShell (Command Processor)
+----------------------------------
+Arquivo: https://github.com/AlisonTristao/TinyShell.git (externa)
+
+Framework modular para comandos tipo Unix:
+- Sintaxe: <modulo> -<comando> [arg1] [arg2] ...
+- Exemplos:
+  * "espnow -add AA:BB:CC:DD:EE:FF peer_name peer_description"
+  * "database -status"
+  * "shell -history 10"
+
+Integração Local:
+- ShellConfig::registerCommands() registra handlers
+- Dispatch automático baseado em parse
+- Retorna bool (sucesso/falha) + output
+
+Módulos Suportados (via ShellConfig):
+- espnow: gerenciar peers, enviar mensagens, histórico
+- database: status, leitura, backup, rebuild
+- led: controlar LED RGB
+- lcd: rotar display, controle de backlight
+- shell: histórico, info, help
+- system: reset, info de memória/uptime
+- device: info do hardware
+
+
+4.9. StartupConfig (Sequência de Boot)
+--------------------------------------
+Arquivo: lib/StartupConfig/
+
+Responsabilidades:
+- Validação de estado de hardware após inicialização
+- Testes de periféricos (LED piscando, LCD ligando, SD detectando)
+- Exibição de informações: versão, MAC, IPs
+- Diagnosticos iniciais via ShellOutput
+- Configuração de modo de operação (async RX enabled/disabled)
+
+Integração:
+- Chamada por AppRuntime::begin() após todas inicializações
+- Output via ShellOutput para Serial + LCD
+- Feedback visual via LED
+
+
+4.10. ShellOutput (Formatação de Output)
+----------------------------------------
+Arquivo: lib/ShelOutput/ (nota: typo em nome de diretório)
+
+Responsabilidades:
+- Padronização de formato de log com tags
+- Método: printTagged(stream, tag, message)
+- Formato: "[tag] message\n"
+- Uso em todas componentes para consistência
+- Output pode ir para Serial, LCD, arquivo (se Stream)
+
+Exemplo:
+```cpp
+ShellOutput::printTagged(Serial, "espnow", "peer added");
+// Output: "[espnow] peer added\n"
+```
+
+
+================================================================================
+5. FLUXO DE EXECUÇÃO DETALHADO
+================================================================================
+
+5.1. STARTUP (Sequência de Boot)
+---------------------------------
+
+1. Hardware Reset / Power-on
+   ├─ CPU entra em modo de boot do segundo estágio
+   ├─ Flash carregado em memória
+   └─ Executa código do Arduino bootloader
+
+2. Arduino Environment Inicializa
+   ├─ USB CDC inicializa
+   ├─ Portas seriais prontas
+   └─ Jumper para setup()
+
+3. setup() (main.cpp)
+   └─ AppRuntime::begin()
+
+4. AppRuntime::begin() (sequência de inicialização)
+   ├─ Chama BoardConfig::initBoardPins()
+   │  ├─ Configura GPIO como input/output
+   │  ├─ Define defaults: LCD backlight OFF, SD pullup
+   │  └─ Prepara linhas SPI para LCD/SD
+   │
+   ├─ ShellSerial::begin(Serial) @ 921600 baud
+   │  ├─ Anexa stream USB
+   │  └─ Inicializa buffer de entrada/histórico
+   │
+   ├─ EspNowManager::begin()
+   │  ├─ Inicializa WiFi station mode
+   │  ├─ Inicializa ESP-NOW
+   │  ├─ Registra callbacks de RX/TX
+   │  └─ Retorna true/false
+   │
+   ├─ DatabaseStore::begin(espNowManager)
+   │  ├─ Abre arquivo SQLite em SD
+   │  ├─ Executa bootstrap.sql (CREATE TABLE...IF NOT EXISTS)
+   │  ├─ Aplica migrations de runtime
+   │  ├─ Carrega peers salvos do banco em espNowManager
+   │  └─ Define ready_=true
+   │
+   ├─ DonglePeripherals::begin()
+   │  ├─ beginLed()  → inicializa LED RGB
+   │  ├─ beginLcd()  → inicializa LCD ST7735
+   │  └─ Exibe splash screen ou boot message
+   │
+   ├─ LcdTerminal::begin()
+   │  ├─ Vincula ao LCD de DonglePeripherals
+   │  ├─ Inicializa buffer de linhas
+   │  └─ Limpa display
+   │
+   ├─ StartupConfig::run()
+   │  ├─ Testes de hardware
+   │  ├─ Exibe informações de boot
+   │  ├─ Diagnosticos via ShellOutput
+   │  └─ Feedback visual com LED
+   │
+   ├─ restoreShellHistoryFromDatabase()
+   │  ├─ Lê últimos 64 comandos do banco
+   │  ├─ Popula ShellSerial::historico
+   │  └─ Permite up/down arrow recall
+   │
+   ├─ startEspNowWorkers()
+   │  ├─ Se HIGH_FREQUENCY_INCOMMING=1:
+   │  │  ├─ Cria espNowRxWorkerTask @ core 1
+   │  │  └─ Cria espNowRxDbWorkerTask @ core 1
+   │  └─ Retorna se desabilitado
+   │
+   └─ Retorna true se tudo OK, false se falha crítica
+
+5. loop() → AppRuntime::tick() (executado continuamente)
+   ├─ // Processa entrada do shell
+   ├─ handleShellInput()
+   │  ├─ ShellSerial::readInputLine(comandoStr)
+   │  ├─ Se tem input:
+   │  │  ├─ TinyShell::processCommand(comandoStr)
+   │  │  ├─ Dispatch para handler correto
+   │  │  ├─ Resulta em output buffer
+   │  │  ├─ ShellOutput::printTagged() → Serial + LCD
+   │  │  └─ DatabaseStore::logCommand() se relevante
+   │  │
+   │  └─ Se timeout (vazio):
+   │     └─ Retorna para polling
+   │
+   ├─ // Processa warnings async
+   ├─ processAsyncWarnings()
+   │  ├─ Se HIGH_FREQUENCY_INCOMMING:
+   │  │  ├─ Verifica fila RxDbLogQueue
+   │  │  ├─ Se preenche > 80%:
+   │  │  │  ├─ Emite warning "[espnow] rx queue warning 80%"
+   │  │  │  ├─ Flush automático se acionado
+   │  │  │  └─ Reset counter
+   │  │  │
+   │  │  └─ Exibe estatísticas
+   │  │
+   │  └─ Atualiza LCD com status
+   │
+   ├─ // Escreve outputs pendentes
+   ├─ flushPendingEspNowOutput()
+   │  ├─ Processa buffer de RX não-escrito
+   │  ├─ DatabaseStore::logIncomingEspNow()
+   │  └─ LcdTerminal exibe última mensagem
+   │
+   └─ LcdTerminal::refresh()
+      └─ Sincroniza buffer com LED + LCD
+
+
+5.2. COMMAND PROCESSING (Processamento de Comando)
+---------------------------------------------------
+
+Exemplo: Usuário digita "espnow -add AA:BB:CC:DD:EE:FF AlarmSensor Sensor externo"
+
+Fluxo:
+1. ShellSerial::readInputLine() retorna string
+2. AppRuntime::handleShellInput() recebe
+3. TinyShell::processCommand("espnow -add ...") é chamado
+4. Parse interno:
+   ├─ Extrai módulo: "espnow"
+   ├─ Extrai subcomando: "add"
+   └─ Extrai argumentos: [MAC, name, description]
+5. Dispatch para handler registrado em ShellConfig
+6. Handler executa:
+   ├─ Valida MAC hexadecimal
+   ├─ CHAMA EspNowManager::addDevice(mac, name, desc)
+   ├─ Se sucesso:
+   │  ├─ Adiciona em registro local (até 16 peers)
+   │  ├─ Registra na HAL ESP-NOW
+   │  └─ DatabaseStore::upsertPeer() persiste
+   │
+   └─ Compõe output: "[espnow] peer adicionado: AA:BB:CC:DD:EE:FF"
+7. Output escrito em:
+   ├─ Serial (USB) imediatamente
+   ├─ LcdTerminal (buffer, exibe em refresh)
+   └─ Potencialmente DatabaseStore se logCommand()
+8. Retorna ao tick() para próxima iteração
+
+
+5.3. ESP-NOW MESSAGE RECEPTION (Recebimento de Mensagem Wireless)
+------------------------------------------------------------------
+
+Contexto: Remoto envia "Hello" para o dongle via ESP-NOW
+
+1. Hardware Recebe Pacote
+   └─ Trigger interrupt do WiFi MAC
+
+2. ISR (Interrupt Context)
+   ├─ esp_now_recv_cb (registrada em EspNowConfig)
+   ├─ Copia payload em estrutura message
+   ├─ Enqueue em RxMessageQueue (low-level, bloqueio curto)
+   └─ Retorna (ISR termina)
+
+3. FreeRTOS Context Switch
+   ├─ Se HIGH_FREQUENCY_INCOMMING:
+   │  └─ espNowRxWorkerTask acorda (priority=1)
+   │
+   └─ Se modo síncrono:
+      └─ AppRuntime::tick() processa na próxima iteração
+
+4. espNowRxWorkerTask (se async)
+   ├─ Dequeue message de RxMessageQueue
+   ├─ EspNowConfig::processRxMessage(event)
+   │  ├─ Copia para RxDbLogQueue
+   │  ├─ Usa ReceiveCallback se registrada
+   │  └─ Atualiza estatísticas
+   │
+   └─ Loop continua, aguarda próxima
+
+5. espNowRxDbWorkerTask (se async + HIGH_FREQUENCY)
+   ├─ Dequeue de RxDbLogQueue (buffer em RAM)
+   ├─ DatabaseStore::logIncomingEspNow(mac, message)
+   │  ├─ Insert em espnow_incoming_log
+   │  ├─ Links com peers(id) via FK
+   │  └─ Timestamp automático
+   │
+   └─ Atualiza contador interno
+
+6. AppRuntime::tick() (main loop)
+   ├─ processAsyncWarnings()
+   │  ├─ Checa se RxDbLogQueue > 80%
+   │  ├─ Se sim: flush em RAM SE não foi flushed ainda
+   │  └─ Exibe warning e estatísticas
+   │
+   ├─ flushPendingEspNowOutput()
+   │  ├─ Move pending RX para display/DB se necessário
+   │  └─ LcdTerminal exibe "RX: [sender] msg"
+   │
+   └─ LcdTerminal::refresh()
+      ├─ Renderiza linhas em LCD
+      ├─ Atualiza status bar
+      └─ Exibe LED status color
+
+7. Resultado Final
+   ├─ Serial (monitor): "[espnow] RX from AA:BB:CC:DD:EE:FF: Hello"
+   ├─ LCD: Mensagem visível com peer name
+   ├─ Database: Persistida em espnow_incoming_log
+   └─ LED: Piscada (status ou ACK)
+
+
+================================================================================
+6. CONFIGURAÇÃO E FLAGS DE BUILD
+================================================================================
+
+platformio.ini (Configuração de Build):
+
+[env:tdongle-s3]
+├─ board: esp32-s3-devkitc-1
+│  └─ SoC ESP32-S3, CPU 240MHz, 16MB flash
+│
+├─ framework: arduino
+│  └─ Arduino framework + PlatformIO
+│
+├─ upload_speed: 921600 baud
+│  └─ Serial USB @ 921600 para uploades rápidos
+│
+├─ monitor_speed: 921600 baud
+│  └─ Serial monitor @ mesma taxa
+│
+├─ build_flags:
+│  ├─ -std=gnu++17       (C++17)
+│  ├─ -I include         (Include path)
+│  ├─ -DARDUINO_USB_MODE=1   (CDC native)
+│  ├─ -DARDUINO_USB_CDC_ON_BOOT=1  (Auto-start USB)
+│  ├─ -DARDUINO_RUNNING_CORE=1 (Core 1)
+│  └─ -DHIGH_FREQUENCY_INCOMMING_ESPNOW=1 (Async RX buffer)
+│
+├─ lib_deps:
+│  ├─ Adafruit GFX Library (Display abstraction)
+│  ├─ Adafruit ST7735 Library (LCD driver)
+│  ├─ Sqlite3Esp32 (SQLite binding)
+│  └─ TinyShell (Custom fork git)
+│
+└─ board_build.flash_size: 16MB
+
+Constantes Importantes (include/config.h):
+├─ HIGH_FREQUENCY_INCOMMING_ESPNOW=1
+│  └─ Ativa buffers async em RAM para RX de alto volume
+│
+├─ RX_ASYNC_QUEUE_DEPTH=64
+│  └─ Tamanho da fila principal de RX
+│
+├─ RX_DB_LOG_QUEUE_DEPTH=256
+│  └─ Tamanho do buffer em RAM de log de RX
+│
+├─ RX_DB_WARNING_PERCENT=80
+│  └─ Threshold para warning de overflow
+│
+└─ PIN_* constantes
+   └─ Mapeamento de GPIO (já descritos em BoardConfig)
+
+Debug/Scripts:
+└─ pio_warnings.py
+   └─ Script pre-build para verificar warnings
+
+
+================================================================================
+7. SECURITY & ROBUSTNESS (Segurança e Robustez)
+================================================================================
+
+7.1. Proteção de Dados (SQL Injection Prevention)
+--------------------------------------------------
+DatabaseStore::escapeSqlText()
+- Duplica aspas simples: ' → ''
+- Escape manual não é best practice, mas funciona
+
+Plus:
+- isSafeIdentifier() valida nomes de tabela
+- Rejeita "sqlite_*" (schemas internos)
+- Usa prepared statements quando possível
+
+
+7.2. Thread Safety (Sincronização)
+----------------------------------
+DatabaseStore::lockDb() / unlockDb()
+- Mutex recursivo FreeRTOS
+- Permite mesma thread chamar múltiplas vezes
+- Timeout configurável
+- Protege ACESSO ao banco SQLite
+
+EspNowConfig queues:
+- FreeRTOS queues já são thread-safe
+- ISR → Task context passa por queue
+- Serializa acesso sem deadlock
+
+
+7.3. Resiliência
+-----------------
+Bootstrap SQL idempotence:
+- CREATE TABLE IF NOT EXISTS
+- CREATE INDEX IF NOT EXISTS
+- Seguro contra múltiplas execuções
+
+Database Migrations:
+- applyRuntimeMigrations() sempre segura
+- Não causa erro em banco já migrado
+
+Backup atomárico:
+- sqlite3_backup_init/step/finish
+- PRAGMA wal_checkpoint(FULL) sincroniza WAL
+- Garante snapshot consistente
+
+
+7.4. Error Handling
+--------------------
+Padrão geral:
+- Funções retornam bool (true=OK, false=falha)
+- Mensagens de erro via ShellOutput com tags
+- Logs de erro em DatabaseStore quando aplicável
+- Fallback seguro se recurso não disponível
+
+Exemplo:
+```cpp
+if (!databaseStore_.begin(espNowManager, &Serial)) {
+    // Ignora DB, continua com funcionalidad base
+    logLine("[database] nao inicializado");
+}
+```
+
+
+================================================================================
+8. FLUXOS DE DADOS CRÍTICOS
+================================================================================
+
+8.1. Fluxo de Saída (Output)
+----------------------------
+
+Comando → Processing → Output Buffer → (Serial + LCD + DB)
+
+Exemplo: "espnow -status"
+1. TinyShell processa comando
+2. EspNowManager::getStatus() retorna string
+3. ShellOutput::printTagged("[espnow] status: ...")
+   ├─ Escreve em Serial (USB) via io_->println()
+   ├─ Escreve em LcdTerminal (buffer)
+   └─ Potencialmente em DatabaseStore (log)
+4. LcdTerminal::refresh() renderiza LCD na próxima iteração
+
+
+8.2. Fluxo de Entrada (Input)
+-----------------------------
+
+Usuario → Serial → Parse → Command Dispatch → Handler
+
+Exemplo: "led -set FF 00 00" (LED vermelho)
+1. ShellSerial::readInputLine() ler USB
+2. Retorna string "led -set FF 00 00"
+3. TinyShell::processCommand() parse
+   ├─ Modulo: "led"
+   ├─ Subcommand: "set"
+   └─ Args: ["FF", "00", "00"]
+4. Dispatch para handler LED
+5. Handler:
+   ├─ Parse RGB values
+   ├─ DonglePeripherals::setLedColor(255, 0, 0)
+   └─ Compõe output: "[led] color set to FF:00:00"
+
+
+8.3. Fluxo de Persistência (Database)
+-------------------------------------
+
+Operation → Insert SQL → Execute via mutex → Confirm
+
+Exemplo: "espnow -add AA:BB:CC:DD:EE:FF TestPeer Test description"
+1. Handler chama EspNowManager::addDevice()
+2. Depois chama DatabaseStore::upsertPeer()
+3. upsertPeer():
+   ├─ lockDb() - pega mutex
+   ├─ Constrói SQL: UPDATE + INSERT OR IGNORE
+   ├─ executeNoResult(sql)
+   ├─ unlockDb() - libera mutex
+   └─ Retorna true/false
+4. Resultado persisted em "peers" table com timestamp
+
+
+================================================================================
+9. MÓDULOS DE SHELL - REFERÊNCIA RÁPIDA
+================================================================================
+
+módulo 'espnow':
+├─ -add <MAC> <name> <desc>        → Adiciona peer
+├─ -remove <MAC>                   → Remove peer  
+├─ -list                           → Lista peers
+├─ -send <MAC> <mensagem>          → Envia msg
+├─ -broadcast <mensagem>           → Envia para todos
+├─ -history [limit]                → Mostra histórico RX/TX
+├─ -status                         → Status do subsistema
+└─ -peers                          → Info dos peers
+
+módulo 'database':
+├─ -status                         → Count de tabelas
+├─ -backup                         → Cria snapshot
+├─ -rebuild                        → Reconstrói banco
+├─ -read <tableName> [limit]       → Lê tabela
+├─ -logs [limit]                   → Mostra histórico comandos
+└─ -drop <tableName>               → Delete tabela (danger!)
+
+módulo 'led':
+├─ -set <R> <G> <B>               → Set RGB (hex)
+├─ -pulse <ms>                    → Pulso de cor
+└─ -off                           → Desliga
+
+módulo 'lcd':
+├─ -on / -off                     → Backlight on/off
+├─ -rotate <0..3>                → Rotação display
+├─ -clear                        → Limpa tela
+└─ -test                        → Test display
+
+módulo 'shell':
+├─ -help                        → Mostra ajuda
+├─ -history [n]               → Mostra últimas N linhas
+├─ -version                   → Versão do firmware
+└─ -info                      → Info do sistema
+
+módulo 'system':
+├─ -reset                     → Reboot
+├─ -memory                    → RAM/Flash status
+├─ -uptime                   → Tempo desde boot
+└─ -mac                      → MAC WiFi
+
+
+
+================================================================================
+10. ESTRUTURA DE DIRETÓRIOS
+================================================================================
+
+t_dongle_develop/
+├─ platformio.ini               Configuration de build
+├─ README.md                    Este arquivo
+│
+├─ include/
+│  ├─ config.h                 Mapeamento de pinos + BoardConfig
+│  └─ error_codes.h            Códigos de erro (reference)
+│
+├─ src/
+│  └─ main.cpp                 Ponto de entrada (setup/loop)
+│
+├─ lib/                         Bibliotecas locais
+│  ├─ AppRuntime/              Orquestrador central
+│  │  ├─ AppRuntime.h
+│  │  └─ AppRuntime.cpp
+│  │
+│  ├─ ShellSerial/             Leitura de shell com histórico
+│  │  ├─ ShellSerial.h
+│  │  └─ ShellSerial.cpp
+│  │
+│  ├─ EspNowManager/           Gerenciador de peers ESP-NOW
+│  │  ├─ EspNowManager.h
+│  │  └─ EspNowManager.cpp
+│  │
+│  ├─ EspNowConfig/            Socket layer ESP-NOW + queues
+│  │  ├─ EspNowConfig.h
+│  │  └─ EspNowConfig.cpp
+│  │
+│  ├─ DatabaseStore/           SQLite persistence
+│  │  ├─ DatabaseStore.h
+│  │  └─ DatabaseStore.cpp
+│  │
+│  ├─ DonglePeripherals/       LED + LCD + SD control
+│  │  ├─ DonglePeripherals.h
+│  │  └─ DonglePeripherals.cpp
+│  │
+│  ├─ LcdTerminal/             Terminal abstraction para LCD
+│  │  ├─ LcdTerminal.h
+│  │  └─ LcdTerminal.cpp
+│  │
+│  ├─ StartupConfig/           Código de boot/diagnostics
+│  │  ├─ StartupConfig.h
+│  │  └─ StartupConfig.cpp
+│  │
+│  ├─ ShellConfig/             Registro de comandos
+│  │  ├─ ShellConfig.h
+│  │  └─ ShellConfig.cpp
+│  │
+│  └─ ShelOutput/              Formatação de output com tags
+│     ├─ ShellOutput.h
+│     └─ ShellOutput.cpp
+│
+├─ scripts/
+│  └─ pio_warnings.py          Pre-build script
+│
+└─ test/
+   └─ test_tablelinker.cpp    Unit test (minimal)
+
+
+Dependências Externas (definidas em platformio.ini):
+├─ Adafruit GFX Library (gfx drawings)
+├─ Adafruit ST7735 Library (LCD SPI driver)
+├─ Sqlite3Esp32 (SQLite binding)
+├─ TinyShell (GitHub fork - command parsing)
+└─ Arduino Framework (built-in)
+
+
+================================================================================
+11. FLUXO DE DESENVOLVIMENTO E COMPILAÇÃO
+================================================================================
+
+Build Process:
+1. PlatformIO lê platformio.ini
+2. Instala dependências (se não cached)
+3. Compila código com c++17 flags
+4. Executa pio_warnings.py (pre-build script)
+5. Links bibliotecas (Arduino, Adafruit, SQLite, TinyShell)
+6. Produz firmware.bin (uploading para COM5 @ 921600)
+
+Típico Workflow Desenvolvimento:
+```bash
+# Build
+pio run
+
+# Upload para placa
+pio run --target upload --upload-port COM5
+
+# Monitorar serial
+pio device monitor --port COM5 --baud 921600
+```
+
+Após o upload:
+- Placa reenicia
+- setup() executa (AppRuntime::begin)
+- Inicialização de 1-2 segundos
+- Prompt "> " aparece
+- Pronto para comandos
+
+
+================================================================================
+12. RESUMO E CONCEITOS-CHAVE
+================================================================================
+
+Padrões de Design Utilizados:
+✓ Singleton (AppRuntime): instância global, único ponto de coordenação
+✓ Observer (Callbacks): ESP-NOW rx/tx callbacks para eventos wireless
+✓ Strategy (ShellConfig): registry pattern para diferentes handlers de comando
+✓ Factory (DatabaseStore): criação automática de schema via SQL
+✓ Adapter (LcdTerminal): interface terminal abstrata para hardware LCD
+✓ Layer/Separation of Concerns: Cada classe tem responsabilidade úniva
+
+
+Características Arquiteturais:
+✓ Modular: componentes independentes, interfaces bem-definidas
+✓ Thread-safe: mutex para DB, FreeRTOS queues para wireless
+✓ Resilient: idempotência, error handling, fallbacks
+✓ Rich I/O: 3 canais (Serial, LCD, DB) para feedback
+✓ Embarcado-primeiro: sem alocação dinâmica excessiva, buffers fixos
+✓ Extensível: fácil adicionar novos comandos via ShellConfig
+
+
+Trade-offs Implementados:
+⚖ Simplicidade vs. Funcionalidade: main.cpp minimalisimo, delegação em AppRuntime
+⚖ Performance vs. Segurança: SQL escaping manual vs. prepared statements
+⚖ Async vs. Síncrono: HIGH_FREQUENCY_INCOMMING pode ser desabilitado
+
+Limitações Conhecidas:
+- Máximo 16 peers (EspNowManager::MAX_DEVICES)
+- Máximo 64 comandos em histórico (ShellSerial::DEFAULT_LOG_CAPACITY)
+- Máximo 64 peers carregados do banco (loadPeersFromDatabase LIMIT 64)
+- Backup automático não agendado (manual apenas)
+- KV store não integrado (presente mas não usado)
+
+
+================================================================================
+13. PRÓXIMOS PASSOS & EXTENSIBILIDADE
+================================================================================
+
+Melhorias Possíveis:
+✓ Implementar KV store para persistência de configurações
+✓ Adicionar transações de multi-comando para atomicidade
+✓ Suporte para OTA (over-the-air) updates
+✓ Persistência de pares em EEPROM (backup fail-safe)
+✓ Modo low-power com sleep schedule
+✓ Interface web (WebServer) para remoto control
+✓ Integração com MQTT para nuvem
+✓ Autenticação/criptografia em comandos
+✓ Analisador de tráfego ESP-NOW (sniffer mode)
+✓ Visualização real-time de topologia de rede
+
+
+Adição de Novo Comando:
+1. Crie handler em .cpp apropriado ou novo módulo
+2. Registre em ShellConfig::registerCommands()
+3. Implemente parseando argumentos via TinyShell
+4. Use ShellOutput::printTagged() para output
+5. Chame DatabaseStore::logCommand() se persistir localmente
+6. Test via "modulo -comando args"
+
+
+================================================================================
+14. REFERÊNCIA DE ARQUIVO IMPORTANTES
+================================================================================
+
+Configuração de Hardware:
+└─ include/config.h: Todos os pinos e constantes de placa
+
+Inicialização:
+├─ src/main.cpp: setup() e loop()
+├─ lib/AppRuntime/AppRuntime.cpp: begin() e tick()
+└─ lib/StartupConfig/: Diagnostics de boot
+
+Comunicação Wireless:
+├─ lib/EspNowManager/: Registro de peers
+└─ lib/EspNowConfig/: Socket layer + queues
+
+Persistência:
+├─ lib/DatabaseStore/: SQLite manager (ANÁLISE COMPLETA EM ARQUIVO ANTERIOR)
+└─ include/config.h: Paths de SD card
+
+Interface Serial:
+├─ lib/ShellSerial/: Leitura com histórico
+├─ lib/ShellConfig/: Registro de comandos
+└─ lib/ShelOutput/: Formatação padronizada
+
+Periféricos:
+├─ lib/DonglePeripherals/: LED RGB, LCD, SD
+└─ lib/LcdTerminal/: Terminal abstraction
+
+Build:
+└─ platformio.ini: Configuração de compilação
+
+
+================================================================================
+15. CONCLUSÃO
+================================================================================
+
+O projeto t_dongle_develop é uma implementação embarcada completa de um **sistema
+de terminal wireless interativo** para o LILYGO T-Dongle-S3, integrando:
+
+✓ Shell interativo com histórico persistente
+✓ Comunicação ESP-NOW com logging estruturado
+✓ Persistência SQLite com backup automático
+✓ Output em múltiplos canais (Serial, LCD, Banco)
+✓ Hardware embarcado (LED RGB, Display, SD card)
+✓ Thread-safe via FreeRTOS
+✓ Modular e extensível
+✓ Robusto contra falhas e restarts
+
+A arquitetura em camadas, com separação claro de conceitos, facilita manutenção,
+teste e extensão. O padrão Singleton com delegação simplifica o main.cpp. O uso
+de FreeRTOS tasks permite processamento assíncrono sem bloquear o shell.
+
+O código exemplifica boas práticas para embedded systems:
+- Sincronização apropriada
+- Tratamento de erros graceful
+- Persistência robusta
+- Segurança contra exploração
+- Documentação implícita através de nomes descritivos
+- Componentização clara
+
+Este projeto serve como base sólida para expansion com features adicionais
+(OTA, MQTT, criptografia, análise de rede, etc) enquanto mantém núcleo estável.
+
+================================================================================
+FIM DA ANÁLISE COMPLETA DO PROJETO
+================================================================================

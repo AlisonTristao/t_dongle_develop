@@ -1,4 +1,5 @@
 .pio
 .vscode
 .venv
+.txt
 __pycache__

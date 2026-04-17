@@ -1,0 +1,576 @@
+================================================================================
+ANÁLISE DETALHADA DO CÓDIGO: DatabaseStore.cpp
+================================================================================
+
+1. PROPÓSITO GERAL DA CLASSE
+================================================================================
+
+A classe DatabaseStore é um gerenciador de banco de dados SQLite que:
+- Controla a persistência de dados em cartão SD
+- Mantém registro de dispositivos ESP-NOW (pares de comunicação)
+- Armazena histórico de comandos de shell
+- Registra logs de comunicação (entrada/saída) via ESP-NOW
+- Gerencia eventos de boot do dispositivo
+- Fornece acesso seguro e sincronizado ao banco de dados em ambiente FreeRTOS
+
+O banco de dados é crítico para manter a persistência de configurações e histórico
+através de reinicializações e desligamentos.
+
+
+2. ESTRUTURA INTERNA E COMPONENTES PRINCIPAIS
+================================================================================
+
+2.1. TABELAS DO BANCO DE DADOS (Schema)
+--------------------------------------
+
+a) peers
+   - Armazena os dispositivos ESP-NOW conhecidos
+   - Campos: id, mac (endereço único), name, description, created_at, updated_at
+   - Chave primária: id (auto-increment)
+   - Constraint único: mac (não pode haver dois dispositivos com mesmo MAC)
+   - Exemplo: MAC "AA:BB:CC:DD:EE:FF", name "SensorTempo", description "sensor externo"
+
+b) command_log
+   - Histórico de todos os comandos executados via shell
+   - Campos: id, command, source (origem: serial/espnow), created_at
+   - Relacionamento: um comando pode ter múltiplos outputs (tabela command_log_output)
+
+c) command_log_output
+   - Armazena a saída/resposta de cada comando
+   - Campos: id, log_id (referência ao comando), output, created_at
+   - Chave estrangeira: log_id referencia command_log(id)
+   - Tipo de relacionamento: 1-para-muitos (1 comando com N saídas)
+
+d) espnow_incoming_log
+   - Registro de mensagens recebidas via ESP-NOW
+   - Campos: id, peer_id (ref. dispositivo), payload (conteúdo), payload_type, received_at
+   - Rastreia comunicação de entrada
+
+e) espnow_outgoing_log
+   - Registro de mensagens enviadas via ESP-NOW
+   - Campos: id, peer_id, mac, payload, payload_type, delivered (sucesso/falha), sent_at
+   - Rastreia comunicação de saída e estado de entrega
+
+f) boot_events
+   - Registra cada inicialização do dispositivo
+   - Campos: id, reason (motivo do boot), boot_at (timestamp)
+   - Útil para debugging e diagnóstico
+
+g) kv_store
+   - Armazenamento de pares chave-valor genéricos
+   - Campos: key (chave primária), value, updated_at
+   - Propósito: guardar configurações simples
+
+
+2.2. MECANISMO DE SINCRONIZAÇÃO (Mutex)
+----------------------------------------
+
+Ao criar DatabaseStore:
+  - dbMutex_ = xSemaphoreCreateRecursiveMutex()
+  - Cria um semáforo RTOS recursivo para ambiente FreeRTOS
+  - Permite que a mesma thread bloqueie múltiplas vezes
+
+Funções de proteção:
+  - lockDb(timeoutMs): tenta adquirir o lock com timeout
+    - portMAX_DELAY se timeoutMs == 0 (espera indefinida)
+    - pdMS_TO_TICKS(timeoutMs) converte milissegundos em ticks do RTOS
+    - Retorna true se conseguiu o lock
+  
+  - unlockDb(): libera o lock
+    - Usa xSemaphoreGiveRecursive() para semáforo recursivo
+    - Permite código com múltiplos unlockDb() sem problemas
+
+Todos os acessos ao banco (db_) são protegidos por lockDb/unlockDb.
+
+
+2.3. CONSTANTES E PATHS DO ARQUIVO
+-----------------------------------
+
+kDefaultBootstrapSql: String contendo SQL para criar todas as tabelas
+kFsDatabaseDir: diretório base "/database"
+kFsDatabasePath: caminho completo do arquivo SQLite
+kFsBootstrapPath: path para arquivo bootstrap.sql
+kFsBackupDir: diretório de backups "/database/backups"
+
+O Bootstrap SQL cria as tabelas durante a inicialização do banco.
+
+
+3. FLUXO DE INICIALIZAÇÃO
+================================================================================
+
+A inicialização segue a sequência: begin() → openDatabase() → applyBootstrapScript()
+                                    → applyRuntimeMigrations() → loadPeersFromDatabase()
+
+
+3.1. MÉTODO begin()
+-------------------
+bool DatabaseStore::begin(EspNowManager& espNow, Stream* io)
+
+Etapas:
+1. Armazena referência ao Stream (io_) para logs
+2. Define ready_ = false (não pronto)
+3. Chama closeDatabase() para limpar estado anterior
+4. ensureBootstrapAssets():
+   - Cria diretório "/database" se não existir
+   - Verifica/cria arquivo bootstrap.sql com SQL padrão
+5. openDatabase():
+   - Abre conexão SQLite no arquivo "/sdcard/database/database.db"
+   - Retorna false se falhar
+6. applyBootstrapScript():
+   - Lê bootstrap.sql do SD
+   - Executa criação de tabelas (CREATE TABLE IF NOT EXISTS)
+   - IF NOT EXISTS garante idempotência
+7. applyRuntimeMigrations():
+   - Aplica índices para otimizar queries:
+     * idx_peers_mac: índice em peers(mac)
+     * idx_incoming_peer: índice em espnow_incoming_log(peer_id)
+     * idx_outgoing_peer: índice em espnow_outgoing_log(peer_id)
+     * idx_log_output_log_id: índice em command_log_output(log_id)
+   - Idempotente: CREATE TABLE/INDEX IF NOT EXISTS
+8. Define ready_ = true
+9. ensureDefaultBroadcastPeer():
+   - Cria entrada especial "FF:FF:FF:FF:FF:FF" (endereço broadcast)
+   - Nome: "Default", descrição: "peer virtual padrao para broadcast"
+10. loadPeersFromDatabase(espNow):
+    - Lê todos os peers do banco
+    - Adiciona-os ao EspNowManager em memória
+
+
+3.2. MÉTODO ensureBootstrapAssets()
+-----------------------------------
+Garante que a estrutura de diretórios e arquivo inicial existem:
+- Cria /database se não existir
+- Se bootstrap.sql não existe, cria com conteúdo padrão
+- Retorna true se sucesso
+
+
+3.3. MÉTODO applyBootstrapScript()
+----------------------------------
+- Abre bootstrap.sql do SD como leitura
+- Lê todo o conteúdo como String
+- Executa com executeNoResult(script)
+- Cria todas as tabelas via CREATE TABLE IF NOT EXISTS
+
+
+4. OPERAÇÕES DE LEITURA E ESCRITA
+================================================================================
+
+4.1. INSERÇÃO/ATUALIZAÇÃO: upsertPeer()
+---------------------------------------
+bool DatabaseStore::upsertPeer(const uint8_t mac[6], const char* name, const char* description)
+
+Lógica "upsert" (update ou insert):
+1. Se peer com esse MAC já existe: UPDATE
+2. Se não existe: INSERT
+
+Implementação:
+- Constrói SQL com dois comandos separados:
+  * UPDATE peers SET name='...', description='...' WHERE mac='...'
+  * INSERT OR IGNORE INTO peers(...) VALUES(...)
+  
+- INSERT OR IGNORE:
+  * Se MAC já existe (constraint único), ignora silenciosamente
+  * Se MAC não existe, insere a nova linha
+  
+- Escapa valores com escapeSqlText() para evitar SQL injection
+- Usa currentEpochSeconds() para timestamp
+
+
+4.2. LOGGING DE COMANDOS: logCommandWithOutput()
+-------------------------------------------------
+bool DatabaseStore::logCommandWithOutput(const char* command, 
+                                         const char* output, 
+                                         const char* source)
+
+Armazena dois registros relacionados:
+1. INSERT INTO command_log(command, source, created_at) values(...)
+2. INSERT INTO command_log_output(log_id, output, created_at) VALUES(last_insert_rowid(), ...)
+
+Benefício: usando last_insert_rowid(), vincula automaticamente output ao comando
+
+
+4.3. LOGGING ESP-NOW: logIncomingEspNow() e logOutgoingEspNow()
+---------------------------------------------------------------
+
+a) Entrada: logIncomingEspNow(mac, message)
+   - Usa ensurePeerExistsWithDefaults() para garantir peer existe
+   - Se peer não existe, cria automaticamente com nome "peer-XXYY"
+   - INSERT INTO espnow_incoming_log(peer_id, payload, payload_type, received_at)
+   - Rastreia mensagens recebidas
+
+b) Saída: logOutgoingEspNow(mac, message, delivered)
+   - peerIdByMac() busca ID do peer
+   - InsertOU cria novo peer se não encontrado
+   - INSERT INTO espnow_outgoing_log(..., delivered=1/0, ...)
+   - Registra sucesso/falha da entrega
+
+
+4.4. FUNÇÕES DE CONSULTA HELPERS
+--------------------------------
+
+a) querySingleInt(sql, outValue)
+   - Executa SQL que retorna UM inteiro
+   - Usa callback queryIntCallback
+   - Retorna value extraído do primeiro campo
+
+b) queryToText(sql, maxRows, outText)
+   - Executa SQL e retorna resultado como String formatada
+   - Formata: "[1] coluna1=valor1 | coluna2=valor2"
+   - Limita a maxRows linhas
+   - Define truncated=true se resultado exceder limite
+
+
+4.5. BACKUP: backup()
+---------------------
+bool DatabaseStore::backup(String& outText)
+
+Cria snapshot do banco com segurança:
+1. Cria /database/backups se não existe
+2. Gera timestamp: "dongle_YYYYMMDD_HHMMSS"
+3. Se arquivo já existe, adiciona sufixo "_001", "_002", etc.
+4. Lock do banco por 5 segundos
+5. Executa PRAGMA wal_checkpoint(FULL) para 
+   sincronizar Write-Ahead Log (WAL)
+6. Abre novo banco de dados para destino do backup
+7. Usa sqlite3_backup_init() e sqlite3_backup_step() para copiar
+8. Fecha banco de backup
+9. Retorna path do backup e tamanho em bytes
+
+
+5. FUNÇÕES DE GERENCIAMENTO E ADMINISTRAÇÃO
+================================================================================
+
+5.1. rebuild()
+--------------
+bool DatabaseStore::rebuild(EspNowManager& espNow)
+
+Reconstrói o banco do zero:
+1. closeDatabase()
+2. Remove arquivo antigo: SD_MMC.remove()
+3. Chama begin() para inicializar novo banco vazio
+4. Retorna false se alguma etapa falhar
+
+
+5.2. getStatus()
+----------------
+bool DatabaseStore::getStatus(String& outText)
+
+Retorna summary do estado do banco:
+  "[database] pronto arquivo=... peers=N comandos=N rx=N tx=N boots=N"
+
+Usa querySingleInt() para contar linhas em cada tabela.
+
+
+5.3. readTable()
+----------------
+bool DatabaseStore::readTable(const String& tableName, size_t limit, String& outText)
+
+Lê dados de uma tabela específica:
+1. Valida Nome: isSafeIdentifier() previne SQL injection
+2. Limita entre 20 (padrão) e 200 linhas
+3. Executa: SELECT * FROM <tableName> LIMIT <limit>
+4. Retorna resultado formatado
+
+
+5.4. readCommandLogsWithOutput()
+--------------------------------
+Lê histórico de comandos com suas saídas:
+- SELECT c.id, c.created_at, c.source, c.command, o.output
+- FROM command_log c
+- LEFT JOIN command_log_output o ON o.log_id = c.id
+- ORDER BY c.id DESC LIMIT limit
+
+Usa prepared statement (sqlite3_prepare_v2) para melhor performance
+Loop com sqlite3_step() processa cada linha
+
+
+5.5. readEspNowHistory()
+------------------------
+Exibe histórico de comunicação ESP-NOW agrupado em TX (saída) e RX (entrada):
+
+TX (Transmitido):
+  SELECT o.id, o.sent_at, p.name, o.mac, o.payload, o.delivered
+  FROM espnow_outgoing_log o LEFT JOIN peers p ON p.id = o.peer_id
+  ORDER BY o.sent_at DESC
+
+RX (Recebido):
+  SELECT i.id, i.received_at, p.name, p.mac, i.payload
+  FROM espnow_incoming_log i LEFT JOIN peers p ON p.id = i.peer_id
+  ORDER BY i.received_at DESC
+
+
+6. TRANSAÇÕES
+================================================================================
+
+Suporta controle manual de transações:
+
+a) beginTransaction()
+   - Executa "BEGIN IMMEDIATE;"
+   - Inicia transação com lock imediato
+
+b) commitTransaction()
+   - Executa "COMMIT;"
+   - Confirma todas operações desde BEGIN
+
+c) rollbackTransaction()
+   - Executa "ROLLBACK;"
+   - Desfaz todas operações desde BEGIN
+
+
+7. FUNÇÕES AUXILIARES E UTILITÁRIOS
+================================================================================
+
+7.1. escapeSqlText()
+--------------------
+String DatabaseStore::escapeSqlText(const String& value)
+
+Previne SQL injection escapando aspas simples:
+- Cada ' é duplicada para ''
+- Exemplo: "It's" → "It''s"
+
+
+7.2. isSafeIdentifier()
+-----------------------
+bool DatabaseStore::isSafeIdentifier(const String& value)
+
+Valida se string é segura como identificador SQL:
+- Verifica apenas caracteres alfanuméricos + underscore
+- Rejeita "sqlite_*" (esquemas internos SQLite)
+- Retorna false se vazio
+
+
+7.3. macToText()
+----------------
+String DatabaseStore::macToText(const uint8_t mac[6])
+
+Converte array de 6 bytes para string formatada:
+  {0xAA, 0xBB, ...} → "AA:BB:CC:DD:EE:FF"
+
+
+7.4. currentEpochSeconds()
+--------------------------
+int64_t DatabaseStore::currentEpochSeconds()
+
+Retorna timestamp UNIX atual:
+- Tenta usar time() do sistema
+- Se falhar, usa millis()/1000 (fallback)
+
+
+7.5. sanitizeAndTruncateField()
+-------------------------------
+String DatabaseStore::sanitizeAndTruncateField(const String& input, size_t maxLen)
+
+Limpa dados para exibição:
+- Substitui \r \n \t por espaço
+- Substitui | por /
+- Trunca a maxLen caracteres com "..."
+- Se vazio, retorna "(vazio)"
+
+
+7.6. epochToDateTimeText()
+--------------------------
+String DatabaseStore::epochToDateTimeText(int64_t epoch)
+
+Converte timestamp UNIX para string legível:
+- Usa localtime_r() para conversão thread-safe
+- Formato: "YYYY-MM-DD HH:MM:SS"
+- Se inválido, retorna "(sem-data)"
+
+
+8. FUNÇÕES CALLBACK (Callbacks para sqlite3_exec)
+================================================================================
+
+8.1. queryTextCallback
+---------------------
+Callback executado para cada linha resultante de query:
+- Formata linha como "[rowNum] col1=val1 | col2=val2"
+- Conta linhas em context->rowCount
+- Se atinge maxRows, define truncated=true
+
+
+8.2. queryIntCallback
+---------------------
+Callback para extrair valor inteiro:
+- Lê primeiro coluna do primeiro resultado
+- Converte para int32_t com strtol()
+- Define context->hasValue = true
+
+
+8.3. Callback lambda em getDefaultBroadcastMac()
+-------------------------------------------------
+Busca MAC padrão para broadcast:
+- Procura por peers com name='Default' ou mac='FF:FF:FF:FF:FF:FF'
+- Parse hexadecimal com sscanf "%02x:%02x..."
+- Retorna apenas 1 resultado
+
+
+8.4. Callback lambda em loadPeersFromDatabase()
+-----------------------------------------------
+Carrega peers do banco para EspNowManager:
+- Conta linhas processadas, carregadas, já presentes
+- Ignora broadcast FF:FF:FF:FF:FF:FF (virtual)
+- Verifica se peer já existe em memória
+- Chama espNow.addDevice() para cada peer novo
+- Registra estatísticas
+
+
+9. FLUXO CRÍTICO: PROTEÇÃO DE ACESSO
+================================================================================
+
+Exemplo: upsertPeer()
+1. Checa ready_, valida mac
+2. Chama lockDb() - BLOQUEIA se outro thread acessa
+3. Constrói SQL seguro com escapeSqlText
+4. Executa executeNoResult()
+5. unlockDb() - LIBERA o lock
+
+Vantagem: Se múltiplas threads acessam DB:
+- Thread A lock → opera → unlock
+- Thread B espera → recebe lock → opera → unlock
+- Evita corrupção de dados
+
+
+10. FLUXO DE KV_STORE (Persistência Genérica)
+================================================================================
+
+O DatabaseStore cria tabela kv_store mas não implementa métodos públicos.
+Esta tabela seria usada para:
+- Configurações simples (WiFi SSID, timeout, etc.)
+- Dados de estado que precisam persistência
+- Forma simples de pares chave-valor
+
+Implementação seria similar a upsertPeer() mas com chaves genéricas.
+
+
+11. TRATAMENTO DE ERROS
+================================================================================
+
+Todos os métodos seguem padrão:
+- Retornam bool (true=sucesso, false=falha)
+- Quando não conseguem lock: retornam false (timeout)
+- SQL errors: executam sqlite3_free(errorMessage) para liberar memória
+- Se Database não está ready_: operação falha
+
+Estratégia: "fail early"
+- Se lockDb() falha, retorna false imediatamente
+- Se ready_ é false, operação não procede
+- Graceful degradation: log para error para debugging
+
+
+12. CONTINUIDADE E IDIEMPOTÊNCIA
+================================================================================
+
+O design garante que múltiplas inicializações são seguras:
+
+a) Bootstrap SQL usa CREATE TABLE IF NOT EXISTS
+   → Segunda execução não causa erro
+
+b) Runtime migrations também idempotentes
+   → CREATE INDEX IF NOT EXISTS
+
+c) ensureDefaultBroadcastPeer() usa INSERT OR IGNORE
+   → Se já existe, silenciosamente ignora
+
+Benefício: Código robusto contra restarts, múltiplas chamadas begin()
+
+
+13. SEGURANÇA E SANITIZAÇÃO
+================================================================================
+
+Defesas contra SQL Injection:
+1. escapeSqlText() escapa aspas
+2. isSafeIdentifier() valida nomes de tabela
+3. Uso de sqlite3_prepare_v2() quando possível
+   (prepared statements são intrinsecamente seguros)
+4. Callbacks customizados controlam como dados são processados
+
+Exemplo seguro:
+  String name = "O'Brien"; → "O''Brien"
+  SQL: INSERT INTO peers(...) VALUES(..., 'O''Brien', ...)
+
+
+14. LIMITAÇÕES E CONSIDERAÇÕES
+================================================================================
+
+a) Limite de 64 peers no loadPeersFromDatabase()
+   SELECT ... LIMIT 64
+   → Design intencional para economizar memória
+
+b) Queries limitadas a 200 linhas por padrão
+   → Evita consumir muita memória em resultado grande
+
+c) Backup sincroniza WAL explicitamente
+   → PRAGMA wal_checkpoint(FULL) garante consistência
+
+d) Mutex recursivo permite locked code chamar outro locked code
+   → Simplifica implementação interna
+
+e) Timestamps usam epoch UNIX (segundos desde 1970)
+   → Compatível com ferramentas UNIX, fácil de comparar
+
+
+15. RESUMO ARQUITETURAL
+================================================================================
+
+DatabaseStore implementa padrão Singleton-like com recursos:
+
+┌─────────────────────────────────────────────────────────────┐
+│ DatabaseStore (Gerenciador Centralizado)                    │
+├─────────────────────────────────────────────────────────────┤
+│                                                               │
+│   Camada de Sincronização (FreeRTOS)                         │
+│   ├─ lockDb(timeout)                                         │
+│   └─ unlockDb()                                              │
+│                                                               │
+│   Camada de Persistência (SQLite)                            │
+│   ├─ peers (dispositivos ESP-NOW)                            │
+│   ├─ command_log + command_log_output (histórico)            │
+│   ├─ espnow_incoming_log (RX)                                │
+│   ├─ espnow_outgoing_log (TX)                                │
+│   ├─ boot_events (diagnóstico)                               │
+│   └─ kv_store (flexível)                                     │
+│                                                               │
+│   Camada de Interface (Operações)                            │
+│   ├─ Peer Management (upsert, remove, sync)                  │
+│   ├─ Command Logging (logCommand, readCommands)              │
+│   ├─ Communication History (logIncoming, readHistory)        │
+│   ├─ Administrative (query, backup, rebuild, status)         │
+│   └─ Transações (begin, commit, rollback)                    │
+│                                                               │
+│   Camada de Utilitários                                       │
+│   ├─ SQL Escaping (sanitização, validação)                   │
+│   ├─ Conversão de Dados (MAC, timestamp, formatação)         │
+│   └─ Callback Processing (parsing de resultados)             │
+│                                                               │
+└─────────────────────────────────────────────────────────────┘
+
+Fluxo Típico de Uso:
+1. begin() durante inicialização
+2. Operações de log durante execução (logCommand, logIncomingEspNow, etc)
+3. Consultas ocasionais via Serial/Shell (readTable, getStatus, etc)
+4. backup() periódico para segurança
+5. end() durante shutdown
+
+
+16. CONCLUSÃO
+================================================================================
+
+DatabaseStore é um sistema robusto de persistência que:
+- Gerencia banco SQLite em cartão SD
+- Fornece acesso thread-safe via mutex FreeRTOS
+- Implementa defesas contra SQL injection
+- Mantém histórico completo de operações
+- Suporta backup atomático
+- É resiliente a falhas e restarts (idempotência)
+- Oferece interface simples para logging e consulta de dados
+
+O código exemplifica boas práticas em embedded systems:
+- Gerenciamento de memória (reserve(), escaping)
+- Segurança contra exploração (SQL injection)
+- Sincronização em ambiente multi-thread (mutex)
+- Tratamento graceful de erros
+- Documentação implícita através de nomes descritivos
+
+================================================================================
+FIM DA ANÁLISE
+================================================================================
