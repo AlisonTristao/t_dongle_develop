@@ -6,8 +6,8 @@
 enum class logType : uint8_t {
     NONE = 0,
     INFO,
-    CMD,
-    TELEMETRY,
-    ERROR,
-    DEBUG
+    CMDO,
+    TELE,
+    ERRO,
+    DEBG
 };

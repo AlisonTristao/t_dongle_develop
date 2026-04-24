@@ -37,14 +37,14 @@ const char* logTypeToText(EspNowManager::logType type) {
     switch (type) {
     case EspNowManager::logType::INFO:
         return "INFO";
-    case EspNowManager::logType::CMD:
-        return "CMD";
-    case EspNowManager::logType::TELEMETRY:
-        return "TELEMETRY";
-    case EspNowManager::logType::ERROR:
-        return "ERROR";
-    case EspNowManager::logType::DEBUG:
-        return "DEBUG";
+    case EspNowManager::logType::CMDO:
+        return "CMDO";
+    case EspNowManager::logType::TELE:
+        return "TELE";
+    case EspNowManager::logType::ERRO:
+        return "ERRO";
+    case EspNowManager::logType::DEBG:
+        return "DEBG";
     case EspNowManager::logType::NONE:
     default:
         return "NONE";
@@ -53,11 +53,11 @@ const char* logTypeToText(EspNowManager::logType type) {
 
 uint16_t logTypeToLcdColor(EspNowManager::logType type) {
     switch (type) {
-    case EspNowManager::logType::ERROR:
+    case EspNowManager::logType::ERRO:
         return ST77XX_RED;
-    case EspNowManager::logType::TELEMETRY:
+    case EspNowManager::logType::TELE:
         return ST77XX_GREEN;
-    case EspNowManager::logType::DEBUG:
+    case EspNowManager::logType::DEBG:
         return ST77XX_YELLOW;
     case EspNowManager::logType::INFO:
     case EspNowManager::logType::NONE:
