@@ -504,9 +504,10 @@ void ShellSerial::onCtrlR() {
 		reverseSearchActive_ = true;
 	}
 
-	int nextMatch = findPreviousHistoryMatch(reverseSearchPrefix_, reverseSearchLogicalIndex_);
+	const String excludedText = inputBuffer_;
+	int nextMatch = findPreviousHistoryMatch(reverseSearchPrefix_, reverseSearchLogicalIndex_, excludedText);
 	if (nextMatch < 0) {
-		nextMatch = findPreviousHistoryMatch(reverseSearchPrefix_, static_cast<int>(count_));
+		nextMatch = findPreviousHistoryMatch(reverseSearchPrefix_, static_cast<int>(count_), excludedText);
 	}
 
 	if (nextMatch < 0) {
@@ -533,7 +534,7 @@ void ShellSerial::resetReverseSearch() {
 	reverseSearchActive_ = false;
 }
 
-int ShellSerial::findPreviousHistoryMatch(const String& prefix, int startExclusive) const {
+int ShellSerial::findPreviousHistoryMatch(const String& prefix, int startExclusive, const String& excludedText) const {
 	if (count_ == 0) {
 		return -1;
 	}
@@ -549,7 +550,7 @@ int ShellSerial::findPreviousHistoryMatch(const String& prefix, int startExclusi
 
 	for (int i = start - 1; i >= 0; --i) {
 		const String candidate = getLogByOffset(static_cast<size_t>(i));
-		if (prefix.length() == 0 || candidate.startsWith(prefix)) {
+		if ((prefix.length() == 0 || candidate.startsWith(prefix)) && candidate != excludedText) {
 			return i;
 		}
 	}

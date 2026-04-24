@@ -216,9 +216,9 @@ private:
 	void resetReverseSearch();
 
 	/**
-	 * @brief Finds the previous history entry starting with prefix.
+	 * @brief Finds the previous history entry starting with prefix and not exactly excludedText.
 	 */
-	int findPreviousHistoryMatch(const String& prefix, int startExclusive) const;
+	int findPreviousHistoryMatch(const String& prefix, int startExclusive, const String& excludedText) const;
 
 	/**
 	 * @brief Inserts a message into the circular history buffer.
