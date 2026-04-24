@@ -1221,53 +1221,53 @@ uint8_t registerDefaultModules() {
         return failWithCode(AppError::Code::SHELL_NOT_READY, "shell nao configurada para registrar modulos");
     }
 
-    g_ctx.shell->create_module("help", "ajuda e informacoes");
-    g_ctx.shell->create_module("dongle", "comandos executados localmente nesta ESP");
-    g_ctx.shell->create_module("espnow", "gerenciamento de peers e envio de mensagens esp-now");
-    g_ctx.shell->create_module("database", "sqlite no SD: status, leitura e manutencao");
+    g_ctx.shell->create_module("help", "help and information");
+    g_ctx.shell->create_module("dongle", "commands executed locally on this ESP");
+    g_ctx.shell->create_module("espnow", "ESP-NOW peers management and message sending");
+    g_ctx.shell->create_module("database", "SQLite on SD: status, reading and maintenance");
 
-    g_ctx.shell->add(wrapper_help_h, "h", "lista os modulos", "help");
-    g_ctx.shell->add(wrapper_help_l, "l", "lista as funcoes de um modulo", "help");
-    g_ctx.shell->add(wrapper_help_e, "e", "explica o uso dos comandos", "help");
+    g_ctx.shell->add(wrapper_help_h, "h", "list modules", "help");
+    g_ctx.shell->add(wrapper_help_l, "l", "list functions in a module", "help");
+    g_ctx.shell->add(wrapper_help_e, "e", "explain command usage", "help");
 
-    g_ctx.shell->add(wrapper_dongle_ping, "ping", "teste rapido local", "dongle");
-    g_ctx.shell->add(wrapper_dongle_clock, "clock", "mostra horario atual do RTC", "dongle");
-    g_ctx.shell->add(wrapper_dongle_set_clock, "set_clock", "ajusta RTC: <\"YYYY-MM-DD HH:MM:SS\">", "dongle");
-    g_ctx.shell->add(wrapper_dongle_run, "run", "executa comando local (placeholder)", "dongle");
-    g_ctx.shell->add(wrapper_dongle_led, "led", "define LED RGB: <r>, <g>, <b>", "dongle");
-    g_ctx.shell->add(wrapper_dongle_led_off, "led_off", "desliga o LED", "dongle");
-    g_ctx.shell->add(wrapper_dongle_lcd, "lcd", "escreve texto no terminal LCD: <texto>", "dongle");
-    g_ctx.shell->add(wrapper_dongle_lcd_clear, "lcd_clear", "limpa o terminal LCD", "dongle");
-    g_ctx.shell->add(wrapper_dongle_lcd_rot, "lcd_rot", "rotacao LCD: <0|1|2|3>", "dongle");
-    g_ctx.shell->add(wrapper_dongle_lcd_rot_get, "lcd_rot_get", "mostra rotacao atual do LCD", "dongle");
-    g_ctx.shell->add(wrapper_dongle_lcd_bl, "lcd_bl", "backlight LCD: <0=ON|1=OFF>", "dongle");
-    g_ctx.shell->add(wrapper_dongle_lcd_bl_inv, "lcd_bl_inv", "polaridade backlight: <1=HIGH_ON|0=LOW_ON>", "dongle");
-    g_ctx.shell->add(wrapper_dongle_lcd_reinit, "lcd_reinit", "reinicializa o LCD", "dongle");
-    g_ctx.shell->add(wrapper_dongle_sd_init, "sd_init", "inicia o SD", "dongle");
-    g_ctx.shell->add(wrapper_dongle_sd_status, "sd_status", "mostra status do SD", "dongle");
-    g_ctx.shell->add(wrapper_dongle_sd_wipe, "sd_wipe", "apaga todo o conteudo do SD", "dongle");
+    g_ctx.shell->add(wrapper_dongle_ping, "ping", "quick local test", "dongle");
+    g_ctx.shell->add(wrapper_dongle_clock, "clock", "show current RTC time", "dongle");
+    g_ctx.shell->add(wrapper_dongle_set_clock, "set_clock", "set RTC: <\"YYYY-MM-DD HH:MM:SS\">", "dongle");
+    g_ctx.shell->add(wrapper_dongle_run, "run", "execute local command (placeholder)", "dongle");
+    g_ctx.shell->add(wrapper_dongle_led, "led", "set RGB LED: <r>, <g>, <b>", "dongle");
+    g_ctx.shell->add(wrapper_dongle_led_off, "led_off", "turn off LED", "dongle");
+    g_ctx.shell->add(wrapper_dongle_lcd, "lcd", "write text to LCD terminal: <text>", "dongle");
+    g_ctx.shell->add(wrapper_dongle_lcd_clear, "lcd_clear", "clear LCD terminal", "dongle");
+    g_ctx.shell->add(wrapper_dongle_lcd_rot, "lcd_rot", "LCD rotation: <0|1|2|3>", "dongle");
+    g_ctx.shell->add(wrapper_dongle_lcd_rot_get, "lcd_rot_get", "show current LCD rotation", "dongle");
+    g_ctx.shell->add(wrapper_dongle_lcd_bl, "lcd_bl", "LCD backlight: <0=ON|1=OFF>", "dongle");
+    g_ctx.shell->add(wrapper_dongle_lcd_bl_inv, "lcd_bl_inv", "backlight polarity: <1=HIGH_ON|0=LOW_ON>", "dongle");
+    g_ctx.shell->add(wrapper_dongle_lcd_reinit, "lcd_reinit", "reinitialize LCD", "dongle");
+    g_ctx.shell->add(wrapper_dongle_sd_init, "sd_init", "initialize SD", "dongle");
+    g_ctx.shell->add(wrapper_dongle_sd_status, "sd_status", "show SD status", "dongle");
+    g_ctx.shell->add(wrapper_dongle_sd_wipe, "sd_wipe", "wipe all SD content", "dongle");
 
-    g_ctx.shell->add(wrapper_espnow_list, "list", "lista dispositivos cadastrados", "espnow");
-    g_ctx.shell->add(wrapper_espnow_add, "add", "adiciona peer: <mac>, <nome>, <descricao>", "espnow");
-    g_ctx.shell->add(wrapper_espnow_remove, "remove", "remove peer por indice: <numero>", "espnow");
-    g_ctx.shell->add(wrapper_espnow_remove_mac, "remove_mac", "remove peer por mac: <mac>", "espnow");
-    g_ctx.shell->add(wrapper_espnow_update, "update", "atualiza peer: <numero>, <nome>, <descricao>", "espnow");
-    g_ctx.shell->add(wrapper_espnow_send_to, "send_to", "envia para indice: <numero|000>, <comando> (000=todos)", "espnow");
-    g_ctx.shell->add(wrapper_espnow_send_all, "send_all", "envia para todos: <comando>", "espnow");
-    g_ctx.shell->add(wrapper_espnow_flush_status, "flush_status", "mostra status do buffer RX->DB", "espnow");
-    g_ctx.shell->add(wrapper_espnow_flush_db, "flush_db", "persiste buffer RX->DB: <limite opcional>", "espnow");
+    g_ctx.shell->add(wrapper_espnow_list, "list", "list registered devices", "espnow");
+    g_ctx.shell->add(wrapper_espnow_add, "add", "add peer: <mac>, <name>, <description>", "espnow");
+    g_ctx.shell->add(wrapper_espnow_remove, "remove", "remove peer by index: <number>", "espnow");
+    g_ctx.shell->add(wrapper_espnow_remove_mac, "remove_mac", "remove peer by MAC: <mac>", "espnow");
+    g_ctx.shell->add(wrapper_espnow_update, "update", "update peer: <number>, <name>, <description>", "espnow");
+    g_ctx.shell->add(wrapper_espnow_send_to, "send_to", "send to index: <number|000>, <command> (000=all)", "espnow");
+    g_ctx.shell->add(wrapper_espnow_send_all, "send_all", "send to all: <command>", "espnow");
+    g_ctx.shell->add(wrapper_espnow_flush_status, "flush_status", "show RX->DB buffer status", "espnow");
+    g_ctx.shell->add(wrapper_espnow_flush_db, "flush_db", "persist RX->DB buffer: <optional limit>", "espnow");
 
-    g_ctx.shell->add(wrapper_database_init, "init", "abre o banco e aplica bootstrap.sql", "database");
-    g_ctx.shell->add(wrapper_database_status, "status", "status geral do sqlite", "database");
-    g_ctx.shell->add(wrapper_database_tables, "tables", "lista tabelas no banco", "database");
-    g_ctx.shell->add(wrapper_database_read, "read", "le tabela: <nome>, <limite>", "database");
-    g_ctx.shell->add(wrapper_database_logs, "logs", "historico de comandos com saidas: <limite>", "database");
-    g_ctx.shell->add(wrapper_database_espnow_history, "espnow_history", "historico ESP-NOW RX/TX com status: <limite>", "database");
-    g_ctx.shell->add(wrapper_database_drop, "drop", "remove tabela: <nome>", "database");
-    g_ctx.shell->add(wrapper_database_rebuild, "rebuild", "recria banco a partir do bootstrap", "database");
-    g_ctx.shell->add(wrapper_database_backup, "backup", "salva snapshot do banco em /database/backups", "database");
-    g_ctx.shell->add(wrapper_database_exec, "exec", "executa SQL livre: <sql>", "database");
-    g_ctx.shell->add(wrapper_database_exec_nolog, "exec_nolog", "executa SQL sem salvar no command_log: <sql>", "database");
+    g_ctx.shell->add(wrapper_database_init, "init", "open database and apply bootstrap.sql", "database");
+    g_ctx.shell->add(wrapper_database_status, "status", "overall SQLite status", "database");
+    g_ctx.shell->add(wrapper_database_tables, "tables", "list tables in database", "database");
+    g_ctx.shell->add(wrapper_database_read, "read", "read table: <name>, <limit>", "database");
+    g_ctx.shell->add(wrapper_database_logs, "logs", "command history with outputs: <limit>", "database");
+    g_ctx.shell->add(wrapper_database_espnow_history, "espnow_history", "ESP-NOW RX/TX history with status: <limit>", "database");
+    g_ctx.shell->add(wrapper_database_drop, "drop", "remove table: <name>", "database");
+    g_ctx.shell->add(wrapper_database_rebuild, "rebuild", "recreate database from bootstrap", "database");
+    g_ctx.shell->add(wrapper_database_backup, "backup", "save database snapshot to /database/backups", "database");
+    g_ctx.shell->add(wrapper_database_exec, "exec", "execute raw SQL: <sql>", "database");
+    g_ctx.shell->add(wrapper_database_exec_nolog, "exec_nolog", "execute SQL without saving to command_log: <sql>", "database");
 
     return RESULT_OK;
 }
@@ -1312,7 +1312,7 @@ std::string runLine(const std::string& command) {
         }
         skipCommandPersistence = true;
     } else {
-        output = g_ctx.shell->run_line_command(normalized);
+        output = g_ctx.shell->run_command_line(normalized);
     }
 
     if (!skipCommandPersistence && g_ctx.database != nullptr && g_ctx.database->isReady()) {
