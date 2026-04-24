@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <functional>
 
 /**
  * @brief ShellSerial provides line-based serial input with editable history.
@@ -11,9 +12,13 @@
  * - left/right cursor movement with in-line editing
  * - in-memory circular log/history
  * - arrow up/down history recall using ESC sequences
+ * - Ctrl+R prefix search through history
+ * - Tab completion through an external completion provider
  */
 class ShellSerial final {
 public:
+    using CompletionProvider = std::function<size_t(const String& input, String* outSuggestions, size_t maxSuggestions)>;
+
 	/**
 	 * @brief Default number of lines stored in command history.
 	 */
@@ -95,6 +100,12 @@ public:
 	 */
 	void refreshLine();
 
+	/**
+	 * @brief Sets callback used by Tab to obtain completion candidates.
+	 * @param provider Callback that fills outSuggestions with full-line candidates.
+	 */
+	void setCompletionProvider(CompletionProvider provider);
+
 private:
 	/**
 	 * @brief Internal hard limit for static log storage array.
@@ -102,6 +113,7 @@ private:
 	static constexpr size_t MAX_LOG_STORAGE = 128;
 	static constexpr size_t MAX_INPUT_LENGTH = 512;
 	static constexpr size_t MAX_RENDER_COLUMNS = 72;
+	static constexpr size_t MAX_TAB_SUGGESTIONS = 24;
 
 	/**
 	 * @brief Parser state for ANSI escape sequence handling.
@@ -126,6 +138,17 @@ private:
 	size_t count_;
 	size_t firstIndex_;
 	int historyCursor_;
+
+	CompletionProvider completionProvider_;
+	String tabSeedInput_;
+	String tabSuggestions_[MAX_TAB_SUGGESTIONS];
+	size_t tabSuggestionCount_;
+	size_t tabSuggestionIndex_;
+	bool tabCycleActive_;
+
+	String reverseSearchPrefix_;
+	int reverseSearchLogicalIndex_;
+	bool reverseSearchActive_;
 
 	/**
 	 * @brief Processes one received byte and updates parsing state.
@@ -171,6 +194,31 @@ private:
 	 * @brief Moves cursor one position to the right.
 	 */
 	void onArrowRight();
+
+	/**
+	 * @brief Handles Tab completion and cycles through candidates.
+	 */
+	void onTab();
+
+	/**
+	 * @brief Handles Ctrl+R search by prefix through command history.
+	 */
+	void onCtrlR();
+
+	/**
+	 * @brief Resets current Tab completion cycle state.
+	 */
+	void resetTabCycle();
+
+	/**
+	 * @brief Resets current Ctrl+R reverse-search state.
+	 */
+	void resetReverseSearch();
+
+	/**
+	 * @brief Finds the previous history entry starting with prefix.
+	 */
+	int findPreviousHistoryMatch(const String& prefix, int startExclusive) const;
 
 	/**
 	 * @brief Inserts a message into the circular history buffer.

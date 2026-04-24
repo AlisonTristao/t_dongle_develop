@@ -4,13 +4,19 @@
 ShellSerial::ShellSerial(size_t logCapacity)
 	: serial_(nullptr),
 	  renderedLength_(0),
-	cursorIndex_(0),
+	  cursorIndex_(0),
 	  escState_(EscState::None),
 	  ignoreNextLf_(false),
 	  capacity_(logCapacity),
 	  count_(0),
 	  firstIndex_(0),
-	  historyCursor_(-1) {
+	  historyCursor_(-1),
+	  completionProvider_(),
+	  tabSuggestionCount_(0),
+	  tabSuggestionIndex_(0),
+	  tabCycleActive_(false),
+	  reverseSearchLogicalIndex_(-1),
+	  reverseSearchActive_(false) {
 	if (capacity_ == 0) {
 		capacity_ = 1;
 	}
@@ -30,6 +36,8 @@ void ShellSerial::begin(Stream& serialPort) {
 	escState_ = EscState::None;
 	ignoreNextLf_ = false;
 	historyCursor_ = -1;
+	resetTabCycle();
+	resetReverseSearch();
 }
 
 // Consume all available bytes until a full line is ready.
@@ -58,6 +66,9 @@ void ShellSerial::eraseLastChar() {
 		return;
 	}
 
+	resetTabCycle();
+	resetReverseSearch();
+
 	const bool removeAtTail = (cursorIndex_ == inputBuffer_.length());
 	if (removeAtTail && serial_ != nullptr && fitsSingleRenderLine()) {
 		inputBuffer_.remove(cursorIndex_ - 1, 1);
@@ -83,6 +94,8 @@ void ShellSerial::clearInput() {
 	draftBeforeHistory_ = "";
 	cursorIndex_ = 0;
 	historyCursor_ = -1;
+	resetTabCycle();
+	resetReverseSearch();
 	redrawInput();
 }
 
@@ -96,6 +109,7 @@ void ShellSerial::clearLogs() {
 	count_ = 0;
 	firstIndex_ = 0;
 	historyCursor_ = -1;
+	resetReverseSearch();
 }
 
 // Return current number of stored entries.
@@ -122,6 +136,11 @@ void ShellSerial::setPrompt(const String& text) {
 
 void ShellSerial::refreshLine() {
 	redrawInput();
+}
+
+void ShellSerial::setCompletionProvider(CompletionProvider provider) {
+	completionProvider_ = provider;
+	resetTabCycle();
 }
 
 bool ShellSerial::hasUnclosedDoubleQuote() const {
@@ -210,10 +229,10 @@ void ShellSerial::processChar(char c, bool& lineReady, String& outLine) {
 				onArrowUp();
 			} else if (c == 'B') {
 				onArrowDown();
-			    } else if (c == 'C') {
-				    onArrowRight();
-			    } else if (c == 'D') {
-				    onArrowLeft();
+			} else if (c == 'C') {
+				onArrowRight();
+			} else if (c == 'D') {
+				onArrowLeft();
 			}
 			escState_ = EscState::None;
 			return;
@@ -222,7 +241,19 @@ void ShellSerial::processChar(char c, bool& lineReady, String& outLine) {
 
 	// Escape sequence introducer.
 	if (c == 27) {
+		resetTabCycle();
+		resetReverseSearch();
 		escState_ = EscState::Esc;
+		return;
+	}
+
+	if (c == '\t') {
+		onTab();
+		return;
+	}
+
+	if (c == 18) { // Ctrl+R
+		onCtrlR();
 		return;
 	}
 
@@ -234,6 +265,8 @@ void ShellSerial::processChar(char c, bool& lineReady, String& outLine) {
 		}
 
 		if (hasUnclosedDoubleQuote()) {
+			resetTabCycle();
+			resetReverseSearch();
 			ignoreNextLf_ = (c == '\r');
 
 			if (inputBuffer_.length() < MAX_INPUT_LENGTH && !inputBuffer_.endsWith(" ")) {
@@ -258,7 +291,9 @@ void ShellSerial::processChar(char c, bool& lineReady, String& outLine) {
 		draftBeforeHistory_ = "";
 		historyCursor_ = -1;
 		renderedLength_ = 0;
-		    cursorIndex_ = 0;
+		cursorIndex_ = 0;
+		resetTabCycle();
+		resetReverseSearch();
 
 		if (line.length() > 0) {
 			pushLog(line);
@@ -281,6 +316,9 @@ void ShellSerial::processChar(char c, bool& lineReady, String& outLine) {
 		if (inputBuffer_.length() >= MAX_INPUT_LENGTH) {
 			return;
 		}
+
+		resetTabCycle();
+		resetReverseSearch();
 
 		if (historyCursor_ >= 0) {
 			historyCursor_ = -1;
@@ -343,6 +381,9 @@ void ShellSerial::redrawInput() {
 
 // Move to older command in history.
 void ShellSerial::onArrowUp() {
+	resetTabCycle();
+	resetReverseSearch();
+
 	if (count_ == 0) {
 		return;
 	}
@@ -361,6 +402,9 @@ void ShellSerial::onArrowUp() {
 
 // Move to newer command in history or restore unsent draft.
 void ShellSerial::onArrowDown() {
+	resetTabCycle();
+	resetReverseSearch();
+
 	if (count_ == 0 || historyCursor_ < 0) {
 		return;
 	}
@@ -379,6 +423,9 @@ void ShellSerial::onArrowDown() {
 
 // Move cursor one position to the left.
 void ShellSerial::onArrowLeft() {
+	resetTabCycle();
+	resetReverseSearch();
+
 	if (cursorIndex_ == 0) {
 		return;
 	}
@@ -395,6 +442,9 @@ void ShellSerial::onArrowLeft() {
 
 // Move cursor one position to the right.
 void ShellSerial::onArrowRight() {
+	resetTabCycle();
+	resetReverseSearch();
+
 	if (cursorIndex_ >= inputBuffer_.length()) {
 		return;
 	}
@@ -407,6 +457,104 @@ void ShellSerial::onArrowRight() {
 		++cursorIndex_;
 		redrawInput();
 	}
+}
+
+void ShellSerial::onTab() {
+	resetReverseSearch();
+
+	if (!completionProvider_) {
+		return;
+	}
+
+	if (!tabCycleActive_) {
+		tabSeedInput_ = inputBuffer_;
+		tabSuggestionCount_ = completionProvider_(tabSeedInput_, tabSuggestions_, MAX_TAB_SUGGESTIONS);
+		tabSuggestionIndex_ = 0;
+
+		if (tabSuggestionCount_ == 0) {
+			return;
+		}
+
+		tabCycleActive_ = true;
+	} else if (tabSuggestionCount_ > 1) {
+		tabSuggestionIndex_ = (tabSuggestionIndex_ + 1) % tabSuggestionCount_;
+	}
+
+	const String nextInput = tabSuggestions_[tabSuggestionIndex_];
+	if (nextInput.length() > MAX_INPUT_LENGTH) {
+		return;
+	}
+
+	inputBuffer_ = nextInput;
+	cursorIndex_ = inputBuffer_.length();
+	historyCursor_ = -1;
+	redrawInput();
+}
+
+void ShellSerial::onCtrlR() {
+	resetTabCycle();
+
+	if (count_ == 0) {
+		return;
+	}
+
+	if (!reverseSearchActive_) {
+		reverseSearchPrefix_ = inputBuffer_;
+		reverseSearchLogicalIndex_ = static_cast<int>(count_);
+		reverseSearchActive_ = true;
+	}
+
+	int nextMatch = findPreviousHistoryMatch(reverseSearchPrefix_, reverseSearchLogicalIndex_);
+	if (nextMatch < 0) {
+		nextMatch = findPreviousHistoryMatch(reverseSearchPrefix_, static_cast<int>(count_));
+	}
+
+	if (nextMatch < 0) {
+		return;
+	}
+
+	reverseSearchLogicalIndex_ = nextMatch;
+	historyCursor_ = nextMatch;
+	inputBuffer_ = getLogByOffset(static_cast<size_t>(nextMatch));
+	cursorIndex_ = inputBuffer_.length();
+	redrawInput();
+}
+
+void ShellSerial::resetTabCycle() {
+	tabSeedInput_ = "";
+	tabSuggestionCount_ = 0;
+	tabSuggestionIndex_ = 0;
+	tabCycleActive_ = false;
+}
+
+void ShellSerial::resetReverseSearch() {
+	reverseSearchPrefix_ = "";
+	reverseSearchLogicalIndex_ = -1;
+	reverseSearchActive_ = false;
+}
+
+int ShellSerial::findPreviousHistoryMatch(const String& prefix, int startExclusive) const {
+	if (count_ == 0) {
+		return -1;
+	}
+
+	int start = startExclusive;
+	if (start > static_cast<int>(count_)) {
+		start = static_cast<int>(count_);
+	}
+
+	if (start < 0) {
+		start = 0;
+	}
+
+	for (int i = start - 1; i >= 0; --i) {
+		const String candidate = getLogByOffset(static_cast<size_t>(i));
+		if (prefix.length() == 0 || candidate.startsWith(prefix)) {
+			return i;
+		}
+	}
+
+	return -1;
 }
 
 // Store normalized text in circular buffer and overwrite oldest on overflow.

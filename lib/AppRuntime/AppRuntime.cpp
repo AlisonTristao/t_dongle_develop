@@ -4,6 +4,7 @@
 #include <Esp.h>
 
 #include <cstdio>
+#include <vector>
 
 #include "config.h"
 #include "StartupConfig.h"
@@ -317,6 +318,24 @@ void AppRuntime::begin() {
         ShellOutput::printTagged(Serial, "shell", "module registration failed");
         return;
     }
+
+    serialShell_.setCompletionProvider([this](const String& input, String* outSuggestions, size_t maxSuggestions) -> size_t {
+        if (outSuggestions == nullptr || maxSuggestions == 0) {
+            return 0;
+        }
+
+        const std::vector<std::string> matches = tinyShell_.complete_line(std::string(input.c_str()), maxSuggestions);
+        size_t written = 0;
+        for (const std::string& candidate : matches) {
+            if (written >= maxSuggestions) {
+                break;
+            }
+
+            outSuggestions[written++] = String(candidate.c_str());
+        }
+
+        return written;
+    });
 
     restoreShellHistoryFromDatabase();
 
