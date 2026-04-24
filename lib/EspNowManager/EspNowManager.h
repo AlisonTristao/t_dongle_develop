@@ -36,6 +36,7 @@ public:
         uint32_t timer;
         char msg[MESSAGE_TEXT_SIZE];
         logType type;
+        uint8_t packetInfo;
     };
 
     /**

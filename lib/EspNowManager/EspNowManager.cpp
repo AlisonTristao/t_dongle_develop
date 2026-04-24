@@ -325,9 +325,23 @@ void EspNowManager::handleReceiveStatic(const uint8_t* mac, const uint8_t* incom
 
     message incoming = {};
 
+    struct LegacyMessage {
+        uint32_t timer;
+        char msg[MESSAGE_TEXT_SIZE];
+        logType type;
+    };
+
     if (len == static_cast<int>(sizeof(message))) {
         memcpy(&incoming, incomingData, sizeof(message));
         incoming.msg[sizeof(incoming.msg) - 1] = '\0';
+    } else if (len == static_cast<int>(sizeof(LegacyMessage))) {
+        LegacyMessage legacy = {};
+        memcpy(&legacy, incomingData, sizeof(legacy));
+        incoming.timer = legacy.timer;
+        memcpy(incoming.msg, legacy.msg, sizeof(legacy.msg));
+        incoming.msg[sizeof(incoming.msg) - 1] = '\0';
+        incoming.type = legacy.type;
+        incoming.packetInfo = makePacketInfo(0, true);
     } else {
         // Compatibility path for raw text payloads.
         const size_t copySize = (static_cast<size_t>(len) < (sizeof(incoming.msg) - 1))
@@ -337,6 +351,7 @@ void EspNowManager::handleReceiveStatic(const uint8_t* mac, const uint8_t* incom
         incoming.msg[copySize] = '\0';
         incoming.timer = millis();
         incoming.type = logType::NONE;
+        incoming.packetInfo = makePacketInfo(0, true);
     }
 
     activeInstance_->receiveCallback_(mac, incoming);

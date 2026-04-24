@@ -850,6 +850,7 @@ uint8_t wrapper_espnow_send_to(int32_t deviceNumber, string command) {
     EspNowManager::message outgoing = {};
     outgoing.timer = millis();
     outgoing.type = EspNowManager::logType::INFO;
+    outgoing.packetInfo = makePacketInfo(0, true);
 
     const string msg = stripOuterQuotes(command);
     std::strncpy(outgoing.msg, msg.c_str(), sizeof(outgoing.msg) - 1);
@@ -904,6 +905,7 @@ uint8_t wrapper_espnow_send_all(string command) {
     EspNowManager::message outgoing = {};
     outgoing.timer = millis();
     outgoing.type = EspNowManager::logType::INFO;
+    outgoing.packetInfo = makePacketInfo(0, true);
 
     const string msg = stripOuterQuotes(command);
     std::strncpy(outgoing.msg, msg.c_str(), sizeof(outgoing.msg) - 1);

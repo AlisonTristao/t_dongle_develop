@@ -29,9 +29,19 @@ bool g_asyncDbLogEnabled = false;
 struct RxDisplayLine {
     char header[96];
     char payload[EspNowManager::MESSAGE_TEXT_SIZE + 1];
+    char closeSuffix[24];
     size_t payloadLen;
     uint16_t color;
+    bool appendToPrevious;
+    bool keepLineOpen;
 };
+
+bool g_rxLineOpen = false;
+size_t g_rxContinuationPadding = 1;
+bool g_rxAssemblyActive = false;
+bool g_rxAssemblyHasMac = false;
+uint8_t g_rxAssemblyMac[6] = {0};
+uint8_t g_rxExpectedPacketIndex = 0;
 
 const char* logTypeToText(EspNowManager::logType type) {
     switch (type) {
@@ -45,7 +55,10 @@ const char* logTypeToText(EspNowManager::logType type) {
         return "ERRO";
     case EspNowManager::logType::DEBG:
         return "DEBG";
+    case EspNowManager::logType::PAKG:
+        return "PAKG";
     case EspNowManager::logType::NONE:
+
     default:
         return "NONE";
     }
@@ -103,37 +116,70 @@ size_t copyIncomingPayload(const EspNowManager::message& incomingData, char* out
     return copyLen;
 }
 
-size_t normalizePayloadSingleLine(char* payload, size_t payloadLen) {
-    if (payload == nullptr) {
-        return 0;
+void writeRawToStream(Stream* io, const char* data, size_t len);
+
+void resetRxAssemblyState() {
+    g_rxAssemblyActive = false;
+    g_rxAssemblyHasMac = false;
+    g_rxExpectedPacketIndex = 0;
+}
+
+bool sameMacAddress(const uint8_t* lhs, const uint8_t* rhs) {
+    return lhs != nullptr && rhs != nullptr && std::memcmp(lhs, rhs, 6) == 0;
+}
+
+void closeOpenRxLine(Stream* io) {
+    if (io == nullptr || !g_rxLineOpen) {
+        return;
     }
 
-    size_t writeIndex = 0;
-    bool previousWasSpace = false;
-    for (size_t readIndex = 0; readIndex < payloadLen && payload[readIndex] != '\0'; ++readIndex) {
-        char current = payload[readIndex];
-        if (current == '\r' || current == '\n' || current == '\t') {
-            current = ' ';
+    io->write('\r');
+    io->write('\n');
+    g_rxLineOpen = false;
+}
+
+void writePaddingSpaces(Stream* io, size_t count) {
+    if (io == nullptr || count == 0) {
+        return;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        io->write(' ');
+    }
+}
+
+void writePayloadWithContinuation(Stream* io, const char* payload, size_t payloadLen, size_t continuationPadding) {
+    if (io == nullptr || payload == nullptr || payloadLen == 0) {
+        return;
+    }
+
+    size_t start = 0;
+    for (size_t i = 0; i < payloadLen; ++i) {
+        const char ch = payload[i];
+        if (ch != '\r' && ch != '\n') {
+            continue;
         }
 
-        if (current == ' ') {
-            if (writeIndex == 0 || previousWasSpace) {
-                continue;
-            }
-            previousWasSpace = true;
-        } else {
-            previousWasSpace = false;
+        if (i > start) {
+            writeRawToStream(io, payload + start, i - start);
         }
 
-        payload[writeIndex++] = current;
+        if (ch == '\r' && (i + 1) < payloadLen && payload[i + 1] == '\n') {
+            ++i;
+        }
+
+        io->write('\r');
+        io->write('\n');
+        if ((i + 1) < payloadLen) {
+            writePaddingSpaces(io, continuationPadding);
+        }
+
+        start = i + 1;
     }
 
-    while (writeIndex > 0 && payload[writeIndex - 1] == ' ') {
-        --writeIndex;
+    if (start < payloadLen) {
+        writeRawToStream(io, payload + start, payloadLen - start);
     }
-
-    payload[writeIndex] = '\0';
-    return writeIndex;
 }
 
 void writeRawToStream(Stream* io, const char* data, size_t len) {
@@ -179,23 +225,89 @@ void ensurePayloadTerminator(Stream* io, const char* payload, size_t payloadLen)
     }
 }
 
-void writeRxLineToStream(Stream* io, const char* header, const char* payload, size_t payloadLen) {
+void writeCloseSuffix(Stream* io, const char* closeSuffix) {
+    if (io == nullptr || closeSuffix == nullptr || closeSuffix[0] == '\0') {
+        return;
+    }
+
+    io->write(' ');
+    writeRawToStream(io, closeSuffix, std::strlen(closeSuffix));
+}
+
+void writeRxLineToStream(
+    Stream* io,
+    const char* header,
+    const char* payload,
+    size_t payloadLen,
+    bool keepLineOpen,
+    const char* closeSuffix
+) {
     if (io == nullptr || header == nullptr) {
         return;
     }
 
+    closeOpenRxLine(io);
+
+    const size_t headerLen = std::strlen(header);
+    const size_t continuationPadding = headerLen + 1;
+    g_rxContinuationPadding = continuationPadding;
+
     // Ensure the log starts from the beginning of the terminal line.
     io->write('\r');
-    writeRawToStream(io, header, std::strlen(header));
+    writeRawToStream(io, header, headerLen);
     if (payload != nullptr && payloadLen > 0) {
         io->write(' ');
-        writeRawToStream(io, payload, payloadLen);
+        writePayloadWithContinuation(io, payload, payloadLen, continuationPadding);
     }
+
+    if (keepLineOpen) {
+        g_rxLineOpen = true;
+        return;
+    }
+
+    writeCloseSuffix(io, closeSuffix);
     io->write('\r');
     io->write('\n');
+    g_rxLineOpen = false;
 }
 
-bool enqueueDisplayLine(const char* header, const char* payload, size_t payloadLen, uint16_t color) {
+void writeRxContinuationToStream(
+    Stream* io,
+    const char* payload,
+    size_t payloadLen,
+    bool keepLineOpen,
+    const char* closeSuffix
+) {
+    if (io == nullptr || payload == nullptr || payloadLen == 0) {
+        return;
+    }
+
+    if (!g_rxLineOpen) {
+        io->write('\r');
+    }
+
+    writePayloadWithContinuation(io, payload, payloadLen, g_rxContinuationPadding);
+
+    if (keepLineOpen) {
+        g_rxLineOpen = true;
+        return;
+    }
+
+    writeCloseSuffix(io, closeSuffix);
+    io->write('\r');
+    io->write('\n');
+    g_rxLineOpen = false;
+}
+
+bool enqueueDisplayLine(
+    const char* header,
+    const char* payload,
+    size_t payloadLen,
+    uint16_t color,
+    bool appendToPrevious,
+    bool keepLineOpen,
+    const char* closeSuffix
+) {
     if (header == nullptr || payload == nullptr) {
         return false;
     }
@@ -207,8 +319,11 @@ bool enqueueDisplayLine(const char* header, const char* payload, size_t payloadL
     RxDisplayLine item = {};
     std::snprintf(item.header, sizeof(item.header), "%s", header);
     std::snprintf(item.payload, sizeof(item.payload), "%s", payload);
+    std::snprintf(item.closeSuffix, sizeof(item.closeSuffix), "%s", (closeSuffix != nullptr) ? closeSuffix : "");
     item.payloadLen = payloadLen;
     item.color = color;
+    item.appendToPrevious = appendToPrevious;
+    item.keepLineOpen = keepLineOpen;
 
     if (xQueueSend(g_rxDisplayQueue, &item, 0) == pdTRUE) {
         return true;
@@ -273,38 +388,132 @@ bool createDbLogQueue() {
 }
 
 void processRxMessageInternal(const uint8_t mac[6], const EspNowManager::message& incomingData) {
-    const String arrivedAt = arrivalTimeText();
-    const char* typeText = logTypeToText(incomingData.type);
     char payload[EspNowManager::MESSAGE_TEXT_SIZE + 1] = {0};
     const size_t copiedPayloadLen = copyIncomingPayload(incomingData, payload, sizeof(payload));
-    const size_t payloadLen = normalizePayloadSingleLine(payload, copiedPayloadLen);
+    const size_t payloadLen = copiedPayloadLen;
+
+    const bool isPackageContinuation = (incomingData.type == EspNowManager::logType::PAKG);
+    const uint8_t packetIndex = getPacketIndex(incomingData.packetInfo);
+    const bool packetIsLast = ::isLastPacket(incomingData.packetInfo);
+    const bool keepLineOpen = (!packetIsLast) && (packetIndex < MESSAGE_PACKET_MAX_INDEX);
+
+    if (g_rxAssemblyActive && g_rxAssemblyHasMac && mac != nullptr && !sameMacAddress(g_rxAssemblyMac, mac)) {
+        closeOpenRxLine(g_io);
+        resetRxAssemblyState();
+    }
+
+    bool appendToPrevious = false;
+    if (isPackageContinuation) {
+        appendToPrevious = g_rxAssemblyActive &&
+                           packetIndex == g_rxExpectedPacketIndex &&
+                           (!g_rxAssemblyHasMac || sameMacAddress(g_rxAssemblyMac, mac));
+
+        if (!appendToPrevious) {
+            closeOpenRxLine(g_io);
+        }
+    } else {
+        closeOpenRxLine(g_io);
+    }
+
+    char packetProgress[16] = {0};
+    if (packetIsLast) {
+        std::snprintf(
+            packetProgress,
+            sizeof(packetProgress),
+            "%u/%u",
+            static_cast<unsigned>(packetIndex + 1U),
+            static_cast<unsigned>(packetIndex + 1U)
+        );
+    } else {
+        std::snprintf(
+            packetProgress,
+            sizeof(packetProgress),
+            "%u/?",
+            static_cast<unsigned>(packetIndex + 1U)
+        );
+    }
 
     char header[96] = {0};
-    std::snprintf(
-        header,
-        sizeof(header),
-        "[ESPNOW][RX][%s][%s]",
-        typeText,
-        arrivedAt.c_str()
-    );
+    if (!appendToPrevious) {
+        const String arrivedAt = arrivalTimeText();
+        const char* typeText = logTypeToText(incomingData.type);
+        std::snprintf(
+            header,
+            sizeof(header),
+            "[%s][%s][%s]",
+            typeText,
+            arrivedAt.c_str(),
+            packetProgress
+        );
+    }
+
+    char closeSuffix[24] = {0};
+    if (appendToPrevious && packetIsLast) {
+        std::snprintf(
+            closeSuffix,
+            sizeof(closeSuffix),
+            "[%u/%u]",
+            static_cast<unsigned>(packetIndex + 1U),
+            static_cast<unsigned>(packetIndex + 1U)
+        );
+    }
+
+    if (keepLineOpen) {
+        g_rxAssemblyActive = true;
+        g_rxExpectedPacketIndex = static_cast<uint8_t>(packetIndex + 1U);
+        if (mac != nullptr) {
+            std::memcpy(g_rxAssemblyMac, mac, sizeof(g_rxAssemblyMac));
+            g_rxAssemblyHasMac = true;
+        } else {
+            g_rxAssemblyHasMac = false;
+        }
+    } else {
+        resetRxAssemblyState();
+    }
 
     const uint16_t color = logTypeToLcdColor(incomingData.type);
     const bool displayQueueReady = (g_rxDisplayQueue != nullptr);
-    if (!enqueueDisplayLine(header, payload, payloadLen, color)) {
+    if (!enqueueDisplayLine(header, payload, payloadLen, color, appendToPrevious, keepLineOpen, closeSuffix)) {
         // Fallback only when queue is unavailable.
         if (!displayQueueReady) {
             if (g_io != nullptr) {
-                writeRxLineToStream(g_io, header, payload, payloadLen);
+                if (appendToPrevious) {
+                    writeRxContinuationToStream(g_io, payload, payloadLen, keepLineOpen, closeSuffix);
+                } else {
+                    writeRxLineToStream(g_io, header, payload, payloadLen, keepLineOpen, closeSuffix);
+                }
             }
 
 #if !HIGH_FREQUENCY_INCOMMING_ESPNOW
             if (g_lcdTerminal != nullptr && g_lcdTerminal->isReady()) {
-                String lcdLine = String(header);
+                String lcdLine;
                 if (payloadLen > 0) {
-                    lcdLine += " ";
-                    lcdLine += String(payload);
+                    String lcdPayload = String(payload);
+                    lcdPayload.replace('\r', ' ');
+                    lcdPayload.replace('\n', ' ');
+                    lcdPayload.replace('\t', ' ');
+                    lcdPayload.trim();
+                    if (appendToPrevious) {
+                        lcdLine = lcdPayload;
+                    } else {
+                        lcdLine = String(header);
+                        lcdLine += " ";
+                        lcdLine += lcdPayload;
+                    }
+                } else if (!appendToPrevious) {
+                    lcdLine = String(header);
                 }
-                g_lcdTerminal->writeText(lcdLine, color);
+
+                if (!keepLineOpen && closeSuffix[0] != '\0') {
+                    if (lcdLine.length() > 0) {
+                        lcdLine += " ";
+                    }
+                    lcdLine += closeSuffix;
+                }
+
+                if (lcdLine.length() > 0) {
+                    g_lcdTerminal->writeText(lcdLine, color);
+                }
             }
 #endif
         }
@@ -406,12 +615,17 @@ bool enableAsyncRx(size_t queueDepth) {
     g_droppedRxCount = 0;
     g_overwrittenRxDisplayCount = 0;
     g_droppedRxDbLogCount = 0;
+    g_rxLineOpen = false;
+    g_rxContinuationPadding = 1;
+    resetRxAssemblyState();
     g_asyncDbLogEnabled = false;
     g_asyncRxEnabled = true;
     return true;
 }
 
 void disableAsyncRx() {
+    closeOpenRxLine(g_io);
+    resetRxAssemblyState();
     g_asyncRxEnabled = false;
     g_asyncDbLogEnabled = false;
     if (g_rxQueue != nullptr) {
@@ -522,17 +736,56 @@ size_t flushRxDisplayLines(size_t maxLines) {
     size_t drained = 0;
     while (drained < maxLines && xQueueReceive(g_rxDisplayQueue, &item, 0) == pdTRUE) {
         if (g_io != nullptr) {
-            writeRxLineToStream(g_io, item.header, item.payload, item.payloadLen);
+            if (item.appendToPrevious) {
+                writeRxContinuationToStream(
+                    g_io,
+                    item.payload,
+                    item.payloadLen,
+                    item.keepLineOpen,
+                    item.closeSuffix
+                );
+            } else {
+                writeRxLineToStream(
+                    g_io,
+                    item.header,
+                    item.payload,
+                    item.payloadLen,
+                    item.keepLineOpen,
+                    item.closeSuffix
+                );
+            }
         }
 
 #if !HIGH_FREQUENCY_INCOMMING_ESPNOW
-    if (g_lcdTerminal != nullptr && g_lcdTerminal->isReady()) {
-            String lcdLine = String(item.header);
+        if (g_lcdTerminal != nullptr && g_lcdTerminal->isReady()) {
+            String lcdLine;
             if (item.payloadLen > 0) {
-                lcdLine += " ";
-                lcdLine += String(item.payload);
+                String lcdPayload = String(item.payload);
+                lcdPayload.replace('\r', ' ');
+                lcdPayload.replace('\n', ' ');
+                lcdPayload.replace('\t', ' ');
+                lcdPayload.trim();
+                if (item.appendToPrevious) {
+                    lcdLine = lcdPayload;
+                } else {
+                    lcdLine = String(item.header);
+                    lcdLine += " ";
+                    lcdLine += lcdPayload;
+                }
+            } else if (!item.appendToPrevious) {
+                lcdLine = String(item.header);
             }
-            g_lcdTerminal->writeText(lcdLine, item.color);
+
+            if (!item.keepLineOpen && item.closeSuffix[0] != '\0') {
+                if (lcdLine.length() > 0) {
+                    lcdLine += " ";
+                }
+                lcdLine += item.closeSuffix;
+            }
+
+            if (lcdLine.length() > 0) {
+                g_lcdTerminal->writeText(lcdLine, item.color);
+            }
         }
 #endif
 

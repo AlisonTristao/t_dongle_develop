@@ -7,6 +7,15 @@ namespace {
 constexpr const char* kCommandPrefix = "$ ";
 constexpr const char* kOutputPrefix = "! ";
 
+bool isEspNowTypeToken(const String& token) {
+    return token.equalsIgnoreCase("info") ||
+           token.equalsIgnoreCase("cmdo") ||
+           token.equalsIgnoreCase("tele") ||
+           token.equalsIgnoreCase("erro") ||
+           token.equalsIgnoreCase("debg") ||
+           token.equalsIgnoreCase("none");
+}
+
 String normalizeTag(const char* tag) {
     String out = (tag != nullptr) ? String(tag) : String("shell");
     out.trim();
@@ -32,8 +41,22 @@ String normalizeTag(const char* tag) {
 bool isEspNowStructuredLine(const String& line) {
     String lower = line;
     lower.trim();
-    lower.toLowerCase();
-    return lower.startsWith("[espnow][");
+
+    if (!lower.startsWith("[")) {
+        return false;
+    }
+
+    const int32_t firstClose = lower.indexOf(']');
+    if (firstClose <= 1) {
+        return false;
+    }
+
+    const String firstToken = lower.substring(1, firstClose);
+    if (!isEspNowTypeToken(firstToken)) {
+        return false;
+    }
+
+    return (firstClose + 1 < static_cast<int32_t>(lower.length())) && lower[firstClose + 1] == '[';
 }
 
 String stripLeadingBracketTags(const String& input) {
@@ -64,8 +87,7 @@ bool hasVisualPrefix(const char* line) {
 
     if (std::strncmp(line, kOutputPrefix, std::strlen(kOutputPrefix)) == 0 ||
         std::strncmp(line, kCommandPrefix, std::strlen(kCommandPrefix)) == 0 ||
-        std::strncmp(line, "[ESPNOW][", 9) == 0 ||
-        std::strncmp(line, "[espnow][", 9) == 0) {
+        isEspNowStructuredLine(String(line))) {
         return true;
     }
 
@@ -83,32 +105,81 @@ String normalizeNewlines(const char* text) {
     return normalized;
 }
 
-void writeBufferWithNewLine(Stream& io, const char* line) {
-    // Ensure output starts at the beginning of the current terminal line.
-    io.write('\r');
+void writeTextWithPrefix(Stream& io, const char* prefix, const char* text, bool prefixEmptyLine) {
+    const char* safeText = (text != nullptr) ? text : "";
+    const char* safePrefix = (prefix != nullptr) ? prefix : "";
+    const size_t textLen = std::strlen(safeText);
+    const size_t prefixLen = std::strlen(safePrefix);
 
-    const char* safeLine = (line != nullptr) ? line : "";
-    const uint8_t* data = reinterpret_cast<const uint8_t*>(safeLine);
-    size_t remaining = std::strlen(safeLine);
-    uint32_t retries = 0;
+    auto writeChunk = [&](const char* data, size_t len) {
+        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(data);
+        size_t remaining = len;
+        uint32_t retries = 0;
 
-    while (remaining > 0) {
-        const size_t sent = io.write(data, remaining);
-        if (sent == 0) {
-            ++retries;
-            if (retries > 8) {
-                break;
+        while (remaining > 0) {
+            const size_t sent = io.write(bytes, remaining);
+            if (sent == 0) {
+                ++retries;
+                if (retries > 8) {
+                    break;
+                }
+                delay(1);
+                continue;
             }
-            delay(1);
-            continue;
-        }
 
-        data += sent;
-        remaining -= sent;
+            bytes += sent;
+            remaining -= sent;
+        }
+    };
+
+    if (textLen == 0) {
+        if (prefixLen > 0 && prefixEmptyLine) {
+            io.write('\r');
+            writeChunk(safePrefix, prefixLen);
+        }
+        io.write('\r');
+        io.write('\n');
+        return;
     }
 
     io.write('\r');
-    io.write('\n');
+    if (prefixLen > 0) {
+        writeChunk(safePrefix, prefixLen);
+    }
+
+    bool lineOpen = true;
+    for (size_t i = 0; i < textLen; ++i) {
+        const char ch = safeText[i];
+        if (ch == '\0') {
+            break;
+        }
+
+        if (ch == '\r' || ch == '\n') {
+            if (ch == '\r' && (i + 1) < textLen && safeText[i + 1] == '\n') {
+                ++i;
+            }
+
+            io.write('\r');
+            io.write('\n');
+            lineOpen = false;
+
+            if ((i + 1) < textLen) {
+                io.write('\r');
+                if (prefixLen > 0) {
+                    writeChunk(safePrefix, prefixLen);
+                }
+                lineOpen = true;
+            }
+            continue;
+        }
+
+        io.write(ch);
+    }
+
+    if (lineOpen) {
+        io.write('\r');
+        io.write('\n');
+    }
 }
 
 } // namespace
@@ -128,7 +199,7 @@ void writeRawLine(Stream& io, const String& line) {
 }
 
 void writeRawLine(Stream& io, const char* line) {
-    writeBufferWithNewLine(io, line);
+    writeTextWithPrefix(io, nullptr, line, false);
 }
 
 void writeLine(Stream& io, const String& line) {
@@ -138,17 +209,16 @@ void writeLine(Stream& io, const String& line) {
 void writeLine(Stream& io, const char* line) {
     const char* safeLine = (line != nullptr) ? line : "";
     if (safeLine[0] == '\0') {
-        writeBufferWithNewLine(io, safeLine);
+        writeTextWithPrefix(io, kOutputPrefix, safeLine, true);
         return;
     }
 
     if (hasVisualPrefix(safeLine)) {
-        writeBufferWithNewLine(io, safeLine);
+        writeTextWithPrefix(io, nullptr, safeLine, false);
         return;
     }
 
-    String prefixed = String(kOutputPrefix) + safeLine;
-    writeBufferWithNewLine(io, prefixed.c_str());
+    writeTextWithPrefix(io, kOutputPrefix, safeLine, true);
 }
 
 void writeLines(Stream& io, const char* text) {
