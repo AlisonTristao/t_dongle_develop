@@ -1,4 +1,4 @@
 [submodule "shared/sincronizacao_mensagens"]
-	path = shared/sincronizacao_mensagens
+	path = shared
 	url = https://github.com/AlisonTristao/sincronizacao_mensagens.git
 	branch = main
