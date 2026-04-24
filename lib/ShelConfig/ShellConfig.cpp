@@ -48,17 +48,69 @@ string stripOuterQuotes(const string& text) {
     return s;
 }
 
+bool isTagToken(const string& token) {
+    if (token.empty()) {
+        return false;
+    }
+
+    for (const char ch : token) {
+        const unsigned char uch = static_cast<unsigned char>(ch);
+        if (!(std::isalpha(uch) != 0 || ch == '_' || ch == '-')) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool isEspNowStructuredLine(const string& text) {
+    string lower = trimCopy(text);
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+
+    return lower.rfind("[espnow][", 0) == 0;
+}
+
+string stripLeadingModuleTags(const string& text) {
+    string out = trimCopy(text);
+    if (out.empty() || isEspNowStructuredLine(out)) {
+        return out;
+    }
+
+    while (!out.empty() && out.front() == '[') {
+        const size_t close = out.find(']');
+        if (close == string::npos || close <= 1) {
+            break;
+        }
+
+        const string tag = out.substr(1, close - 1);
+        if (!isTagToken(tag)) {
+            break;
+        }
+
+        out = trimCopy(out.substr(close + 1));
+    }
+
+    return out;
+}
+
 string normalizeOutputTag(const string& text) {
     string s = trimCopy(text);
     if (s.empty()) {
         return s;
     }
 
-    if (s.front() == '[') {
+    if (isEspNowStructuredLine(s)) {
         return s;
     }
 
-    return string("[shell] ") + s;
+    const string stripped = stripLeadingModuleTags(s);
+    if (!stripped.empty()) {
+        return stripped;
+    }
+
+    return s;
 }
 
 bool parseMacAddress(const string& text, uint8_t outMac[6]) {

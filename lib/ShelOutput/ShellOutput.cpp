@@ -7,18 +7,6 @@ namespace {
 constexpr const char* kCommandPrefix = "$ ";
 constexpr const char* kOutputPrefix = "! ";
 
-bool isErrorLike(const String& text) {
-    String lower = text;
-    lower.toLowerCase();
-
-    return (
-        lower.indexOf("falhou") >= 0 ||
-        lower.indexOf("erro") >= 0 ||
-        lower.indexOf("error") >= 0 ||
-        lower.indexOf("invalid") >= 0
-    );
-}
-
 String normalizeTag(const char* tag) {
     String out = (tag != nullptr) ? String(tag) : String("shell");
     out.trim();
@@ -41,13 +29,47 @@ String normalizeTag(const char* tag) {
     return out;
 }
 
+bool isEspNowStructuredLine(const String& line) {
+    String lower = line;
+    lower.trim();
+    lower.toLowerCase();
+    return lower.startsWith("[espnow][");
+}
+
+String stripLeadingBracketTags(const String& input) {
+    String out = input;
+    out.trim();
+
+    if (isEspNowStructuredLine(out)) {
+        return out;
+    }
+
+    while (out.startsWith("[")) {
+        const int32_t close = out.indexOf(']');
+        if (close <= 0) {
+            break;
+        }
+
+        out = out.substring(close + 1);
+        out.trim();
+    }
+
+    return out;
+}
+
 bool hasVisualPrefix(const char* line) {
     if (line == nullptr) {
         return false;
     }
 
-    return std::strncmp(line, kOutputPrefix, std::strlen(kOutputPrefix)) == 0 ||
-           std::strncmp(line, kCommandPrefix, std::strlen(kCommandPrefix)) == 0;
+    if (std::strncmp(line, kOutputPrefix, std::strlen(kOutputPrefix)) == 0 ||
+        std::strncmp(line, kCommandPrefix, std::strlen(kCommandPrefix)) == 0 ||
+        std::strncmp(line, "[ESPNOW][", 9) == 0 ||
+        std::strncmp(line, "[espnow][", 9) == 0) {
+        return true;
+    }
+
+    return false;
 }
 
 String normalizeNewlines(const char* text) {
@@ -162,11 +184,21 @@ void writeLines(Stream& io, const String& text) {
 
 void printTagged(Stream& io, const char* tag, const String& message) {
     const String safeTag = normalizeTag(tag);
-    String line = "[" + safeTag + "]";
+    String line = message;
+    line.trim();
 
-    if (message.length() > 0) {
-        line += " ";
-        line += message;
+    if (line.length() == 0) {
+        return;
+    }
+
+    if (safeTag.equalsIgnoreCase("espnow") && isEspNowStructuredLine(line)) {
+        writeRawLine(io, line);
+        return;
+    }
+
+    line = stripLeadingBracketTags(line);
+    if (line.length() == 0) {
+        return;
     }
 
     writeLine(io, line);
@@ -198,20 +230,14 @@ void printResponse(Stream& io, const std::string& response) {
 
         line.trim();
         if (line.length() > 0) {
-            if (line.startsWith("[")) {
-                writeLine(io, line);
-                if (newline < 0) {
-                    break;
+            if (isEspNowStructuredLine(line)) {
+                writeRawLine(io, line);
+            } else {
+                const String cleanLine = stripLeadingBracketTags(line);
+                if (cleanLine.length() > 0) {
+                    writeLine(io, cleanLine);
                 }
-                start = newline + 1;
-                continue;
             }
-
-            const bool error = isErrorLike(line);
-            const String tagged = error
-                ? String("[shell][erro] ") + line
-                : String("[shell][ok] ") + line;
-            writeLine(io, tagged);
         }
 
         if (newline < 0) {
