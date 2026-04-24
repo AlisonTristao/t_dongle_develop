@@ -11,6 +11,10 @@
 #include "EspNowConfig.h"
 #include "ShellOutput.h"
 
+#ifndef BOUDERATE
+#define BAUDRATE 9600
+#endif
+
 namespace {
 
 constexpr uint8_t kRxDbWarningPercent = RX_DB_WARNING_PERCENT;
@@ -267,7 +271,7 @@ void AppRuntime::handleShellInput() {
 void AppRuntime::begin() {
     BoardConfig::initBoardPins(false);
 
-    serialShell_.begin(Serial, 921600);
+    serialShell_.begin(Serial, BAUDRATE);
     serialShell_.setPrompt(ShellOutput::commandPrompt());
 
     StartupConfig::waitForSerialAndAnimateLed(donglePeripherals_);
