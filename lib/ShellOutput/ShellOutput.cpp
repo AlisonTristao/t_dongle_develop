@@ -9,10 +9,15 @@ constexpr const char* kOutputPrefix = "! ";
 
 bool isEspNowTypeToken(const String& token) {
     return token.equalsIgnoreCase("info") ||
+           token.equalsIgnoreCase("cmd") ||
            token.equalsIgnoreCase("cmdo") ||
+           token.equalsIgnoreCase("telemetry") ||
            token.equalsIgnoreCase("tele") ||
+           token.equalsIgnoreCase("error") ||
            token.equalsIgnoreCase("erro") ||
+           token.equalsIgnoreCase("debug") ||
            token.equalsIgnoreCase("debg") ||
+           token.equalsIgnoreCase("pakg") ||
            token.equalsIgnoreCase("none");
 }
 

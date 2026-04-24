@@ -1,0 +1,3 @@
+[submodule "shared/sincronizacao_mensagens"]
+	path = shared/sincronizacao_mensagens
+	url = https://github.com/AlisonTristao/sincronizacao_mensagens.git

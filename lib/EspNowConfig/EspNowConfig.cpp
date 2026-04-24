@@ -43,34 +43,13 @@ bool g_rxAssemblyHasMac = false;
 uint8_t g_rxAssemblyMac[6] = {0};
 uint8_t g_rxExpectedPacketIndex = 0;
 
-const char* logTypeToText(EspNowManager::logType type) {
-    switch (type) {
-    case EspNowManager::logType::INFO:
-        return "INFO";
-    case EspNowManager::logType::CMDO:
-        return "CMDO";
-    case EspNowManager::logType::TELE:
-        return "TELE";
-    case EspNowManager::logType::ERRO:
-        return "ERRO";
-    case EspNowManager::logType::DEBG:
-        return "DEBG";
-    case EspNowManager::logType::PAKG:
-        return "PAKG";
-    case EspNowManager::logType::NONE:
-
-    default:
-        return "NONE";
-    }
-}
-
 uint16_t logTypeToLcdColor(EspNowManager::logType type) {
     switch (type) {
-    case EspNowManager::logType::ERRO:
+    case EspNowManager::logType::ERROR:
         return ST77XX_RED;
-    case EspNowManager::logType::TELE:
+    case EspNowManager::logType::TELEMETRY:
         return ST77XX_GREEN;
-    case EspNowManager::logType::DEBG:
+    case EspNowManager::logType::DEBUG:
         return ST77XX_YELLOW;
     case EspNowManager::logType::INFO:
     case EspNowManager::logType::NONE:
@@ -436,7 +415,7 @@ void processRxMessageInternal(const uint8_t mac[6], const EspNowManager::message
     char header[96] = {0};
     if (!appendToPrevious) {
         const String arrivedAt = arrivalTimeText();
-        const char* typeText = logTypeToText(incomingData.type);
+        const char* typeText = logTypeToString(incomingData.type);
         std::snprintf(
             header,
             sizeof(header),
