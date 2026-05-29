@@ -5,6 +5,7 @@
 
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 
 namespace {
@@ -111,6 +112,24 @@ struct IntQueryContext {
     bool hasValue;
     int32_t value;
 };
+
+String messagePayloadText(const EspNowManager::message& msg) {
+    const size_t maxLen = EspNowManager::MESSAGE_TEXT_SIZE;
+    size_t length = msg.content.size;
+    if (length == 0 || length > maxLen) {
+        length = 0;
+        while (length < maxLen && msg.content.text[length] != '\0') {
+            ++length;
+        }
+    }
+
+    char buffer[EspNowManager::MESSAGE_TEXT_SIZE + 1] = {0};
+    if (length > 0) {
+        std::memcpy(buffer, msg.content.text, length);
+    }
+    buffer[length] = '\0';
+    return String(buffer);
+}
 
 int queryIntCallback(void* rawContext, int argc, char** argv, char**) {
     if (rawContext == nullptr || argc <= 0 || argv == nullptr || argv[0] == nullptr) {
@@ -510,7 +529,7 @@ bool DatabaseStore::logIncomingEspNow(const uint8_t mac[6], const EspNowManager:
     sql += "INSERT INTO espnow_incoming_log(peer_id,payload,payload_type,received_at) VALUES(";
     sql += String(static_cast<long>(peerId));
     sql += ",'";
-    sql += escapeSqlText(String(incoming.msg));
+    sql += escapeSqlText(messagePayloadText(incoming));
     sql += "',";
     sql += String(static_cast<int>(incoming.type));
     sql += ",";
@@ -542,7 +561,7 @@ bool DatabaseStore::logOutgoingEspNow(const uint8_t mac[6], const EspNowManager:
     sql += ",'";
     sql += escapeSqlText(macToText(mac));
     sql += "','";
-    sql += escapeSqlText(String(outgoing.msg));
+    sql += escapeSqlText(messagePayloadText(outgoing));
     sql += "',";
     sql += String(static_cast<int>(outgoing.type));
     sql += ",";

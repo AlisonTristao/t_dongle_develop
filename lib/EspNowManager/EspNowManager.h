@@ -22,7 +22,7 @@ public:
     /** Maximum length for device description, including terminator. */
     static constexpr size_t DEVICE_DESCRIPTION_SIZE = 96;
     /** Payload text size compatible with message struct. */
-    static constexpr size_t MESSAGE_TEXT_SIZE = 231;
+    static constexpr size_t MESSAGE_TEXT_SIZE = MAX_CONTENT_SIZE;
 
     /**
      * @brief Message category used in ESP-NOW payloads.
@@ -32,12 +32,7 @@ public:
     /**
      * @brief Wire payload structure shared between sender and receiver.
      */
-    struct message {
-        uint32_t timer;
-        char msg[MESSAGE_TEXT_SIZE];
-        logType type;
-        uint8_t packetInfo;
-    };
+    using message = ::message;
 
     /**
      * @brief Local device registry record.

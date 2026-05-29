@@ -3,6 +3,10 @@
 #include <WiFi.h>
 #include <cstring>
 
+namespace {
+constexpr size_t kLegacyMessageTextSize = 231;
+}
+
 // Active instance used by static C callbacks required by ESP-NOW API.
 EspNowManager* EspNowManager::activeInstance_ = nullptr;
 
@@ -327,31 +331,48 @@ void EspNowManager::handleReceiveStatic(const uint8_t* mac, const uint8_t* incom
 
     struct LegacyMessage {
         uint32_t timer;
-        char msg[MESSAGE_TEXT_SIZE];
+        char msg[kLegacyMessageTextSize];
         logType type;
     };
 
     if (len == static_cast<int>(sizeof(message))) {
         memcpy(&incoming, incomingData, sizeof(message));
-        incoming.msg[sizeof(incoming.msg) - 1] = '\0';
+        if (incoming.content.size > MESSAGE_TEXT_SIZE) {
+            incoming.content.size = MESSAGE_TEXT_SIZE;
+        }
+        incoming.content.text[MESSAGE_TEXT_SIZE] = '\0';
     } else if (len == static_cast<int>(sizeof(LegacyMessage))) {
         LegacyMessage legacy = {};
         memcpy(&legacy, incomingData, sizeof(legacy));
         incoming.timer = legacy.timer;
-        memcpy(incoming.msg, legacy.msg, sizeof(legacy.msg));
-        incoming.msg[sizeof(incoming.msg) - 1] = '\0';
         incoming.type = legacy.type;
-        incoming.packetInfo = makePacketInfo(0, true);
+        incoming.packet_number = 0;
+        incoming.total_packets = 1;
+        incoming.checksum = 0;
+
+        size_t copySize = 0;
+        while (copySize < kLegacyMessageTextSize && legacy.msg[copySize] != '\0') {
+            ++copySize;
+        }
+        if (copySize > 0) {
+            Serial.println(incoming.content.text);
+            memcpy(incoming.content.text, legacy.msg, copySize);
+        }
+        incoming.content.text[copySize] = '\0';
+        incoming.content.size = copySize;
     } else {
         // Compatibility path for raw text payloads.
-        const size_t copySize = (static_cast<size_t>(len) < (sizeof(incoming.msg) - 1))
+        const size_t copySize = (static_cast<size_t>(len) < MESSAGE_TEXT_SIZE)
             ? static_cast<size_t>(len)
-            : (sizeof(incoming.msg) - 1);
-        memcpy(incoming.msg, incomingData, copySize);
-        incoming.msg[copySize] = '\0';
+            : MESSAGE_TEXT_SIZE;
+        memcpy(incoming.content.text, incomingData, copySize);
+        incoming.content.text[copySize] = '\0';
+        incoming.content.size = copySize;
         incoming.timer = millis();
         incoming.type = logType::NONE;
-        incoming.packetInfo = makePacketInfo(0, true);
+        incoming.packet_number = 0;
+        incoming.total_packets = 1;
+        incoming.checksum = 0;
     }
 
     activeInstance_->receiveCallback_(mac, incoming);

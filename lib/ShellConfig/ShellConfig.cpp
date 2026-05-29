@@ -850,11 +850,18 @@ uint8_t wrapper_espnow_send_to(int32_t deviceNumber, string command) {
     EspNowManager::message outgoing = {};
     outgoing.timer = millis();
     outgoing.type = EspNowManager::logType::INFO;
-    outgoing.packetInfo = makePacketInfo(0, true);
+    outgoing.packet_number = 0;
+    outgoing.total_packets = 1;
+    outgoing.checksum = 0;
 
     const string msg = stripOuterQuotes(command);
-    std::strncpy(outgoing.msg, msg.c_str(), sizeof(outgoing.msg) - 1);
-    outgoing.msg[sizeof(outgoing.msg) - 1] = '\0';
+    const size_t maxLen = EspNowManager::MESSAGE_TEXT_SIZE;
+    const size_t copyLen = (msg.size() < maxLen) ? msg.size() : maxLen;
+    if (copyLen > 0) {
+        std::memcpy(outgoing.content.text, msg.c_str(), copyLen);
+    }
+    outgoing.content.text[copyLen] = '\0';
+    outgoing.content.size = copyLen;
 
     if (deviceNumber == 0) {
         // Peer virtual 000: route to default broadcast MAC (stored in DB, with FF fallback).
@@ -905,11 +912,18 @@ uint8_t wrapper_espnow_send_all(string command) {
     EspNowManager::message outgoing = {};
     outgoing.timer = millis();
     outgoing.type = EspNowManager::logType::INFO;
-    outgoing.packetInfo = makePacketInfo(0, true);
+    outgoing.packet_number = 0;
+    outgoing.total_packets = 1;
+    outgoing.checksum = 0;
 
     const string msg = stripOuterQuotes(command);
-    std::strncpy(outgoing.msg, msg.c_str(), sizeof(outgoing.msg) - 1);
-    outgoing.msg[sizeof(outgoing.msg) - 1] = '\0';
+    const size_t maxLen = EspNowManager::MESSAGE_TEXT_SIZE;
+    const size_t copyLen = (msg.size() < maxLen) ? msg.size() : maxLen;
+    if (copyLen > 0) {
+        std::memcpy(outgoing.content.text, msg.c_str(), copyLen);
+    }
+    outgoing.content.text[copyLen] = '\0';
+    outgoing.content.size = copyLen;
 
     size_t deliveredCount = 0;
     size_t triedCount = 0;
