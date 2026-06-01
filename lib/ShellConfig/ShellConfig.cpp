@@ -8,6 +8,7 @@
 #include <cstring>
 #include <cstdio>
 #include <ctime>
+#include <vector>
 #include <sys/time.h>
 #include <Esp.h>
 #include <SD_MMC.h>
@@ -18,6 +19,7 @@ using std::string;
 
 ShellConfig::Context g_ctx = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
 string g_commandOutputBuffer;
+string g_shellResponseBuffer;
 constexpr uint8_t kFallbackBroadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 string trimCopy(const string& text) {
@@ -111,6 +113,22 @@ string normalizeOutputTag(const string& text) {
     }
 
     return s;
+}
+
+void appendShellResponse(const string& text) {
+    if (text.empty()) {
+        return;
+    }
+
+    if (!g_shellResponseBuffer.empty()) {
+        const char last = g_shellResponseBuffer.back();
+        const char first = text.front();
+        if (last != '\n' && last != '\r' && first != '\n' && first != '\r') {
+            g_shellResponseBuffer += '\n';
+        }
+    }
+
+    g_shellResponseBuffer += text;
 }
 
 bool parseMacAddress(const string& text, uint8_t outMac[6]) {
@@ -318,7 +336,19 @@ uint8_t wrapper_help_h() {
         return failWithCode(AppError::Code::SHELL_NOT_READY, "shell nao configurada para help -h");
     }
 
-    printLine(g_ctx.shell->get_help(""));
+    const std::vector<std::string> modules = g_ctx.shell->complete_line("", 64);
+    if (modules.empty()) {
+        printLine("[help] nenhum modulo registrado");
+        return RESULT_OK;
+    }
+
+    printLine("[help] modulos disponiveis:");
+    for (const auto& entry : modules) {
+        const string name = trimCopy(entry);
+        if (!name.empty()) {
+            printLine("- " + name);
+        }
+    }
     return RESULT_OK;
 }
 
@@ -327,7 +357,45 @@ uint8_t wrapper_help_l(string module = "") {
         return failWithCode(AppError::Code::SHELL_NOT_READY, "shell nao configurada para help -l");
     }
 
-    printLine(g_ctx.shell->get_help(module));
+    const string moduleName = trimCopy(module);
+    if (moduleName.empty()) {
+        return wrapper_help_h();
+    }
+
+    bool moduleExists = false;
+    const std::vector<std::string> moduleMatches = g_ctx.shell->complete_line(moduleName, 32);
+    for (const auto& entry : moduleMatches) {
+        if (trimCopy(entry) == moduleName) {
+            moduleExists = true;
+            break;
+        }
+    }
+
+    if (!moduleExists) {
+        printLine("[help] modulo nao encontrado");
+        return RESULT_OK;
+    }
+
+    const string seed = moduleName + " -";
+    const std::vector<std::string> commands = g_ctx.shell->complete_line(seed, 96);
+    if (commands.empty()) {
+        printLine("[help] modulo nao encontrado ou sem comandos");
+        return RESULT_OK;
+    }
+
+    printLine("[help] comandos do modulo " + moduleName + ":");
+    for (const auto& entry : commands) {
+        string text = trimCopy(entry);
+        if (text.rfind(moduleName, 0) == 0) {
+            text = trimCopy(text.substr(moduleName.length()));
+        }
+        if (!text.empty() && text[0] == '-') {
+            text = trimCopy(text.substr(1));
+        }
+        if (!text.empty()) {
+            printLine("- " + text);
+        }
+    }
     return RESULT_OK;
 }
 
@@ -1228,6 +1296,10 @@ bool bind(const Context& context) {
 
     g_ctx = context;
 
+    g_ctx.shell->set_output_callback([](const string& output) {
+        appendShellResponse(output);
+    });
+
     g_ctx.lcdTerminal->begin(*g_ctx.peripherals);
     return true;
 }
@@ -1303,6 +1375,7 @@ std::string runLine(const std::string& command) {
 
     const std::string normalized = normalizeCommand(command);
     g_commandOutputBuffer.clear();
+    g_shellResponseBuffer.clear();
 
     std::string output;
     const std::string databaseExecPrefix = "database -exec";
@@ -1328,7 +1401,8 @@ std::string runLine(const std::string& command) {
         }
         skipCommandPersistence = true;
     } else {
-        output = g_ctx.shell->run_command_line(normalized);
+        g_ctx.shell->run_command_line(normalized);
+        output = g_shellResponseBuffer;
     }
 
     if (!skipCommandPersistence && g_ctx.database != nullptr && g_ctx.database->isReady()) {
@@ -1350,6 +1424,7 @@ std::string runLine(const std::string& command) {
     }
 
     g_commandOutputBuffer.clear();
+    g_shellResponseBuffer.clear();
 
     return output;
 }

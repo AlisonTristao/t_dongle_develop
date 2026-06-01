@@ -15,7 +15,7 @@
 namespace {
 
 constexpr uint8_t kRxDbWarningPercent = RX_DB_WARNING_PERCENT;
-constexpr size_t kRxDisplayFlushBurst = 24;
+constexpr size_t kRxDisplayFlushBurst = 48;
 
 } // namespace
 
@@ -96,7 +96,7 @@ void AppRuntime::startEspNowWorkers(bool asyncRxEnabled) {
         "espnow_rx",
         6144,
         nullptr,
-        1,
+        2,
         &espNowRxTaskHandle_,
         workerCore
     );
@@ -147,7 +147,7 @@ void AppRuntime::startEspNowWorkers(bool asyncRxEnabled) {
         "espnow_rx_db",
         6144,
         nullptr,
-        1,
+        2,
         &espNowRxDbTaskHandle_,
         workerCore
     );

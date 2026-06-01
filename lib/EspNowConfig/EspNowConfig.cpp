@@ -41,7 +41,8 @@ size_t g_rxContinuationPadding = 1;
 bool g_rxAssemblyActive = false;
 bool g_rxAssemblyHasMac = false;
 uint8_t g_rxAssemblyMac[6] = {0};
-uint16_t g_rxExpectedPacketIndex = 0;
+uint16_t g_rxExpectedPacketNumber = 0;
+bool g_rxAssemblyZeroBased = false;
 
 uint16_t logTypeToLcdColor(EspNowManager::logType type) {
     switch (type) {
@@ -102,7 +103,8 @@ void writeRawToStream(Stream* io, const char* data, size_t len);
 void resetRxAssemblyState() {
     g_rxAssemblyActive = false;
     g_rxAssemblyHasMac = false;
-    g_rxExpectedPacketIndex = 0;
+    g_rxExpectedPacketNumber = 0;
+    g_rxAssemblyZeroBased = false;
 }
 
 bool sameMacAddress(const uint8_t* lhs, const uint8_t* rhs) {
@@ -373,27 +375,42 @@ void processRxMessageInternal(const uint8_t mac[6], const EspNowManager::message
     const size_t copiedPayloadLen = copyIncomingPayload(incomingData, payload, sizeof(payload));
     const size_t payloadLen = copiedPayloadLen;
 
-    const uint16_t totalPackets = (incomingData.total_packets == 0)
-        ? static_cast<uint16_t>(1)
-        : incomingData.total_packets;
-    uint16_t packetIndex = incomingData.packet_number;
-    if (packetIndex >= totalPackets) {
-        packetIndex = static_cast<uint16_t>(totalPackets - 1U);
-    }
-
-    const bool packetIsLast = (totalPackets <= 1U) || (packetIndex + 1U >= totalPackets);
-    const bool keepLineOpen = (totalPackets > 1U) && !packetIsLast;
-    const bool isPackageContinuation = (totalPackets > 1U) && (packetIndex > 0U);
-
     if (g_rxAssemblyActive && g_rxAssemblyHasMac && mac != nullptr && !sameMacAddress(g_rxAssemblyMac, mac)) {
         closeOpenRxLine(g_io);
         resetRxAssemblyState();
     }
 
+    const uint16_t totalPackets = (incomingData.total_packets == 0)
+        ? static_cast<uint16_t>(1)
+        : incomingData.total_packets;
+    const bool usesZeroBased = g_rxAssemblyActive ? g_rxAssemblyZeroBased : (incomingData.packet_number == 0);
+
+    uint16_t packetNumber = 1;
+    if (totalPackets <= 1U) {
+        packetNumber = 1U;
+    } else if (usesZeroBased) {
+        uint16_t packetIndex = incomingData.packet_number;
+        if (packetIndex >= totalPackets) {
+            packetIndex = static_cast<uint16_t>(totalPackets - 1U);
+        }
+        packetNumber = static_cast<uint16_t>(packetIndex + 1U);
+    } else {
+        packetNumber = (incomingData.packet_number == 0U)
+            ? static_cast<uint16_t>(1U)
+            : incomingData.packet_number;
+        if (packetNumber > totalPackets) {
+            packetNumber = totalPackets;
+        }
+    }
+
+    const bool packetIsLast = (totalPackets <= 1U) || (packetNumber >= totalPackets);
+    const bool keepLineOpen = (totalPackets > 1U) && !packetIsLast;
+    const bool isPackageContinuation = (totalPackets > 1U) && (packetNumber > 1U);
+
     bool appendToPrevious = false;
     if (isPackageContinuation) {
         appendToPrevious = g_rxAssemblyActive &&
-                           packetIndex == g_rxExpectedPacketIndex &&
+                           packetNumber == g_rxExpectedPacketNumber &&
                            (!g_rxAssemblyHasMac || sameMacAddress(g_rxAssemblyMac, mac));
 
         if (!appendToPrevious) {
@@ -408,7 +425,7 @@ void processRxMessageInternal(const uint8_t mac[6], const EspNowManager::message
         packetProgress,
         sizeof(packetProgress),
         "%u/%u",
-        static_cast<unsigned>(packetIndex + 1U),
+        static_cast<unsigned>(packetNumber),
         static_cast<unsigned>(totalPackets)
     );
 
@@ -432,14 +449,15 @@ void processRxMessageInternal(const uint8_t mac[6], const EspNowManager::message
             closeSuffix,
             sizeof(closeSuffix),
             "[%u/%u]",
-            static_cast<unsigned>(packetIndex + 1U),
+            static_cast<unsigned>(packetNumber),
             static_cast<unsigned>(totalPackets)
         );
     }
 
     if (keepLineOpen) {
         g_rxAssemblyActive = true;
-        g_rxExpectedPacketIndex = static_cast<uint16_t>(packetIndex + 1U);
+        g_rxExpectedPacketNumber = static_cast<uint16_t>(packetNumber + 1U);
+        g_rxAssemblyZeroBased = usesZeroBased;
         if (mac != nullptr) {
             std::memcpy(g_rxAssemblyMac, mac, sizeof(g_rxAssemblyMac));
             g_rxAssemblyHasMac = true;
