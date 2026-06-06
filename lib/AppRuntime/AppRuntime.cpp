@@ -30,13 +30,8 @@ void AppRuntime::espNowRxWorkerTask(void*) {
 }
 
 void AppRuntime::espNowRxDbWorkerTask(void*) {
-    EspNowConfig::RxDbLogEvent event = {};
-
-    while (true) {
-        if (EspNowConfig::dequeueRxDbLog(event, 250)) {
-            EspNowConfig::processRxDbLog(event);
-        }
-    }
+    // Desativado: Os logs de RX no banco não são mais necessários
+    vTaskDelete(nullptr);
 }
 
 void AppRuntime::restoreShellHistoryFromDatabase() {
@@ -110,114 +105,10 @@ void AppRuntime::startEspNowWorkers(bool asyncRxEnabled) {
     char rxLine[48] = {0};
     std::snprintf(rxLine, sizeof(rxLine), "rx task core=%d", static_cast<int>(workerCore));
     ShellOutput::printTagged(Serial, "espnow", rxLine);
-
-#if HIGH_FREQUENCY_INCOMMING_ESPNOW
-    EspNowConfig::setAsyncDbLogEnabled(true);
-    ShellOutput::printTagged(Serial, "espnow", "rx db mode=buffer_ram (warning 80% + flush manual)");
-    const size_t dbCapacity = EspNowConfig::rxDbLogCapacity();
-
-    char queueLine[96] = {0};
-    std::snprintf(
-        queueLine,
-        sizeof(queueLine),
-        "rx queues: main=%u db_min=%u db_cap=%lu",
-        static_cast<unsigned>(RX_ASYNC_QUEUE_DEPTH),
-        static_cast<unsigned>(RX_DB_LOG_QUEUE_DEPTH),
-        static_cast<unsigned long>(dbCapacity)
-    );
-    ShellOutput::printTagged(Serial, "espnow", queueLine);
-
-    const size_t dbThreshold = (dbCapacity * kRxDbWarningPercent + 99U) / 100U;
-    char flushCfgLine[120] = {0};
-    std::snprintf(
-        flushCfgLine,
-        sizeof(flushCfgLine),
-        "rx warning cfg: thr=%lu (%u%%)",
-        static_cast<unsigned long>(dbThreshold),
-        static_cast<unsigned>(kRxDbWarningPercent)
-    );
-    ShellOutput::printTagged(Serial, "espnow", flushCfgLine);
-
-    if (dbCapacity == 0U) {
-        ShellOutput::printTagged(Serial, "espnow", "warn: rx db queue indisponivel; sem buffer em RAM");
-    }
-#else
-    const BaseType_t rxDbTaskOk = xTaskCreatePinnedToCore(
-        espNowRxDbWorkerTask,
-        "espnow_rx_db",
-        6144,
-        nullptr,
-        2,
-        &espNowRxDbTaskHandle_,
-        workerCore
-    );
-
-    if (rxDbTaskOk != pdPASS) {
-        EspNowConfig::setAsyncDbLogEnabled(false);
-        ShellOutput::printTagged(Serial, "espnow", "rx db task create failed (fallback log sync)");
-        return;
-    }
-
-    EspNowConfig::setAsyncDbLogEnabled(true);
-    char dbLine[52] = {0};
-    std::snprintf(dbLine, sizeof(dbLine), "rx db task core=%d", static_cast<int>(workerCore));
-    ShellOutput::printTagged(Serial, "espnow", dbLine);
-#endif
 }
 
 void AppRuntime::processAsyncWarnings(bool& needPromptRefresh) {
-#if HIGH_FREQUENCY_INCOMMING_ESPNOW
-    static bool warnedAt80 = false;
-    static bool warnedFull = false;
-
-    const size_t dbCapacity = EspNowConfig::rxDbLogCapacity();
-    if (dbCapacity > 0U) {
-        const size_t dbPending = EspNowConfig::pendingRxDbLogCount();
-        const size_t dbThreshold = (dbCapacity * kRxDbWarningPercent + 99U) / 100U;
-
-        if (dbPending >= dbThreshold) {
-            if (!warnedAt80) {
-                char warnLine[220] = {0};
-                std::snprintf(
-                    warnLine,
-                    sizeof(warnLine),
-                    "warning: fila RX->DB em %lu/%lu (>= %u%%). use espnow -flush_db",
-                    static_cast<unsigned long>(dbPending),
-                    static_cast<unsigned long>(dbCapacity),
-                    static_cast<unsigned>(kRxDbWarningPercent)
-                );
-                ShellOutput::printTagged(Serial, "espnow", warnLine);
-                warnedAt80 = true;
-                needPromptRefresh = true;
-            }
-        } else {
-            warnedAt80 = false;
-        }
-
-        if (dbPending >= dbCapacity) {
-            if (!warnedFull) {
-                char fullLine[200] = {0};
-                std::snprintf(
-                    fullLine,
-                    sizeof(fullLine),
-                    "warning: fila RX->DB lotada (%lu/%lu), descartando mensagens recentes",
-                    static_cast<unsigned long>(dbPending),
-                    static_cast<unsigned long>(dbCapacity)
-                );
-                ShellOutput::printTagged(Serial, "espnow", fullLine);
-                warnedFull = true;
-                needPromptRefresh = true;
-            }
-        } else {
-            warnedFull = false;
-        }
-    } else {
-        warnedAt80 = false;
-        warnedFull = false;
-    }
-#else
     (void) needPromptRefresh;
-#endif
 }
 
 void AppRuntime::flushPendingEspNowOutput(bool& needPromptRefresh) {
@@ -238,14 +129,6 @@ void AppRuntime::flushPendingEspNowOutput(bool& needPromptRefresh) {
     if (overwrittenDisplay > 0) {
         char line[72] = {0};
         std::snprintf(line, sizeof(line), "rx_display_overwritten=%lu", static_cast<unsigned long>(overwrittenDisplay));
-        ShellOutput::printTagged(Serial, "espnow", line);
-        needPromptRefresh = true;
-    }
-
-    const uint32_t droppedDb = EspNowConfig::takeDroppedRxDbLogCount();
-    if (droppedDb > 0) {
-        char line[64] = {0};
-        std::snprintf(line, sizeof(line), "rx_db_dropped=%lu", static_cast<unsigned long>(droppedDb));
         ShellOutput::printTagged(Serial, "espnow", line);
         needPromptRefresh = true;
     }

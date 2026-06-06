@@ -35,15 +35,6 @@ CREATE TABLE IF NOT EXISTS command_log_output (
     FOREIGN KEY(log_id) REFERENCES command_log(id) ON DELETE CASCADE
 );
 
-CREATE TABLE IF NOT EXISTS espnow_incoming_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    peer_id INTEGER NOT NULL,
-    payload TEXT NOT NULL,
-    payload_type INTEGER NOT NULL DEFAULT 0,
-    received_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-    FOREIGN KEY(peer_id) REFERENCES peers(id) ON DELETE CASCADE
-);
-
 CREATE TABLE IF NOT EXISTS espnow_outgoing_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     peer_id INTEGER,
@@ -514,29 +505,8 @@ bool DatabaseStore::logCommandWithOutput(const char* command, const char* output
 }
 
 bool DatabaseStore::logIncomingEspNow(const uint8_t mac[6], const EspNowManager::message& incoming) {
-    if (!ready_ || mac == nullptr) {
-        return false;
-    }
-
-    int32_t peerId = -1;
-    if (!ensurePeerExistsWithDefaults(mac, peerId)) {
-        return false;
-    }
-
-    const int64_t now = currentEpochSeconds();
-    String sql;
-    sql.reserve(640);
-    sql += "INSERT INTO espnow_incoming_log(peer_id,payload,payload_type,received_at) VALUES(";
-    sql += String(static_cast<long>(peerId));
-    sql += ",'";
-    sql += escapeSqlText(messagePayloadText(incoming));
-    sql += "',";
-    sql += String(static_cast<int>(incoming.type));
-    sql += ",";
-    sql += String(static_cast<long long>(now));
-    sql += ");";
-
-    return executeNoResult(sql);
+    // Removido: logs recebidos via ESP-NOW não são mais salvos no banco
+    return true;
 }
 
 bool DatabaseStore::logOutgoingEspNow(const uint8_t mac[6], const EspNowManager::message& outgoing, bool delivered) {
@@ -685,24 +655,21 @@ bool DatabaseStore::getStatus(String& outText) {
 
     int32_t peerRows = -1;
     int32_t commandRows = -1;
-    int32_t incomingRows = -1;
     int32_t outgoingRows = -1;
     int32_t bootRows = -1;
     const bool peersOk = querySingleInt("SELECT COUNT(*) FROM peers;", peerRows);
     const bool commandsOk = querySingleInt("SELECT COUNT(*) FROM command_log;", commandRows);
-    const bool incomingOk = querySingleInt("SELECT COUNT(*) FROM espnow_incoming_log;", incomingRows);
     const bool outgoingOk = querySingleInt("SELECT COUNT(*) FROM espnow_outgoing_log;", outgoingRows);
     const bool bootsOk = querySingleInt("SELECT COUNT(*) FROM boot_events;", bootRows);
 
-    char line[280] = {0};
+    char line[256] = {0};
     std::snprintf(
         line,
         sizeof(line),
-        "[database] pronto arquivo=%s peers=%ld comandos=%ld rx=%ld tx=%ld boots=%ld",
+        "[database] pronto arquivo=%s peers=%ld comandos=%ld tx=%ld boots=%ld",
         kSqliteDatabasePath,
         peersOk ? static_cast<long>(peerRows) : -1L,
         commandsOk ? static_cast<long>(commandRows) : -1L,
-        incomingOk ? static_cast<long>(incomingRows) : -1L,
         outgoingOk ? static_cast<long>(outgoingRows) : -1L,
         bootsOk ? static_cast<long>(bootRows) : -1L
     );
@@ -917,15 +884,6 @@ bool DatabaseStore::readEspNowHistory(size_t limit, String& outText) {
     txSql += static_cast<unsigned long>(limit);
     txSql += ";";
 
-    String rxSql;
-    rxSql.reserve(240);
-    rxSql += "SELECT i.id, i.received_at, p.name, p.mac, i.payload ";
-    rxSql += "FROM espnow_incoming_log i ";
-    rxSql += "LEFT JOIN peers p ON p.id = i.peer_id ";
-    rxSql += "ORDER BY i.received_at DESC LIMIT ";
-    rxSql += static_cast<unsigned long>(limit);
-    rxSql += ";";
-
     sqlite3_stmt* txStmt = nullptr;
     int prepareRc = sqlite3_prepare_v2(db_, txSql.c_str(), -1, &txStmt, nullptr);
     if (prepareRc != SQLITE_OK || txStmt == nullptr) {
@@ -973,53 +931,6 @@ bool DatabaseStore::readEspNowHistory(size_t limit, String& outText) {
     }
 
     if (txRows == 0) {
-        outText += "(sem linhas)\n";
-    }
-
-    sqlite3_stmt* rxStmt = nullptr;
-    prepareRc = sqlite3_prepare_v2(db_, rxSql.c_str(), -1, &rxStmt, nullptr);
-    if (prepareRc != SQLITE_OK || rxStmt == nullptr) {
-        outText = String("[database] SQL error: ") + sqlite3_errmsg(db_);
-        unlockDb();
-        return false;
-    }
-
-    outText += "\n[database] ESP-NOW RX\n";
-    size_t rxRows = 0;
-    int rxStepRc = SQLITE_ROW;
-    while ((rxStepRc = sqlite3_step(rxStmt)) == SQLITE_ROW) {
-        ++rxRows;
-
-        const int32_t id = static_cast<int32_t>(sqlite3_column_int(rxStmt, 0));
-        const int64_t receivedAt = static_cast<int64_t>(sqlite3_column_int64(rxStmt, 1));
-        const String peer = sanitizeAndTruncateField(safeColumnText(rxStmt, 2), 24);
-        const String mac = sanitizeAndTruncateField(safeColumnText(rxStmt, 3), 17);
-        const String message = sanitizeAndTruncateField(safeColumnText(rxStmt, 4), 96);
-
-        outText += "[";
-        outText += static_cast<unsigned long>(rxRows);
-        outText += "] id=";
-        outText += static_cast<long>(id);
-        outText += " | data_hora=";
-        outText += epochToDateTimeText(receivedAt);
-        outText += " | peer=";
-        outText += peer;
-        outText += " | mac=";
-        outText += mac;
-        outText += " | mensagem=";
-        outText += message;
-        outText += " | status=recebido\n";
-    }
-
-    sqlite3_finalize(rxStmt);
-
-    if (rxStepRc != SQLITE_DONE) {
-        outText = String("[database] SQL error: ") + sqlite3_errmsg(db_);
-        unlockDb();
-        return false;
-    }
-
-    if (rxRows == 0) {
         outText += "(sem linhas)\n";
     }
 
@@ -1182,14 +1093,6 @@ bool DatabaseStore::applyRuntimeMigrations() {
         "created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),"
         "FOREIGN KEY(log_id) REFERENCES command_log(id) ON DELETE CASCADE"
         ");"
-        "CREATE TABLE IF NOT EXISTS espnow_incoming_log ("
-        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "peer_id INTEGER NOT NULL,"
-        "payload TEXT NOT NULL,"
-        "payload_type INTEGER NOT NULL DEFAULT 0,"
-        "received_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),"
-        "FOREIGN KEY(peer_id) REFERENCES peers(id) ON DELETE CASCADE"
-        ");"
         "CREATE TABLE IF NOT EXISTS espnow_outgoing_log ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "peer_id INTEGER,"
@@ -1206,7 +1109,6 @@ bool DatabaseStore::applyRuntimeMigrations() {
         "boot_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_peers_mac ON peers(mac);"
-        "CREATE INDEX IF NOT EXISTS idx_incoming_peer ON espnow_incoming_log(peer_id);"
         "CREATE INDEX IF NOT EXISTS idx_outgoing_peer ON espnow_outgoing_log(peer_id);"
         "CREATE INDEX IF NOT EXISTS idx_log_output_log_id ON command_log_output(log_id);"
     );

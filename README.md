@@ -235,9 +235,6 @@ Tabelas criadas:
 - `command_log_output`
   - `id`, `log_id` (FK -> `command_log.id`), `output`, `created_at`
 
-- `espnow_incoming_log`
-  - `id`, `peer_id` (FK -> `peers.id`), `payload`, `payload_type`, `received_at`
-
 - `espnow_outgoing_log`
   - `id`, `peer_id` (FK -> `peers.id`), `mac`, `payload`, `payload_type`, `delivered`, `sent_at`
 
@@ -249,7 +246,6 @@ Tabelas criadas:
 
 Indices runtime relevantes:
 - `idx_peers_mac`
-- `idx_incoming_peer`
 - `idx_outgoing_peer`
 - `idx_log_output_log_id`
 
@@ -258,7 +254,6 @@ Indices runtime relevantes:
 - cada comando shell executado em `ShellConfig::runLine()` pode ser persistido em:
   - `command_log`
   - `command_log_output`
-- mensagens ESP-NOW recebidas sao persistidas em `espnow_incoming_log`
 - mensagens ESP-NOW enviadas sao persistidas em `espnow_outgoing_log` com status de entrega
 - boot do sistema registra evento em `boot_events`
 
