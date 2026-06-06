@@ -324,7 +324,7 @@ bool DonglePeripherals::beginSd(bool oneBitMode) {
         }
 #endif
 
-        if (!SD_MMC.begin("/sdcard", attempt.mode1bit, false, attempt.frequencyKHz)) {
+        if (!SD_MMC.begin("/sdcard", attempt.mode1bit, true, attempt.frequencyKHz)) {
             continue;
         }
 

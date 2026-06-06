@@ -346,21 +346,29 @@ void AppRuntime::begin() {
 }
 
 void AppRuntime::tick() {
-    bool needPromptRefresh = false;
+    static uint32_t lastAsyncOutputTime = 0;
+    static bool pendingPromptRefresh = false;
+    
+    bool asyncOutputOccurred = false;
 
-    processAsyncWarnings(needPromptRefresh);
-    flushPendingEspNowOutput(needPromptRefresh);
-
-    if (needPromptRefresh) {
-        serialShell_.refreshLine();
-        needPromptRefresh = false;
-    }
+    processAsyncWarnings(asyncOutputOccurred);
+    flushPendingEspNowOutput(asyncOutputOccurred);
 
     handleShellInput();
-    flushPendingEspNowOutput(needPromptRefresh);
+    flushPendingEspNowOutput(asyncOutputOccurred);
 
-    if (needPromptRefresh) {
+    if (asyncOutputOccurred) {
+        lastAsyncOutputTime = millis();
+        pendingPromptRefresh = true;
+    }
+
+    // Aguarda 150ms de "silencio" antes de redesenhar o prompt.
+    // Isso permite que pacotes ESP-NOW fragmentados (ex: [1/5], [2/5]) 
+    // sejam impressos de forma contigua sem que o prompt quebre a linha no meio.
+    if (pendingPromptRefresh && (millis() - lastAsyncOutputTime > 150)) {
+        Serial.println(); // Garante que o prompt inicie em uma linha limpa
         serialShell_.refreshLine();
+        pendingPromptRefresh = false;
     }
 
     delay(1);

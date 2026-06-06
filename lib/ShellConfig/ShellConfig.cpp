@@ -256,6 +256,8 @@ void printLine(const string& text) {
     g_commandOutputBuffer += "\n";
 
     if (g_ctx.io != nullptr) {
+        // Limpa a linha onde está o cursor (geralmente o prompt) antes de imprimir
+        g_ctx.io->print("\r\033[K");
         ShellOutput::writeLine(*g_ctx.io, normalized.c_str());
     }
 
