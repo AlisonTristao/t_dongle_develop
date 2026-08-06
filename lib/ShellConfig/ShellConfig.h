@@ -33,11 +33,11 @@ bool bind(const Context& context);
 /**
  * @brief Creates and registers default modules and commands.
  *
- * Modules configured:
- * - help
- * - dongle
- * - espnow
- * - database
+ * Each module owns its own registration in its own library:
+ * - help     -> HelpCommands
+ * - dongle   -> DongleCommands
+ * - espnow   -> EspNowCommands
+ * - database -> DatabaseCommands
  *
  * @return RESULT_OK on success.
  */
@@ -47,6 +47,7 @@ uint8_t registerDefaultModules();
  * @brief Runs one shell command line.
  *
  * Special handling:
+ * - Command aliases are expanded first (see ShellAliases).
  * - "espnow -send_to <texto>" is mapped to broadcast send.
  * - "espnow -send_to <indice>, <texto>" sends to one device.
  *
