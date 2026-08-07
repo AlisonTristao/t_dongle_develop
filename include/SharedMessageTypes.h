@@ -22,6 +22,7 @@ enum class logType : uint8_t {
     ERRO,           // error messages
     DEBG,           // debug messages
     CMDO,           // terminal commands received
+    PING,           // heartbeat probe: only the ESP-NOW delivery ACK matters, receivers ignore the payload
 };
 
 // creates a struct union to convert the message text or sound data to a byte array, 
@@ -63,6 +64,7 @@ inline constexpr const char* logTypeToString(logType type) {
         case logType::ERRO:         return "ERRO";
         case logType::DEBG:         return "DEBG";
         case logType::NONE:         return "NONE";
+        case logType::PING:         return "PING";
         // capotamo o corsa
         default:                    return "UNKN"; 
     }

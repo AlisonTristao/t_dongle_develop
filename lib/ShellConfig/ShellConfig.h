@@ -4,7 +4,7 @@
 #include <TinyShell.h>
 #include <EspNowManager.h>
 #include <DonglePeripherals.h>
-#include <LcdTerminal.h>
+#include <LcdDashboard.h>
 #include <DatabaseStore.h>
 
 #include <string>
@@ -18,7 +18,7 @@ struct Context {
 	TinyShell* shell;
 	EspNowManager* espNow;
 	DonglePeripherals* peripherals;
-	LcdTerminal* lcdTerminal;
+	LcdDashboard* lcdDashboard;
 	DatabaseStore* database;
 	Stream* io;
 };

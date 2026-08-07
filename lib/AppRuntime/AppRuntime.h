@@ -7,7 +7,7 @@
 #include <ShellSerial.h>
 #include <EspNowManager.h>
 #include <DonglePeripherals.h>
-#include <LcdTerminal.h>
+#include <LcdDashboard.h>
 #include <DatabaseStore.h>
 #include <TinyShell.h>
 
@@ -19,10 +19,12 @@ public:
 private:
     static void espNowRxWorkerTask(void* param);
     static void espNowRxDbWorkerTask(void* param);
+    static void espNowHeartbeatWorkerTask(void* param);
 
     void restoreShellHistoryFromDatabase();
     BaseType_t selectEspNowWorkerCore() const;
     void startEspNowWorkers(bool asyncRxEnabled);
+    void startHeartbeatWorker();
     void processAsyncWarnings(bool& needPromptRefresh);
     void flushPendingEspNowOutput(bool& needPromptRefresh);
     void handleShellInput();
@@ -30,10 +32,11 @@ private:
     ShellSerial serialShell_;
     EspNowManager espNowManager_;
     DonglePeripherals donglePeripherals_;
-    LcdTerminal lcdTerminal_;
+    LcdDashboard lcdDashboard_;
     DatabaseStore databaseStore_;
     TinyShell tinyShell_;
 
     TaskHandle_t espNowRxTaskHandle_ = nullptr;
     TaskHandle_t espNowRxDbTaskHandle_ = nullptr;
+    TaskHandle_t espNowHeartbeatTaskHandle_ = nullptr;
 };

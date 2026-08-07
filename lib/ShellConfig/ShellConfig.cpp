@@ -43,7 +43,7 @@ bool bind(const Context& context) {
     if (context.shell == nullptr ||
         context.espNow == nullptr ||
         context.peripherals == nullptr ||
-        context.lcdTerminal == nullptr ||
+        context.lcdDashboard == nullptr ||
         context.database == nullptr ||
         context.io == nullptr) {
         return false;
@@ -53,7 +53,7 @@ bool bind(const Context& context) {
         context.shell,
         context.espNow,
         context.peripherals,
-        context.lcdTerminal,
+        context.lcdDashboard,
         context.database,
         context.io
     });
@@ -62,7 +62,7 @@ bool bind(const Context& context) {
         ShellCommandSupport::appendShellResponse(output);
     });
 
-    context.lcdTerminal->begin(*context.peripherals);
+    context.lcdDashboard->begin(*context.peripherals);
     return true;
 }
 

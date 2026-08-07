@@ -4,7 +4,7 @@
 #include <EspNowManager.h>
 #include <DatabaseStore.h>
 
-class LcdTerminal;
+class LcdDashboard;
 
 #ifndef HIGH_FREQUENCY_INCOMMING_ESPNOW
 #define HIGH_FREQUENCY_INCOMMING_ESPNOW 0
@@ -46,6 +46,14 @@ class LcdTerminal;
 #define RX_DB_AUTO_FLUSH_PERCENT RX_DB_WARNING_PERCENT
 #endif
 
+#ifndef HEARTBEAT_INTERVAL_MS
+#define HEARTBEAT_INTERVAL_MS 200 // 5x/s
+#endif
+
+#ifndef HEARTBEAT_SEND_TIMEOUT_MS
+#define HEARTBEAT_SEND_TIMEOUT_MS 150 // must stay under HEARTBEAT_INTERVAL_MS
+#endif
+
 namespace EspNowConfig {
 
 struct RxMessageEvent {
@@ -62,7 +70,7 @@ void attachCallbacks(
 	EspNowManager& manager,
 	Stream& io,
 	DatabaseStore* database = nullptr,
-	LcdTerminal* lcdTerminal = nullptr
+	LcdDashboard* lcdDashboard = nullptr
 );
 
 bool enableAsyncRx(size_t queueDepth = 24);
@@ -94,5 +102,15 @@ uint32_t takeOverwrittenRxDisplayCount();
 uint32_t takeDroppedRxDisplayCount();
 
 uint32_t takeDroppedRxDbLogCount();
+
+/**
+ * @brief Sends one heartbeat ping to the most recently seen ESP-NOW peer
+ * (the last one we received real data from, not another heartbeat) and
+ * updates the dashboard's link tile with the delivery result. No-op when no
+ * peer has sent us anything yet. Meant to be called on a fixed timer, e.g.
+ * every HEARTBEAT_INTERVAL_MS from its own task (this call blocks up to
+ * HEARTBEAT_SEND_TIMEOUT_MS waiting for the ESP-NOW send callback).
+ */
+void heartbeatTick();
 
 } // namespace EspNowConfig

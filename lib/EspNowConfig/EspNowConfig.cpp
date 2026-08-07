@@ -1,5 +1,5 @@
 #include "EspNowConfig.h"
-#include "LcdTerminal.h"
+#include "LcdDashboard.h"
 #include "ShellOutput.h"
 
 #include <cstdio>
@@ -16,7 +16,7 @@ namespace {
 Stream* g_io = nullptr;
 EspNowManager* g_manager = nullptr;
 DatabaseStore* g_database = nullptr;
-LcdTerminal* g_lcdTerminal = nullptr;
+LcdDashboard* g_lcdDashboard = nullptr;
 QueueHandle_t g_rxQueue = nullptr;
 QueueHandle_t g_rxDisplayQueue = nullptr;
 QueueHandle_t g_rxDbLogQueue = nullptr;
@@ -25,6 +25,10 @@ volatile uint32_t g_overwrittenRxDisplayCount = 0;
 volatile uint32_t g_droppedRxDbLogCount = 0;
 bool g_asyncRxEnabled = false;
 bool g_asyncDbLogEnabled = false;
+
+// Heartbeat target: last peer we received real (non-PING) data from.
+uint8_t g_heartbeatTargetMac[6] = {0};
+bool g_hasHeartbeatTarget = false;
 
 struct RxDisplayLine {
     char header[96];
@@ -96,6 +100,37 @@ size_t copyIncomingPayload(const EspNowManager::message& incomingData, char* out
     }
     outPayload[copyLen] = '\0';
     return copyLen;
+}
+
+// Looks for lines like "state changed: SETUP -> WAIT" in a received payload
+// and pulls out the new state (always right after the last "->"). Checked
+// per-packet rather than on a fully reassembled message: in practice these
+// status lines are short and always fit in a single ESP-NOW packet.
+bool tryExtractRobotState(const char* payload, String& outState) {
+    if (payload == nullptr || payload[0] == '\0') {
+        return false;
+    }
+
+    const String text(payload);
+    String lower = text;
+    lower.toLowerCase();
+    if (lower.indexOf("state changed") < 0) {
+        return false;
+    }
+
+    const int32_t arrowPos = text.lastIndexOf("->");
+    if (arrowPos < 0) {
+        return false;
+    }
+
+    String state = text.substring(arrowPos + 2);
+    state.trim();
+    if (state.length() == 0) {
+        return false;
+    }
+
+    outState = state;
+    return true;
 }
 
 void writeRawToStream(Stream* io, const char* data, size_t len);
@@ -371,9 +406,32 @@ bool createDbLogQueue() {
 }
 
 void processRxMessageInternal(const uint8_t mac[6], const EspNowManager::message& incomingData) {
+    if (g_lcdDashboard != nullptr) {
+        g_lcdDashboard->notifyRx();
+    }
+
+    if (incomingData.type == logType::PING) {
+        // Heartbeat probe from a peer: the ESP-NOW driver already sent the
+        // delivery ACK back to whoever pinged us, nothing else to do here.
+        // Skipped on purpose: display/DB logging (would spam at 5x/s) and
+        // heartbeat-target tracking (a ping isn't "real data" from a peer).
+        return;
+    }
+
+    if (mac != nullptr) {
+        std::memcpy(g_heartbeatTargetMac, mac, sizeof(g_heartbeatTargetMac));
+        g_hasHeartbeatTarget = true;
+    }
+
     char payload[EspNowManager::MESSAGE_TEXT_SIZE + 1] = {0};
     const size_t copiedPayloadLen = copyIncomingPayload(incomingData, payload, sizeof(payload));
     const size_t payloadLen = copiedPayloadLen;
+
+    // Robot state accepted from any peer, not just the one being heartbeated.
+    String robotState;
+    if (g_lcdDashboard != nullptr && tryExtractRobotState(payload, robotState)) {
+        g_lcdDashboard->notifyRobotState(robotState);
+    }
 
     if (g_rxAssemblyActive && g_rxAssemblyHasMac && mac != nullptr && !sameMacAddress(g_rxAssemblyMac, mac)) {
         closeOpenRxLine(g_io);
@@ -482,7 +540,7 @@ void processRxMessageInternal(const uint8_t mac[6], const EspNowManager::message
             }
 
 #if !HIGH_FREQUENCY_INCOMMING_ESPNOW
-            if (g_lcdTerminal != nullptr && g_lcdTerminal->isReady()) {
+            if (g_lcdDashboard != nullptr && g_lcdDashboard->isReady()) {
                 String lcdLine;
                 if (payloadLen > 0) {
                     String lcdPayload = String(payload);
@@ -509,7 +567,7 @@ void processRxMessageInternal(const uint8_t mac[6], const EspNowManager::message
                 }
 
                 if (lcdLine.length() > 0) {
-                    g_lcdTerminal->writeText(lcdLine, color);
+                    g_lcdDashboard->showMessage(lcdLine, color);
                 }
             }
 #endif
@@ -573,12 +631,12 @@ void onDataSent(const uint8_t* mac_addr, esp_now_send_status_t status) {
 
 namespace EspNowConfig {
 
-void attachCallbacks(EspNowManager& manager, Stream& io, DatabaseStore* database, LcdTerminal* lcdTerminal) {
+void attachCallbacks(EspNowManager& manager, Stream& io, DatabaseStore* database, LcdDashboard* lcdDashboard) {
     // Bind callbacks once and keep stream pointer for runtime logging.
     g_io = &io;
     g_manager = &manager;
     g_database = database;
-    g_lcdTerminal = lcdTerminal;
+    g_lcdDashboard = lcdDashboard;
     manager.setReceiveCallback(onDataRecv);
     manager.setSendCallback(onDataSent);
 }
@@ -754,7 +812,7 @@ size_t flushRxDisplayLines(size_t maxLines) {
         }
 
 #if !HIGH_FREQUENCY_INCOMMING_ESPNOW
-        if (g_lcdTerminal != nullptr && g_lcdTerminal->isReady()) {
+        if (g_lcdDashboard != nullptr && g_lcdDashboard->isReady()) {
             String lcdLine;
             if (item.payloadLen > 0) {
                 String lcdPayload = String(item.payload);
@@ -781,7 +839,7 @@ size_t flushRxDisplayLines(size_t maxLines) {
             }
 
             if (lcdLine.length() > 0) {
-                g_lcdTerminal->writeText(lcdLine, item.color);
+                g_lcdDashboard->showMessage(lcdLine, item.color);
             }
         }
 #endif
@@ -813,6 +871,28 @@ uint32_t takeDroppedRxDbLogCount() {
     const uint32_t dropped = g_droppedRxDbLogCount;
     g_droppedRxDbLogCount = 0;
     return dropped;
+}
+
+void heartbeatTick() {
+    if (g_manager == nullptr || !g_hasHeartbeatTarget) {
+        return;
+    }
+
+    EspNowManager::message ping = {};
+    ping.timer = millis();
+    ping.type = logType::PING;
+    ping.packet_number = 0;
+    ping.total_packets = 1;
+    ping.checksum = 0;
+    ping.content.size = 0;
+    ping.content.text[0] = '\0';
+
+    bool delivered = false;
+    const bool gotStatus = g_manager->sendToMacWithStatus(g_heartbeatTargetMac, ping, delivered, HEARTBEAT_SEND_TIMEOUT_MS);
+
+    if (g_lcdDashboard != nullptr) {
+        g_lcdDashboard->notifyHeartbeat(gotStatus && delivered);
+    }
 }
 
 } // namespace EspNowConfig

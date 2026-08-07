@@ -304,8 +304,8 @@ void printLine(const string& text) {
         ShellOutput::writeLine(*g_ctx.io, normalized.c_str());
     }
 
-    if (g_ctx.lcdTerminal != nullptr && g_ctx.lcdTerminal->isReady()) {
-        g_ctx.lcdTerminal->writeText(String(normalized.c_str()), lcdColorForLine(normalized));
+    if (g_ctx.lcdDashboard != nullptr && g_ctx.lcdDashboard->isReady()) {
+        g_ctx.lcdDashboard->showMessage(String(normalized.c_str()), lcdColorForLine(normalized));
     }
 }
 

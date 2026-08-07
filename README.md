@@ -56,7 +56,7 @@ Service/Domain Layer (lib)
   - EspNowManager
   - DatabaseStore
   - ShellSerial
-  - LcdTerminal
+  - LcdDashboard
   - DonglePeripherals
 
 Platform Layer
@@ -86,9 +86,9 @@ Responsabilidade de cada modulo:
   - edicao in-line (backspace e setas)
   - historico com navegacao `ESC[A` / `ESC[B`
 
-- `LcdTerminal`
-  - rendering tipo terminal no ST7735
-  - moldura, area de texto, truncamento e limpeza de tela
+- `LcdDashboard`
+  - grade de status no ST7735 (peers, RX/TX, SD, erros, memoria livre)
+  - banner de mensagem/relogio, atualizacao periodica via `tick()`
 
 - `ShellConfig`
   - bind do contexto runtime
@@ -345,7 +345,7 @@ lib/
   DatabaseStore/
   DonglePeripherals/
   EspNowManager/
-  LcdTerminal/
+  LcdDashboard/
   ShellSerial/
 src/
   main.cpp

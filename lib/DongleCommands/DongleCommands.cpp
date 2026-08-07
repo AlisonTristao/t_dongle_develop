@@ -118,9 +118,9 @@ uint8_t wrapper_dongle_lcd(string text) {
 
     const String content = String(stripOuterQuotes(text).c_str());
 
-    if (context().lcdTerminal != nullptr && context().lcdTerminal->isReady()) {
-        context().lcdTerminal->writeText(content, ST77XX_BLACK);
-        printLine("[dongle] texto escrito no terminal LCD");
+    if (context().lcdDashboard != nullptr && context().lcdDashboard->isReady()) {
+        context().lcdDashboard->showMessage(content, ST77XX_BLACK);
+        printLine("[dongle] texto escrito no painel LCD");
         return RESULT_OK;
     }
 
@@ -138,9 +138,9 @@ uint8_t wrapper_dongle_lcd_clear() {
         return failWithCode(AppError::Code::PERIPHERALS_NOT_READY, "perifericos indisponiveis para comando lcd_clear");
     }
 
-    if (context().lcdTerminal != nullptr && context().lcdTerminal->isReady()) {
-        context().lcdTerminal->clear();
-        printLine("[dongle] terminal LCD limpo");
+    if (context().lcdDashboard != nullptr && context().lcdDashboard->isReady()) {
+        context().lcdDashboard->clear();
+        printLine("[dongle] painel LCD limpo");
         return RESULT_OK;
     }
 
@@ -174,8 +174,8 @@ uint8_t wrapper_dongle_lcd_reinit() {
         return failWithCode(AppError::Code::LCD_REINIT_FAILED, "falha ao reinicializar LCD");
     }
 
-    if (context().lcdTerminal != nullptr) {
-        context().lcdTerminal->begin(*context().peripherals);
+    if (context().lcdDashboard != nullptr) {
+        context().lcdDashboard->begin(*context().peripherals);
     }
 
     printLine("[dongle] LCD reinicializado");
@@ -190,8 +190,8 @@ uint8_t wrapper_dongle_lcd_rot(int32_t rotation) {
     const int32_t normalized = ((rotation % 4) + 4) % 4;
     context().peripherals->setLcdRotation(static_cast<uint8_t>(normalized));
 
-    if (context().lcdTerminal != nullptr) {
-        context().lcdTerminal->begin(*context().peripherals);
+    if (context().lcdDashboard != nullptr) {
+        context().lcdDashboard->begin(*context().peripherals);
     }
 
     char line[80] = {0};

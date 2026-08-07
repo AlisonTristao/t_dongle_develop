@@ -34,6 +34,17 @@ void AppRuntime::espNowRxDbWorkerTask(void*) {
     vTaskDelete(nullptr);
 }
 
+void AppRuntime::espNowHeartbeatWorkerTask(void*) {
+    // Blocking send-with-status lives here, off the main loop, so a slow/absent
+    // peer never stalls the shell. See HEARTBEAT_INTERVAL_MS in EspNowConfig.h.
+    const TickType_t periodTicks = pdMS_TO_TICKS(HEARTBEAT_INTERVAL_MS);
+
+    while (true) {
+        EspNowConfig::heartbeatTick();
+        vTaskDelay(periodTicks);
+    }
+}
+
 void AppRuntime::restoreShellHistoryFromDatabase() {
     if (!databaseStore_.isReady()) {
         return;
@@ -107,6 +118,23 @@ void AppRuntime::startEspNowWorkers(bool asyncRxEnabled) {
     ShellOutput::printTagged(Serial, "espnow", rxLine);
 }
 
+void AppRuntime::startHeartbeatWorker() {
+    const BaseType_t workerCore = selectEspNowWorkerCore();
+    const BaseType_t heartbeatTaskOk = xTaskCreatePinnedToCore(
+        espNowHeartbeatWorkerTask,
+        "espnow_heartbeat",
+        4096,
+        nullptr,
+        1,
+        &espNowHeartbeatTaskHandle_,
+        workerCore
+    );
+
+    if (heartbeatTaskOk != pdPASS) {
+        ShellOutput::printTagged(Serial, "espnow", "heartbeat task create failed");
+    }
+}
+
 void AppRuntime::processAsyncWarnings(bool& needPromptRefresh) {
     (void) needPromptRefresh;
 }
@@ -122,6 +150,7 @@ void AppRuntime::flushPendingEspNowOutput(bool& needPromptRefresh) {
         char line[64] = {0};
         std::snprintf(line, sizeof(line), "rx_dropped=%lu", static_cast<unsigned long>(dropped));
         ShellOutput::printTagged(Serial, "espnow", line);
+        lcdDashboard_.notifyDropped(dropped);
         needPromptRefresh = true;
     }
 
@@ -130,6 +159,7 @@ void AppRuntime::flushPendingEspNowOutput(bool& needPromptRefresh) {
         char line[72] = {0};
         std::snprintf(line, sizeof(line), "rx_display_overwritten=%lu", static_cast<unsigned long>(overwrittenDisplay));
         ShellOutput::printTagged(Serial, "espnow", line);
+        lcdDashboard_.notifyDropped(overwrittenDisplay);
         needPromptRefresh = true;
     }
 }
@@ -165,7 +195,7 @@ void AppRuntime::begin() {
     ShellOutput::printTagged(Serial, "startup", String("mac=") + WiFi.macAddress());
     StartupConfig::promptAndSetDateTime(Serial);
 
-    EspNowConfig::attachCallbacks(espNowManager_, Serial, &databaseStore_, &lcdTerminal_);
+    EspNowConfig::attachCallbacks(espNowManager_, Serial, &databaseStore_, &lcdDashboard_);
 
     const bool asyncRxEnabled = EspNowConfig::enableAsyncRx(RX_ASYNC_QUEUE_DEPTH);
     if (!asyncRxEnabled) {
@@ -184,12 +214,13 @@ void AppRuntime::begin() {
     }
 
     startEspNowWorkers(asyncRxEnabled);
+    startHeartbeatWorker();
 
     const bool shellBound = ShellConfig::bind({
         &tinyShell_,
         &espNowManager_,
         &donglePeripherals_,
-        &lcdTerminal_,
+        &lcdDashboard_,
         &databaseStore_,
         &Serial
     });
@@ -236,6 +267,7 @@ void AppRuntime::tick() {
 
     processAsyncWarnings(asyncOutputOccurred);
     flushPendingEspNowOutput(asyncOutputOccurred);
+    lcdDashboard_.tick();
 
     handleShellInput();
     flushPendingEspNowOutput(asyncOutputOccurred);

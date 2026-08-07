@@ -209,6 +209,10 @@ uint8_t wrapper_espnow_send_to(int32_t deviceNumber, string command) {
             context().database->logOutgoingEspNow(broadcastMac, outgoing, queued);
         }
 
+        if (context().lcdDashboard != nullptr) {
+            context().lcdDashboard->notifyTx(queued);
+        }
+
         if (!queued) {
             return failWithCode(AppError::Code::BROADCAST_QUEUE_FAILED, "000 status=false");
         }
@@ -225,6 +229,10 @@ uint8_t wrapper_espnow_send_to(int32_t deviceNumber, string command) {
     EspNowManager::deviceInfo target = {};
     if (context().database != nullptr && context().database->isReady() && context().espNow->deviceAt(index, target)) {
         context().database->logOutgoingEspNow(target.mac, outgoing, gotStatus && delivered);
+    }
+
+    if (context().lcdDashboard != nullptr) {
+        context().lcdDashboard->notifyTx(gotStatus && delivered);
     }
 
     if (!gotStatus) {
@@ -273,6 +281,10 @@ uint8_t wrapper_espnow_send_all(string command) {
             context().database->logOutgoingEspNow(broadcastMac, outgoing, queued);
         }
 
+        if (context().lcdDashboard != nullptr) {
+            context().lcdDashboard->notifyTx(queued);
+        }
+
         if (!queued) {
             return failWithCode(AppError::Code::BROADCAST_QUEUE_FAILED, "status=false (nenhum peer e broadcast falhou)");
         }
@@ -291,6 +303,10 @@ uint8_t wrapper_espnow_send_all(string command) {
         static_cast<unsigned>(triedCount)
     );
     printLine(line);
+
+    if (context().lcdDashboard != nullptr) {
+        context().lcdDashboard->notifyTx(deliveredCount == triedCount);
+    }
 
     if (deliveredCount != triedCount) {
         return failWithCode(AppError::Code::SEND_PARTIAL_DELIVERY, "entrega parcial no envio para todos os peers");
