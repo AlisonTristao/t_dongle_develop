@@ -1,5 +1,6 @@
 #include "EspNowConfig.h"
 #include "LcdDashboard.h"
+#include "ShellConfig.h"
 #include "ShellOutput.h"
 
 #include <cstdio>
@@ -405,6 +406,40 @@ bool createDbLogQueue() {
 #endif
 }
 
+// Runs a command received from a trusted peer (CMDO type) and sends the
+// output back to that same peer. Only peers already in our registry are
+// trusted to trigger execution; unknown MACs are left alone here (the
+// message is still shown/logged normally like any other RX text).
+void handleRemoteCommand(const uint8_t mac[6], const char* payloadText) {
+    if (g_manager == nullptr || mac == nullptr || payloadText == nullptr || payloadText[0] == '\0') {
+        return;
+    }
+
+    if (g_manager->deviceIndexByMac(mac) < 0) {
+        return;
+    }
+
+    std::string fullOutput;
+    ShellConfig::runLine(std::string(payloadText), "espnow", &fullOutput);
+
+    EspNowManager::message reply = {};
+    reply.timer = millis();
+    reply.type = logType::INFO; // not CMDO: avoids a reply-triggers-reply loop with peers running the same logic
+    reply.packet_number = 0;
+    reply.total_packets = 1;
+    reply.checksum = 0;
+
+    const size_t maxLen = EspNowManager::MESSAGE_TEXT_SIZE;
+    const size_t copyLen = (fullOutput.size() < maxLen) ? fullOutput.size() : maxLen;
+    if (copyLen > 0) {
+        std::memcpy(reply.content.text, fullOutput.c_str(), copyLen);
+    }
+    reply.content.text[copyLen] = '\0';
+    reply.content.size = copyLen;
+
+    g_manager->sendToMac(mac, reply);
+}
+
 void processRxMessageInternal(const uint8_t mac[6], const EspNowManager::message& incomingData) {
     if (g_lcdDashboard != nullptr) {
         g_lcdDashboard->notifyRx();
@@ -431,6 +466,12 @@ void processRxMessageInternal(const uint8_t mac[6], const EspNowManager::message
     String robotState;
     if (g_lcdDashboard != nullptr && tryExtractRobotState(payload, robotState)) {
         g_lcdDashboard->notifyRobotState(robotState);
+    }
+
+    // Single-packet only: a remote command line is short and always fits in
+    // one ESP-NOW packet, so this deliberately skips fragment reassembly.
+    if (incomingData.type == logType::CMDO && incomingData.total_packets <= 1) {
+        handleRemoteCommand(mac, payload);
     }
 
     if (g_rxAssemblyActive && g_rxAssemblyHasMac && mac != nullptr && !sameMacAddress(g_rxAssemblyMac, mac)) {

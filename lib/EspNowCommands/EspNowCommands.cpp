@@ -184,7 +184,9 @@ uint8_t wrapper_espnow_send_to(int32_t deviceNumber, string command) {
 
     EspNowManager::message outgoing = {};
     outgoing.timer = millis();
-    outgoing.type = EspNowManager::logType::INFO;
+    // CMDO tells a registered receiving peer "run this as a shell command and
+    // reply with the output" (see EspNowConfig::processRxMessageInternal).
+    outgoing.type = EspNowManager::logType::CMDO;
     outgoing.packet_number = 0;
     outgoing.total_packets = 1;
     outgoing.checksum = 0;
@@ -254,7 +256,9 @@ uint8_t wrapper_espnow_send_all(string command) {
 
     EspNowManager::message outgoing = {};
     outgoing.timer = millis();
-    outgoing.type = EspNowManager::logType::INFO;
+    // CMDO tells a registered receiving peer "run this as a shell command and
+    // reply with the output" (see EspNowConfig::processRxMessageInternal).
+    outgoing.type = EspNowManager::logType::CMDO;
     outgoing.packet_number = 0;
     outgoing.total_packets = 1;
     outgoing.checksum = 0;

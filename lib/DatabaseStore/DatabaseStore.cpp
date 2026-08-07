@@ -971,6 +971,237 @@ bool DatabaseStore::executeSql(const String& sql, String& outText) {
     return queryToText(trimmed, 80, outText);
 }
 
+bool DatabaseStore::countRows(const String& tableName, int32_t& outCount) {
+    if (!ready_) {
+        return false;
+    }
+
+    if (!isSafeIdentifier(tableName)) {
+        return false;
+    }
+
+    String sql = "SELECT COUNT(*) FROM ";
+    sql += tableName;
+    sql += ";";
+
+    return querySingleInt(sql, outCount);
+}
+
+bool DatabaseStore::deleteRows(const String& tableName, const String& whereClause, int32_t& outDeletedCount) {
+    outDeletedCount = 0;
+
+    if (!ready_ || db_ == nullptr) {
+        return false;
+    }
+
+    if (!isSafeIdentifier(tableName) || whereClause.isEmpty()) {
+        return false;
+    }
+
+    String sql = "DELETE FROM ";
+    sql += tableName;
+    sql += " WHERE ";
+    sql += whereClause;
+    sql += ";";
+
+    if (!lockDb()) {
+        return false;
+    }
+
+    char* errorMessage = nullptr;
+    const int rc = sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &errorMessage);
+    if (rc != SQLITE_OK) {
+        if (errorMessage != nullptr) {
+            logLine(String("[database] SQL error: ") + errorMessage);
+            sqlite3_free(errorMessage);
+        }
+        unlockDb();
+        return false;
+    }
+
+    outDeletedCount = static_cast<int32_t>(sqlite3_changes(db_));
+    unlockDb();
+    return true;
+}
+
+bool DatabaseStore::vacuum(String& outText) {
+    if (!ready_ || db_ == nullptr) {
+        outText = "[database] nao inicializado";
+        return false;
+    }
+
+    uint64_t beforeBytes = 0;
+    File beforeFile = SD_MMC.open(kFsDatabasePath, FILE_READ);
+    if (beforeFile) {
+        beforeBytes = static_cast<uint64_t>(beforeFile.size());
+        beforeFile.close();
+    }
+
+    if (!executeNoResult("VACUUM;")) {
+        outText = "[database] falha ao executar VACUUM";
+        return false;
+    }
+
+    uint64_t afterBytes = 0;
+    File afterFile = SD_MMC.open(kFsDatabasePath, FILE_READ);
+    if (afterFile) {
+        afterBytes = static_cast<uint64_t>(afterFile.size());
+        afterFile.close();
+    }
+
+    char line[128] = {0};
+    std::snprintf(
+        line,
+        sizeof(line),
+        "[database] VACUUM concluido: %lluB -> %lluB",
+        static_cast<unsigned long long>(beforeBytes),
+        static_cast<unsigned long long>(afterBytes)
+    );
+    outText = line;
+    return true;
+}
+
+bool DatabaseStore::exportTableToCsv(const String& tableName, String& outText) {
+    if (!ready_ || db_ == nullptr) {
+        outText = "[database] nao inicializado";
+        return false;
+    }
+
+    if (!isSafeIdentifier(tableName)) {
+        outText = "[database] nome de tabela invalido";
+        return false;
+    }
+
+    if (!lockDb(2000)) {
+        outText = "[database] lock indisponivel para exportar";
+        return false;
+    }
+
+    String selectSql = "SELECT * FROM ";
+    selectSql += tableName;
+    selectSql += ";";
+
+    sqlite3_stmt* stmt = nullptr;
+    const int prepareRc = sqlite3_prepare_v2(db_, selectSql.c_str(), -1, &stmt, nullptr);
+    if (prepareRc != SQLITE_OK || stmt == nullptr) {
+        outText = String("[database] SQL error: ") + sqlite3_errmsg(db_);
+        unlockDb();
+        return false;
+    }
+
+    File exportDir = SD_MMC.open("/database/exports");
+    const bool hasExportDir = exportDir && exportDir.isDirectory();
+    if (exportDir) {
+        exportDir.close();
+    }
+    if (!hasExportDir && !SD_MMC.mkdir("/database/exports")) {
+        sqlite3_finalize(stmt);
+        unlockDb();
+        outText = "[database] falha ao criar pasta de exportacao";
+        return false;
+    }
+
+    const String csvPath = String("/database/exports/") + tableName + ".csv";
+    File csvFile = SD_MMC.open(csvPath, FILE_WRITE);
+    if (!csvFile) {
+        sqlite3_finalize(stmt);
+        unlockDb();
+        outText = "[database] falha ao criar arquivo CSV";
+        return false;
+    }
+
+    const int columnCount = sqlite3_column_count(stmt);
+    for (int i = 0; i < columnCount; ++i) {
+        if (i > 0) {
+            csvFile.print(",");
+        }
+        csvFile.print(sqlite3_column_name(stmt, i));
+    }
+    csvFile.print("\n");
+
+    size_t rowCount = 0;
+    int stepRc = SQLITE_ROW;
+    while ((stepRc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        for (int i = 0; i < columnCount; ++i) {
+            if (i > 0) {
+                csvFile.print(",");
+            }
+
+            const unsigned char* text = sqlite3_column_text(stmt, i);
+            if (text == nullptr) {
+                continue;
+            }
+
+            String value = reinterpret_cast<const char*>(text);
+            value.replace("\"", "\"\"");
+            if (value.indexOf(',') >= 0 || value.indexOf('"') >= 0 || value.indexOf('\n') >= 0) {
+                csvFile.print("\"");
+                csvFile.print(value);
+                csvFile.print("\"");
+            } else {
+                csvFile.print(value);
+            }
+        }
+        csvFile.print("\n");
+        ++rowCount;
+    }
+
+    csvFile.close();
+    sqlite3_finalize(stmt);
+    unlockDb();
+
+    if (stepRc != SQLITE_DONE) {
+        outText = String("[database] SQL error durante exportacao: ") + sqlite3_errmsg(db_);
+        return false;
+    }
+
+    char line[160] = {0};
+    std::snprintf(
+        line,
+        sizeof(line),
+        "[database] exportado %s: %u linha(s) -> %s",
+        tableName.c_str(),
+        static_cast<unsigned>(rowCount),
+        csvPath.c_str()
+    );
+    outText = line;
+    return true;
+}
+
+bool DatabaseStore::clearLogs(String& outText) {
+    if (!ready_ || db_ == nullptr) {
+        outText = "[database] nao inicializado";
+        return false;
+    }
+
+    int32_t commandRows = 0;
+    int32_t outgoingRows = 0;
+    querySingleInt("SELECT COUNT(*) FROM command_log;", commandRows);
+    querySingleInt("SELECT COUNT(*) FROM espnow_outgoing_log;", outgoingRows);
+
+    const bool ok = executeNoResult(
+        "DELETE FROM command_log_output;"
+        "DELETE FROM command_log;"
+        "DELETE FROM espnow_outgoing_log;"
+    );
+
+    if (!ok) {
+        outText = "[database] falha ao limpar logs";
+        return false;
+    }
+
+    char line[128] = {0};
+    std::snprintf(
+        line,
+        sizeof(line),
+        "[database] logs limpos: %ld comando(s) e %ld envio(s) removidos",
+        static_cast<long>(commandRows),
+        static_cast<long>(outgoingRows)
+    );
+    outText = line;
+    return true;
+}
+
 bool DatabaseStore::beginTransaction() {
     if (!ready_) {
         return false;

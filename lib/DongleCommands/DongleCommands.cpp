@@ -3,6 +3,9 @@
 #include "ShellCommandSupport.h"
 #include "error_codes.h"
 
+#include <Esp.h>
+#include <WiFi.h>
+
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -20,9 +23,32 @@ using ShellCommandSupport::printLine;
 using ShellCommandSupport::stripOuterQuotes;
 using ShellCommandSupport::warnWithCode;
 
+// Destructive commands require this exact word as their last argument.
+// Guards against typos/accidental Enter, not a real access-control boundary.
+constexpr const char* kConfirmToken = "CONFIRMAR";
+
+bool isConfirmed(const string& token) {
+    return stripOuterQuotes(token) == kConfirmToken;
+}
+
+// Normalizes a user-supplied path into an absolute SD path (leading '/').
+string normalizeSdPath(const string& rawPath) {
+    string cleanPath = stripOuterQuotes(rawPath);
+    if (cleanPath.empty()) {
+        cleanPath = "/";
+    } else if (cleanPath.front() != '/') {
+        cleanPath = "/" + cleanPath;
+    }
+    return cleanPath;
+}
+
 uint8_t wrapper_dongle_run(string command) {
+    if (context().shell == nullptr) {
+        return failWithCode(AppError::Code::SHELL_NOT_READY, "shell nao configurada para executar comando local");
+    }
+
     const string localCommand = stripOuterQuotes(command);
-    printLine("[dongle] comando local: " + localCommand);
+    context().shell->run_command_line(localCommand);
     return RESULT_OK;
 }
 
@@ -307,7 +333,12 @@ uint8_t wrapper_dongle_sd_status() {
     return RESULT_OK;
 }
 
-uint8_t wrapper_dongle_sd_wipe() {
+uint8_t wrapper_dongle_sd_wipe(string confirm = "") {
+    if (!isConfirmed(confirm)) {
+        printLine(string("[dongle] isso apaga TUDO do cartao SD, banco de dados incluso. Para confirmar: dongle -sd_wipe ") + kConfirmToken);
+        return RESULT_OK;
+    }
+
     if (context().peripherals == nullptr) {
         return failWithCode(AppError::Code::PERIPHERALS_NOT_READY, "perifericos indisponiveis para comando sd_wipe");
     }
@@ -350,6 +381,253 @@ uint8_t wrapper_dongle_sd_wipe() {
     return RESULT_OK;
 }
 
+uint8_t wrapper_dongle_sd_ls(string path = "/") {
+    if (context().peripherals == nullptr || !context().peripherals->isSdReady()) {
+        return failWithCode(AppError::Code::SD_NOT_READY, "SD nao inicializado");
+    }
+
+    const string cleanPath = normalizeSdPath(path);
+    File dir = SD_MMC.open(cleanPath.c_str());
+    if (!dir || !dir.isDirectory()) {
+        if (dir) {
+            dir.close();
+        }
+        return failWithCode(AppError::Code::SD_PATH_NOT_FOUND, "diretorio nao encontrado: " + cleanPath);
+    }
+
+    printLine("[sd] listando " + cleanPath);
+    size_t count = 0;
+    File entry = dir.openNextFile();
+    while (entry) {
+        char line[160] = {0};
+        std::snprintf(
+            line,
+            sizeof(line),
+            "%s %s (%lluB)",
+            entry.isDirectory() ? "[dir]" : "[file]",
+            entry.name(),
+            static_cast<unsigned long long>(entry.isDirectory() ? 0ULL : entry.size())
+        );
+        printLine(line);
+        ++count;
+        entry.close();
+        entry = dir.openNextFile();
+    }
+    dir.close();
+
+    if (count == 0) {
+        printLine("[sd] (vazio)");
+    }
+    return RESULT_OK;
+}
+
+uint8_t wrapper_dongle_sd_cat(string path) {
+    if (context().peripherals == nullptr || !context().peripherals->isSdReady()) {
+        return failWithCode(AppError::Code::SD_NOT_READY, "SD nao inicializado");
+    }
+
+    const string cleanPath = normalizeSdPath(path);
+    File file = SD_MMC.open(cleanPath.c_str(), FILE_READ);
+    if (!file || file.isDirectory()) {
+        if (file) {
+            file.close();
+        }
+        return failWithCode(AppError::Code::SD_PATH_NOT_FOUND, "arquivo nao encontrado: " + cleanPath);
+    }
+
+    char header[96] = {0};
+    std::snprintf(header, sizeof(header), "[sd] %s (%lluB)", cleanPath.c_str(), static_cast<unsigned long long>(file.size()));
+    printLine(header);
+
+    constexpr size_t kMaxPrintBytes = 4096; // safety cap so a huge file doesn't flood the terminal
+    size_t printed = 0;
+    bool truncated = false;
+    String lineBuffer;
+    while (file.available()) {
+        if (printed >= kMaxPrintBytes) {
+            truncated = true;
+            break;
+        }
+
+        const char ch = static_cast<char>(file.read());
+        ++printed;
+        if (ch == '\n') {
+            printLine(std::string(lineBuffer.c_str()));
+            lineBuffer = "";
+        } else if (ch != '\r') {
+            lineBuffer += ch;
+        }
+    }
+    file.close();
+
+    if (lineBuffer.length() > 0) {
+        printLine(std::string(lineBuffer.c_str()));
+    }
+    if (truncated) {
+        printLine("[sd] ... truncado (mostrando so os primeiros 4KB) ...");
+    }
+    return RESULT_OK;
+}
+
+uint8_t wrapper_dongle_sd_rm(string path) {
+    if (context().peripherals == nullptr || !context().peripherals->isSdReady()) {
+        return failWithCode(AppError::Code::SD_NOT_READY, "SD nao inicializado");
+    }
+
+    const string cleanPath = normalizeSdPath(path);
+    if (!SD_MMC.exists(cleanPath.c_str())) {
+        return failWithCode(AppError::Code::SD_PATH_NOT_FOUND, "arquivo nao encontrado: " + cleanPath);
+    }
+
+    File check = SD_MMC.open(cleanPath.c_str());
+    const bool isDirectory = check && check.isDirectory();
+    if (check) {
+        check.close();
+    }
+    if (isDirectory) {
+        return failWithCode(AppError::Code::SD_PATH_IS_DIRECTORY, "sd_rm so remove arquivos; use dongle -sd_wipe para limpar tudo");
+    }
+
+    if (!SD_MMC.remove(cleanPath.c_str())) {
+        return failWithCode(AppError::Code::SD_FILE_REMOVE_FAILED, "falha ao remover " + cleanPath);
+    }
+
+    printLine("[sd] removido: " + cleanPath);
+    return RESULT_OK;
+}
+
+uint8_t wrapper_dongle_sd_mkdir(string path) {
+    if (context().peripherals == nullptr || !context().peripherals->isSdReady()) {
+        return failWithCode(AppError::Code::SD_NOT_READY, "SD nao inicializado");
+    }
+
+    const string cleanPath = normalizeSdPath(path);
+    if (!SD_MMC.mkdir(cleanPath.c_str())) {
+        return failWithCode(AppError::Code::SD_MKDIR_FAILED, "falha ao criar diretorio " + cleanPath);
+    }
+
+    printLine("[sd] diretorio criado: " + cleanPath);
+    return RESULT_OK;
+}
+
+uint8_t writeToSdFile(const string& pathArg, const string& textArg, bool append) {
+    if (context().peripherals == nullptr || !context().peripherals->isSdReady()) {
+        return failWithCode(AppError::Code::SD_NOT_READY, "SD nao inicializado");
+    }
+
+    const string cleanPath = normalizeSdPath(pathArg);
+    const string text = stripOuterQuotes(textArg);
+
+    File file = SD_MMC.open(cleanPath.c_str(), append ? FILE_APPEND : FILE_WRITE);
+    if (!file) {
+        return failWithCode(AppError::Code::SD_FILE_WRITE_FAILED, "falha ao abrir " + cleanPath + " para escrita");
+    }
+
+    file.print(text.c_str());
+    file.print("\n");
+    file.close();
+
+    printLine(string("[sd] ") + (append ? "anexado em " : "escrito em ") + cleanPath);
+    return RESULT_OK;
+}
+
+uint8_t wrapper_dongle_sd_write(string path, string text) {
+    return writeToSdFile(path, text, false);
+}
+
+uint8_t wrapper_dongle_sd_append(string path, string text) {
+    return writeToSdFile(path, text, true);
+}
+
+uint8_t wrapper_dongle_history(int32_t limit = 20) {
+    if (context().database == nullptr) {
+        return failWithCode(AppError::Code::DATABASE_NOT_READY, "database indisponivel para comando history");
+    }
+
+    const size_t boundedLimit = (limit > 0) ? static_cast<size_t>(limit) : 20U;
+    String output;
+    const bool ok = context().database->readRecentCommands(boundedLimit, output);
+    printLine(output.length() > 0 ? std::string(output.c_str()) : std::string("(sem historico)"));
+    if (!ok) {
+        return failWithCode(AppError::Code::DATABASE_QUERY_FAILED, "falha ao ler historico");
+    }
+
+    return RESULT_OK;
+}
+
+uint8_t wrapper_dongle_run_script(string path) {
+    if (context().peripherals == nullptr || !context().peripherals->isSdReady()) {
+        return failWithCode(AppError::Code::SD_NOT_READY, "SD nao inicializado");
+    }
+
+    if (context().shell == nullptr) {
+        return failWithCode(AppError::Code::SHELL_NOT_READY, "shell nao configurada para rodar script");
+    }
+
+    const string cleanPath = normalizeSdPath(path);
+    File file = SD_MMC.open(cleanPath.c_str(), FILE_READ);
+    if (!file || file.isDirectory()) {
+        if (file) {
+            file.close();
+        }
+        return failWithCode(AppError::Code::SD_PATH_NOT_FOUND, "script nao encontrado: " + cleanPath);
+    }
+
+    printLine("[dongle] executando script: " + cleanPath);
+
+    size_t executedCount = 0;
+    size_t skippedCount = 0;
+    while (file.available()) {
+        String rawLine = file.readStringUntil('\n');
+        rawLine.trim();
+
+        if (rawLine.length() == 0 || rawLine.startsWith("#")) {
+            ++skippedCount;
+            continue;
+        }
+
+        context().shell->run_command_line(std::string(rawLine.c_str()));
+        ++executedCount;
+    }
+    file.close();
+
+    char summary[96] = {0};
+    std::snprintf(
+        summary,
+        sizeof(summary),
+        "[dongle] script concluido: %u comando(s), %u linha(s) ignorada(s)",
+        static_cast<unsigned>(executedCount),
+        static_cast<unsigned>(skippedCount)
+    );
+    printLine(summary);
+    return RESULT_OK;
+}
+
+uint8_t wrapper_dongle_reboot() {
+    printLine("[dongle] reiniciando...");
+    delay(200); // give the serial time to flush the message before reset
+    ESP.restart();
+    return RESULT_OK; // unreachable
+}
+
+uint8_t wrapper_dongle_info() {
+    char line[220] = {0};
+    std::snprintf(
+        line,
+        sizeof(line),
+        "[dongle] chip=%s rev=%d cores=%d heap_livre=%uB flash=%uMB uptime=%lus mac=%s",
+        ESP.getChipModel(),
+        static_cast<int>(ESP.getChipRevision()),
+        static_cast<int>(ESP.getChipCores()),
+        static_cast<unsigned>(ESP.getFreeHeap()),
+        static_cast<unsigned>(ESP.getFlashChipSize() / (1024UL * 1024UL)),
+        static_cast<unsigned long>(millis() / 1000UL),
+        WiFi.macAddress().c_str()
+    );
+    printLine(line);
+    return RESULT_OK;
+}
+
 } // namespace
 
 namespace DongleCommands {
@@ -364,7 +642,7 @@ uint8_t registerAll() {
     context().shell->add(wrapper_dongle_ping, "ping", "quick local test", "dongle");
     context().shell->add(wrapper_dongle_clock, "clock", "show current RTC time", "dongle");
     context().shell->add(wrapper_dongle_set_clock, "set_clock", "set RTC: <\"YYYY-MM-DD HH:MM:SS\">", "dongle");
-    context().shell->add(wrapper_dongle_run, "run", "execute local command (placeholder)", "dongle");
+    context().shell->add(wrapper_dongle_run, "run", "execute a command locally: <command>", "dongle");
     context().shell->add(wrapper_dongle_led, "led", "set RGB LED: <r>, <g>, <b>", "dongle");
     context().shell->add(wrapper_dongle_led_off, "led_off", "turn off LED", "dongle");
     context().shell->add(wrapper_dongle_lcd, "lcd", "write text to LCD terminal: <text>", "dongle");
@@ -376,7 +654,17 @@ uint8_t registerAll() {
     context().shell->add(wrapper_dongle_lcd_reinit, "lcd_reinit", "reinitialize LCD", "dongle");
     context().shell->add(wrapper_dongle_sd_init, "sd_init", "initialize SD", "dongle");
     context().shell->add(wrapper_dongle_sd_status, "sd_status", "show SD status", "dongle");
-    context().shell->add(wrapper_dongle_sd_wipe, "sd_wipe", "wipe all SD content", "dongle");
+    context().shell->add(wrapper_dongle_sd_wipe, "sd_wipe", "wipe all SD content: CONFIRMAR", "dongle");
+    context().shell->add(wrapper_dongle_sd_ls, "sd_ls", "list files/dirs: <path>", "dongle");
+    context().shell->add(wrapper_dongle_sd_cat, "sd_cat", "print a text file: <path>", "dongle");
+    context().shell->add(wrapper_dongle_sd_rm, "sd_rm", "remove one file: <path>", "dongle");
+    context().shell->add(wrapper_dongle_sd_mkdir, "sd_mkdir", "create a directory: <path>", "dongle");
+    context().shell->add(wrapper_dongle_sd_write, "sd_write", "overwrite a file: <path>, <text>", "dongle");
+    context().shell->add(wrapper_dongle_sd_append, "sd_append", "append to a file: <path>, <text>", "dongle");
+    context().shell->add(wrapper_dongle_history, "history", "reprint recent serial commands: <limit>", "dongle");
+    context().shell->add(wrapper_dongle_run_script, "run_script", "run one command per line from a SD file: <path>", "dongle");
+    context().shell->add(wrapper_dongle_reboot, "reboot", "restart the ESP32", "dongle");
+    context().shell->add(wrapper_dongle_info, "info", "chip/heap/flash/uptime/mac summary", "dongle");
 
     return RESULT_OK;
 }

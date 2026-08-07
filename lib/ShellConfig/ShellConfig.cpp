@@ -9,10 +9,45 @@
 #include "error_codes.h"
 
 #include <cstdio>
+#include <vector>
 
 namespace {
 
 using std::string;
+
+// Splits on ';' at the top level only (not inside "..." or '...'), so a
+// quoted argument containing ';' isn't torn apart, e.g.
+// dongle -lcd "a; b"; dongle -ping
+std::vector<string> splitTopLevelSemicolons(const string& line) {
+    std::vector<string> parts;
+    string current;
+    bool inDoubleQuote = false;
+    bool inSingleQuote = false;
+
+    for (const char ch : line) {
+        if (ch == '"' && !inSingleQuote) {
+            inDoubleQuote = !inDoubleQuote;
+        } else if (ch == '\'' && !inDoubleQuote) {
+            inSingleQuote = !inSingleQuote;
+        }
+
+        if (ch == ';' && !inDoubleQuote && !inSingleQuote) {
+            parts.push_back(current);
+            current.clear();
+            continue;
+        }
+
+        current += ch;
+    }
+    parts.push_back(current);
+    return parts;
+}
+
+// Last command line handed to run_command_line, regardless of whether it got
+// persisted. Lets runLine() skip logging when the same command is repeated
+// back-to-back (e.g. re-sending the same espnow message), without affecting
+// whether the command actually runs.
+string g_lastCommandLine;
 
 // Fills in the default broadcast peer (000) when send_to is called with only a
 // message and no device number, e.g. "espnow -send_to \"dongle -run status\"".
@@ -94,7 +129,40 @@ uint8_t registerDefaultModules() {
     return RESULT_OK;
 }
 
-std::string runLine(const std::string& command) {
+std::string runLine(const std::string& command, const std::string& source, std::string* outFullText) {
+    const std::vector<std::string> segments = splitTopLevelSemicolons(command);
+    if (segments.size() > 1) {
+        std::string combinedOutput;
+        std::string combinedFullText;
+
+        for (const std::string& segment : segments) {
+            const std::string trimmedSegment = ShellCommandSupport::trimCopy(segment);
+            if (trimmedSegment.empty()) {
+                continue;
+            }
+
+            std::string segmentFullText;
+            const std::string segmentOutput = runLine(trimmedSegment, source, &segmentFullText);
+
+            if (!segmentOutput.empty()) {
+                if (!combinedOutput.empty()) {
+                    combinedOutput += "\n";
+                }
+                combinedOutput += segmentOutput;
+            }
+
+            if (!combinedFullText.empty()) {
+                combinedFullText += "\n";
+            }
+            combinedFullText += segmentFullText;
+        }
+
+        if (outFullText != nullptr) {
+            *outFullText = combinedFullText;
+        }
+        return combinedOutput;
+    }
+
     const ShellCommandSupport::Context& ctx = ShellCommandSupport::context();
     if (ctx.shell == nullptr) {
         char line[96] = {0};
@@ -105,10 +173,15 @@ std::string runLine(const std::string& command) {
             static_cast<unsigned>(AppError::value(AppError::Code::SHELL_NOT_READY)),
             AppError::name(AppError::Code::SHELL_NOT_READY)
         );
+        if (outFullText != nullptr) {
+            *outFullText = line;
+        }
         return line;
     }
 
     const std::string normalized = normalizeCommand(command);
+    const bool isRepeatOfLastCommand = (normalized == g_lastCommandLine);
+    g_lastCommandLine = normalized;
     ShellCommandSupport::resetBuffers();
 
     std::string output;
@@ -139,20 +212,23 @@ std::string runLine(const std::string& command) {
         output = ShellCommandSupport::shellResponseBuffer();
     }
 
-    if (!skipCommandPersistence && ctx.database != nullptr && ctx.database->isReady()) {
-        std::string persistedOutput = ShellCommandSupport::commandOutputBuffer();
-        if (!output.empty()) {
-            if (!persistedOutput.empty()) {
-                persistedOutput += "\n";
-            }
-            persistedOutput += output;
+    std::string combinedText = ShellCommandSupport::commandOutputBuffer();
+    if (!output.empty()) {
+        if (!combinedText.empty()) {
+            combinedText += "\n";
         }
+        combinedText += output;
+    }
+    if (combinedText.empty()) {
+        combinedText = "(sem saida textual)";
+    }
 
-        if (persistedOutput.empty()) {
-            persistedOutput = "(sem saida textual)";
-        }
+    if (outFullText != nullptr) {
+        *outFullText = combinedText;
+    }
 
-        if (!ctx.database->logCommandWithOutput(normalized.c_str(), persistedOutput.c_str(), "serial")) {
+    if (!skipCommandPersistence && !isRepeatOfLastCommand && ctx.database != nullptr && ctx.database->isReady()) {
+        if (!ctx.database->logCommandWithOutput(normalized.c_str(), combinedText.c_str(), source.c_str())) {
             ShellCommandSupport::warnWithCode(AppError::Code::DATABASE_COMMAND_LOG_FAILED, "falha ao persistir log de comando");
         }
     }

@@ -92,13 +92,21 @@ uint8_t wrapper_help_e() {
     printLine("Se LCD nao aparecer: dongle -lcd_bl 1 e depois dongle -lcd_reinit");
     printLine("Se LCD estiver invertido: dongle -lcd_rot 0..3");
     printLine("Exemplo local LED: dongle -led 255, 0, 0");
-    printLine("Exemplo espnow unicast: espnow -send_to 1, \"dongle -run status\"");
-    printLine("Exemplo espnow broadcast: espnow -send_to 000, \"dongle -run status\"");
+    printLine("Exemplo espnow unicast: espnow -send_to 1, \"dongle -clock\"");
+    printLine("Exemplo espnow broadcast: espnow -send_to 000, \"dongle -clock\"");
     printLine("Alias 000 no send_to = envia para todos os peers");
+    printLine("send_to/send_all executam o comando remotamente (so em peers ja cadastrados) e respondem com a saida");
     printLine("Editar peer: espnow -update 1, \"nome novo\", \"descricao nova\"");
+    printLine("Encadear comandos: dongle -ping; dongle -clock");
+    printLine("Comandos destrutivos pedem confirmacao: dongle -sd_wipe CONFIRMAR, database -rebuild CONFIRMAR, database -drop <tabela>, CONFIRMAR");
+    printLine("Cartao SD: dongle -sd_ls <path> | -sd_cat <arquivo> | -sd_write/-sd_append <arquivo>, <texto> | -sd_rm <arquivo> | -sd_mkdir <path>");
+    printLine("Script (1 comando por linha no SD): dongle -run_script <arquivo>");
+    printLine("Historico rapido de comandos: dongle -history 20");
+    printLine("Sistema: dongle -info | dongle -reboot");
     printLine("Banco sqlite no SD: database -status | database -tables | database -read peers, 20");
     printLine("Logs comando+saida: database -logs 20");
     printLine("Historico ESP-NOW RX/TX: database -espnow_history 30");
+    printLine("Manutencao do banco: database -count <tabela> | -delete <tabela>, <condicao> | -vacuum | -export <tabela> | -clear_logs CONFIRMAR");
 
     if (ShellAliases::count() > 0) {
         printLine("Alias de comando (primeira palavra digitada -> prefixo real):");

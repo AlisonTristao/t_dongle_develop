@@ -24,6 +24,11 @@ enum class Code : uint16_t {
     SD_WIPE_FAILED = 1109,
     SD_REINIT_FAILED = 1110,
     SD_DB_RECREATE_FAILED = 1111,
+    SD_PATH_NOT_FOUND = 1112,
+    SD_PATH_IS_DIRECTORY = 1113,
+    SD_FILE_WRITE_FAILED = 1114,
+    SD_FILE_REMOVE_FAILED = 1115,
+    SD_MKDIR_FAILED = 1116,
 
     // ESP-NOW
     ESPNOW_NOT_READY = 1201,
@@ -88,6 +93,16 @@ inline const char* name(Code code) {
         return "SD_REINIT_FAILED";
     case Code::SD_DB_RECREATE_FAILED:
         return "SD_DB_RECREATE_FAILED";
+    case Code::SD_PATH_NOT_FOUND:
+        return "SD_PATH_NOT_FOUND";
+    case Code::SD_PATH_IS_DIRECTORY:
+        return "SD_PATH_IS_DIRECTORY";
+    case Code::SD_FILE_WRITE_FAILED:
+        return "SD_FILE_WRITE_FAILED";
+    case Code::SD_FILE_REMOVE_FAILED:
+        return "SD_FILE_REMOVE_FAILED";
+    case Code::SD_MKDIR_FAILED:
+        return "SD_MKDIR_FAILED";
     case Code::ESPNOW_NOT_READY:
         return "ESPNOW_NOT_READY";
     case Code::INVALID_MAC_FORMAT:
