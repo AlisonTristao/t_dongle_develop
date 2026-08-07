@@ -45,6 +45,20 @@ void setContext(const Context& context);
 const Context& context();
 
 /**
+ * @brief Sets the identity ("serial", "espnow:<MAC>", ...) running the
+ * command currently being dispatched. Set by ShellConfig::runLine() before
+ * calling into TinyShell, so wrappers can look up who is calling them
+ * (see SudoManager) without threading an extra parameter through every
+ * wrapper signature.
+ */
+void setCurrentUserId(const std::string& userId);
+
+/**
+ * @brief Identity of whoever triggered the command currently running.
+ */
+const std::string& currentUserId();
+
+/**
  * @brief Clears the per-command output buffers. Called at the start/end of ShellConfig::runLine.
  */
 void resetBuffers();

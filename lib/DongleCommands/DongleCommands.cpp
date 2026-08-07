@@ -1,6 +1,7 @@
 #include "DongleCommands.h"
 
 #include "ShellCommandSupport.h"
+#include "SudoManager.h"
 #include "error_codes.h"
 
 #include <Esp.h>
@@ -17,19 +18,12 @@ namespace {
 using std::string;
 using ShellCommandSupport::clampByte;
 using ShellCommandSupport::context;
+using ShellCommandSupport::currentUserId;
 using ShellCommandSupport::failWithCode;
 using ShellCommandSupport::parseDateTimeText;
 using ShellCommandSupport::printLine;
 using ShellCommandSupport::stripOuterQuotes;
 using ShellCommandSupport::warnWithCode;
-
-// Destructive commands require this exact word as their last argument.
-// Guards against typos/accidental Enter, not a real access-control boundary.
-constexpr const char* kConfirmToken = "CONFIRMAR";
-
-bool isConfirmed(const string& token) {
-    return stripOuterQuotes(token) == kConfirmToken;
-}
 
 // Normalizes a user-supplied path into an absolute SD path (leading '/').
 string normalizeSdPath(const string& rawPath) {
@@ -333,10 +327,9 @@ uint8_t wrapper_dongle_sd_status() {
     return RESULT_OK;
 }
 
-uint8_t wrapper_dongle_sd_wipe(string confirm = "") {
-    if (!isConfirmed(confirm)) {
-        printLine(string("[dongle] isso apaga TUDO do cartao SD, banco de dados incluso. Para confirmar: dongle -sd_wipe ") + kConfirmToken);
-        return RESULT_OK;
+uint8_t wrapper_dongle_sd_wipe() {
+    if (!SudoManager::isElevated(currentUserId())) {
+        return failWithCode(AppError::Code::PERMISSION_DENIED, "isso apaga TUDO do cartao SD, banco de dados incluso. Rode antes: sudo -login <senha>");
     }
 
     if (context().peripherals == nullptr) {
@@ -654,7 +647,7 @@ uint8_t registerAll() {
     context().shell->add(wrapper_dongle_lcd_reinit, "lcd_reinit", "reinitialize LCD", "dongle");
     context().shell->add(wrapper_dongle_sd_init, "sd_init", "initialize SD", "dongle");
     context().shell->add(wrapper_dongle_sd_status, "sd_status", "show SD status", "dongle");
-    context().shell->add(wrapper_dongle_sd_wipe, "sd_wipe", "wipe all SD content: CONFIRMAR", "dongle");
+    context().shell->add(wrapper_dongle_sd_wipe, "sd_wipe", "wipe all SD content (requires sudo -login)", "dongle");
     context().shell->add(wrapper_dongle_sd_ls, "sd_ls", "list files/dirs: <path>", "dongle");
     context().shell->add(wrapper_dongle_sd_cat, "sd_cat", "print a text file: <path>", "dongle");
     context().shell->add(wrapper_dongle_sd_rm, "sd_rm", "remove one file: <path>", "dongle");

@@ -38,6 +38,7 @@ bool bind(const Context& context);
  * - dongle   -> DongleCommands
  * - espnow   -> EspNowCommands
  * - database -> DatabaseCommands
+ * - sudo     -> SudoCommands
  *
  * @return RESULT_OK on success.
  */
@@ -64,9 +65,13 @@ uint8_t registerDefaultModules();
  * command's real output (e.g. replying to a remote ESP-NOW command), since
  * the returned std::string is usually empty (most wrappers write directly to
  * serial/LCD instead of returning text, to avoid double-printing here).
+ * @param userId Identity running this command, e.g. "serial" or
+ * "espnow:AA:BB:CC:DD:EE:FF" (one identity per registered peer). Read by
+ * SudoManager-gated commands via ShellCommandSupport::currentUserId(). When
+ * empty (the default), falls back to source.
  * @return TinyShell response text (rarely non-empty; see outFullText).
  */
-std::string runLine(const std::string& command, const std::string& source = "serial", std::string* outFullText = nullptr);
+std::string runLine(const std::string& command, const std::string& source = "serial", std::string* outFullText = nullptr, const std::string& userId = "");
 
 } // namespace ShellConfig
 

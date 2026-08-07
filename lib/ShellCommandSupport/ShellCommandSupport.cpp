@@ -14,6 +14,7 @@ using std::string;
 ShellCommandSupport::Context g_ctx = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
 string g_commandOutputBuffer;
 string g_shellResponseBuffer;
+string g_currentUserId = "serial";
 constexpr uint8_t kFallbackBroadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 bool isTagToken(const string& token) {
@@ -156,6 +157,14 @@ void setContext(const Context& context) {
 
 const Context& context() {
     return g_ctx;
+}
+
+void setCurrentUserId(const string& userId) {
+    g_currentUserId = userId;
+}
+
+const string& currentUserId() {
+    return g_currentUserId;
 }
 
 void resetBuffers() {

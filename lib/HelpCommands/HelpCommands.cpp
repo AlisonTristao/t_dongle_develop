@@ -98,7 +98,9 @@ uint8_t wrapper_help_e() {
     printLine("send_to/send_all executam o comando remotamente (so em peers ja cadastrados) e respondem com a saida");
     printLine("Editar peer: espnow -update 1, \"nome novo\", \"descricao nova\"");
     printLine("Encadear comandos: dongle -ping; dongle -clock");
-    printLine("Comandos destrutivos pedem confirmacao: dongle -sd_wipe CONFIRMAR, database -rebuild CONFIRMAR, database -drop <tabela>, CONFIRMAR");
+    printLine("Permissao (sudo): sudo -login <senha> eleva o usuario atual (serial, ou o peer ESP-NOW que mandou o comando)");
+    printLine("Elevacao fica so na RAM e sempre reseta quando o dongle liga; sudo -logout revoga, sudo -status consulta");
+    printLine("Comandos destrutivos exigem sudo -login antes: dongle -sd_wipe, database -rebuild, database -drop <tabela>, database -clear_logs");
     printLine("Cartao SD: dongle -sd_ls <path> | -sd_cat <arquivo> | -sd_write/-sd_append <arquivo>, <texto> | -sd_rm <arquivo> | -sd_mkdir <path>");
     printLine("Script (1 comando por linha no SD): dongle -run_script <arquivo>");
     printLine("Historico rapido de comandos: dongle -history 20");
@@ -106,7 +108,7 @@ uint8_t wrapper_help_e() {
     printLine("Banco sqlite no SD: database -status | database -tables | database -read peers, 20");
     printLine("Logs comando+saida: database -logs 20");
     printLine("Historico ESP-NOW RX/TX: database -espnow_history 30");
-    printLine("Manutencao do banco: database -count <tabela> | -delete <tabela>, <condicao> | -vacuum | -export <tabela> | -clear_logs CONFIRMAR");
+    printLine("Manutencao do banco: database -count <tabela> | -delete <tabela>, <condicao> | -vacuum | -export <tabela> | -clear_logs (requer sudo)");
 
     if (ShellAliases::count() > 0) {
         printLine("Alias de comando (primeira palavra digitada -> prefixo real):");

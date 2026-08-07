@@ -6,6 +6,7 @@
 #include "HelpCommands.h"
 #include "ShellAliases.h"
 #include "ShellCommandSupport.h"
+#include "SudoCommands.h"
 #include "error_codes.h"
 
 #include <cstdio>
@@ -126,10 +127,15 @@ uint8_t registerDefaultModules() {
         return result;
     }
 
+    result = SudoCommands::registerAll();
+    if (result != RESULT_OK) {
+        return result;
+    }
+
     return RESULT_OK;
 }
 
-std::string runLine(const std::string& command, const std::string& source, std::string* outFullText) {
+std::string runLine(const std::string& command, const std::string& source, std::string* outFullText, const std::string& userId) {
     const std::vector<std::string> segments = splitTopLevelSemicolons(command);
     if (segments.size() > 1) {
         std::string combinedOutput;
@@ -142,7 +148,7 @@ std::string runLine(const std::string& command, const std::string& source, std::
             }
 
             std::string segmentFullText;
-            const std::string segmentOutput = runLine(trimmedSegment, source, &segmentFullText);
+            const std::string segmentOutput = runLine(trimmedSegment, source, &segmentFullText, userId);
 
             if (!segmentOutput.empty()) {
                 if (!combinedOutput.empty()) {
@@ -183,6 +189,7 @@ std::string runLine(const std::string& command, const std::string& source, std::
     const bool isRepeatOfLastCommand = (normalized == g_lastCommandLine);
     g_lastCommandLine = normalized;
     ShellCommandSupport::resetBuffers();
+    ShellCommandSupport::setCurrentUserId(userId.empty() ? source : userId);
 
     std::string output;
     const std::string databaseExecPrefix = "database -exec";

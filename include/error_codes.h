@@ -11,6 +11,8 @@ enum class Code : uint16_t {
     SHELL_NOT_READY = 1001,
     INVALID_CONTEXT = 1002,
     INVALID_ARGUMENT = 1003,
+    PERMISSION_DENIED = 1004,
+    SUDO_WRONG_PASSWORD = 1005,
 
     // Dongle / peripherals
     PERIPHERALS_NOT_READY = 1101,
@@ -71,6 +73,10 @@ inline const char* name(Code code) {
         return "INVALID_CONTEXT";
     case Code::INVALID_ARGUMENT:
         return "INVALID_ARGUMENT";
+    case Code::PERMISSION_DENIED:
+        return "PERMISSION_DENIED";
+    case Code::SUDO_WRONG_PASSWORD:
+        return "SUDO_WRONG_PASSWORD";
     case Code::PERIPHERALS_NOT_READY:
         return "PERIPHERALS_NOT_READY";
     case Code::RTC_READ_FAILED:

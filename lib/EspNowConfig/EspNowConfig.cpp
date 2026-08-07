@@ -419,8 +419,19 @@ void handleRemoteCommand(const uint8_t mac[6], const char* payloadText) {
         return;
     }
 
+    // Each peer is its own sudo identity, so elevation granted to one robot
+    // doesn't leak to another that happens to also send CMDO messages.
+    char macText[18] = {0};
+    std::snprintf(
+        macText,
+        sizeof(macText),
+        "%02X:%02X:%02X:%02X:%02X:%02X",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    );
+    const std::string userId = std::string("espnow:") + macText;
+
     std::string fullOutput;
-    ShellConfig::runLine(std::string(payloadText), "espnow", &fullOutput);
+    ShellConfig::runLine(std::string(payloadText), "espnow", &fullOutput, userId);
 
     EspNowManager::message reply = {};
     reply.timer = millis();

@@ -1,24 +1,18 @@
 #include "DatabaseCommands.h"
 
 #include "ShellCommandSupport.h"
+#include "SudoManager.h"
 #include "error_codes.h"
 
 namespace {
 
 using std::string;
 using ShellCommandSupport::context;
+using ShellCommandSupport::currentUserId;
 using ShellCommandSupport::failWithCode;
 using ShellCommandSupport::printLine;
 using ShellCommandSupport::stripOuterQuotes;
 using ShellCommandSupport::warnWithCode;
-
-// Destructive commands require this exact word as their last argument.
-// Guards against typos/accidental Enter, not a real access-control boundary.
-constexpr const char* kConfirmToken = "CONFIRMAR";
-
-bool isConfirmed(const string& token) {
-    return stripOuterQuotes(token) == kConfirmToken;
-}
 
 uint8_t wrapper_database_init() {
     if (context().database == nullptr) {
@@ -92,13 +86,12 @@ uint8_t wrapper_database_read(string tableName, int32_t limit = 20) {
     return RESULT_OK;
 }
 
-uint8_t wrapper_database_drop(string tableName, string confirm = "") {
-    if (!isConfirmed(confirm)) {
-        printLine(
-            "[database] isso apaga a tabela '" + stripOuterQuotes(tableName) +
-            "' permanentemente. Para confirmar: database -drop " + stripOuterQuotes(tableName) + ", " + kConfirmToken
+uint8_t wrapper_database_drop(string tableName) {
+    if (!SudoManager::isElevated(currentUserId())) {
+        return failWithCode(
+            AppError::Code::PERMISSION_DENIED,
+            "isso apaga a tabela '" + stripOuterQuotes(tableName) + "' permanentemente. Rode antes: sudo -login <senha>"
         );
-        return RESULT_OK;
     }
 
     if (context().database == nullptr) {
@@ -147,10 +140,9 @@ uint8_t wrapper_database_espnow_history(int32_t limit = 30) {
     return RESULT_OK;
 }
 
-uint8_t wrapper_database_rebuild(string confirm = "") {
-    if (!isConfirmed(confirm)) {
-        printLine(string("[database] isso apaga o banco inteiro e recria do zero. Para confirmar: database -rebuild ") + kConfirmToken);
-        return RESULT_OK;
+uint8_t wrapper_database_rebuild() {
+    if (!SudoManager::isElevated(currentUserId())) {
+        return failWithCode(AppError::Code::PERMISSION_DENIED, "isso apaga o banco inteiro e recria do zero. Rode antes: sudo -login <senha>");
     }
 
     if (context().database == nullptr) {
@@ -245,10 +237,9 @@ uint8_t wrapper_database_export(string tableName) {
     return RESULT_OK;
 }
 
-uint8_t wrapper_database_clear_logs(string confirm = "") {
-    if (!isConfirmed(confirm)) {
-        printLine(string("[database] isso apaga command_log, saidas e historico de envios ESP-NOW. Para confirmar: database -clear_logs ") + kConfirmToken);
-        return RESULT_OK;
+uint8_t wrapper_database_clear_logs() {
+    if (!SudoManager::isElevated(currentUserId())) {
+        return failWithCode(AppError::Code::PERMISSION_DENIED, "isso apaga command_log, saidas e historico de envios ESP-NOW. Rode antes: sudo -login <senha>");
     }
 
     if (context().database == nullptr) {
@@ -327,14 +318,14 @@ uint8_t registerAll() {
     context().shell->add(wrapper_database_read, "read", "read table: <name>, <limit>", "database");
     context().shell->add(wrapper_database_logs, "logs", "command history with outputs: <limit>", "database");
     context().shell->add(wrapper_database_espnow_history, "espnow_history", "ESP-NOW RX/TX history with status: <limit>", "database");
-    context().shell->add(wrapper_database_drop, "drop", "remove table: <name>, CONFIRMAR", "database");
-    context().shell->add(wrapper_database_rebuild, "rebuild", "recreate database from bootstrap: CONFIRMAR", "database");
+    context().shell->add(wrapper_database_drop, "drop", "remove table: <name> (requires sudo -login)", "database");
+    context().shell->add(wrapper_database_rebuild, "rebuild", "recreate database from bootstrap (requires sudo -login)", "database");
     context().shell->add(wrapper_database_backup, "backup", "save database snapshot to /database/backups", "database");
     context().shell->add(wrapper_database_count, "count", "count rows in a table: <name>", "database");
     context().shell->add(wrapper_database_delete, "delete", "delete rows: <table>, <sql where condition>", "database");
     context().shell->add(wrapper_database_vacuum, "vacuum", "compact database file (reclaim space)", "database");
     context().shell->add(wrapper_database_export, "export", "dump table to CSV on SD: <table>", "database");
-    context().shell->add(wrapper_database_clear_logs, "clear_logs", "purge command/espnow logs: CONFIRMAR", "database");
+    context().shell->add(wrapper_database_clear_logs, "clear_logs", "purge command/espnow logs (requires sudo -login)", "database");
     context().shell->add(exec, "exec", "execute raw SQL: <sql>", "database");
     context().shell->add(execNoLog, "exec_nolog", "execute SQL without saving to command_log", "database");
 

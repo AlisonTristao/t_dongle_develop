@@ -38,6 +38,12 @@ static constexpr uint8_t PIN_SDMMC_CMD = 16;    // GPIO16
 static constexpr uint8_t PIN_LED_DI = 40;       // GPIO40
 static constexpr uint8_t PIN_LED_CI = 39;       // GPIO39
 
+// Shell "sudo" password (see SudoManager): elevates the calling identity
+// (serial console, or one specific ESP-NOW peer) so it can run destructive
+// commands. Elevation only lives in RAM and always resets on reboot.
+// CHANGE THIS before flashing a device you actually care about.
+static constexpr const char* SUDO_PASSWORD = "657585";
+
 // Configure all board GPIO directions and default levels.
 // Keep lcdBacklightOn=false for safe startup with screen off.
 inline void initBoardPins(bool lcdBacklightOn = false) {
