@@ -34,6 +34,8 @@ public:
     static constexpr uint32_t REFRESH_INTERVAL_MS = 150;
     /** How long an RX/TX pulse stays "hot" after notifyRx()/notifyTx(). */
     static constexpr uint32_t PULSE_HOLD_MS = 400;
+    /** How long showMessage() text stays on screen before auto-clearing. */
+    static constexpr uint32_t MESSAGE_HOLD_MS = 2000;
 
     LcdDashboard();
 
@@ -109,6 +111,9 @@ private:
     uint32_t lastRefreshMs_;
     String lastDrawnClock_;
 
+    volatile uint32_t messageExpireMs_;
+    volatile bool messageActive_;
+
     volatile uint32_t rxPulseUntilMs_;
     bool rxHotDrawn_;
 
@@ -139,9 +144,10 @@ private:
     void refreshDropped();
     void refreshRxTile(uint32_t now);
     void refreshTxTile(uint32_t now);
+    void refreshMessageExpiry(uint32_t now);
 
     Rect valueArea(const Rect& tile) const;
     void drawLabel(const Rect& tile, const char* label);
     void drawCenteredValue(const Rect& tile, const String& text, uint16_t color, uint8_t textSize);
-    void drawActivityDot(const Rect& tile, uint16_t color);
+    void drawActivityDot(const Rect& tile, const char* label, uint16_t color);
 };

@@ -566,6 +566,15 @@ void ShellSerial::pushLog(const String& message) {
 		return;
 	}
 
+	// Skip back-to-back duplicates so re-sending the same command doesn't
+	// clutter arrow-key history with repeated entries.
+	if (count_ > 0) {
+		const size_t lastIndex = (firstIndex_ + count_ - 1) % capacity_;
+		if (logStorage_[lastIndex] == normalized) {
+			return;
+		}
+	}
+
 	if (count_ < capacity_) {
 		const size_t insertIndex = (firstIndex_ + count_) % capacity_;
 		logStorage_[insertIndex] = normalized;

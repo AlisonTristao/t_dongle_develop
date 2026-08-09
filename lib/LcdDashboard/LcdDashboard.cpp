@@ -1,6 +1,7 @@
 #include "LcdDashboard.h"
 
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 
 namespace {
@@ -28,6 +29,8 @@ LcdDashboard::LcdDashboard()
       errTile_{0, 0, 0, 0},
       lastRefreshMs_(0),
       lastDrawnClock_(""),
+      messageExpireMs_(0),
+      messageActive_(false),
       rxPulseUntilMs_(0),
       rxHotDrawn_(false),
       txPulseUntilMs_(0),
@@ -113,7 +116,6 @@ void LcdDashboard::drawStaticChrome() {
     // bottom row: STATE (double-wide) | ERR
     tft_->drawFastVLine(errTile_.x, stateTile_.y, static_cast<int16_t>(screenH_ - stateTile_.y), kRawGridLine);
 
-    drawLabel(linkTile_, "LINK");
     drawLabel(rxTile_, "RX");
     drawLabel(txTile_, "TX");
     drawLabel(stateTile_, "STATE");
@@ -125,6 +127,7 @@ void LcdDashboard::resetCaches() {
     // without touching running accumulators (droppedTotal_, last TX outcome,
     // pulse timers) — a clear() shouldn't erase history, just the pixels.
     lastDrawnClock_ = "";
+    messageActive_ = false;
     linkCacheValid_ = false;
     errCacheValid_ = false;
     rxHotDrawn_ = false;
@@ -182,17 +185,34 @@ void LcdDashboard::drawCenteredValue(const Rect& tile, const String& text, uint1
     tft_->print(text);
 }
 
-void LcdDashboard::drawActivityDot(const Rect& tile, uint16_t color) {
+void LcdDashboard::drawActivityDot(const Rect& tile, const char* label, uint16_t color) {
+    // Sized off the sub-area below the label (so it never grows into the
+    // label text). Centered on the whole tile when the label's footprint
+    // (drawLabel: tile.x+3, tile.y+2, ~6px/char, ~8px tall) doesn't reach
+    // that far, so it reads as centered in the grid cell; otherwise it
+    // falls back to sitting below the label, like before, so the two never
+    // overlap (e.g. "LINK" is wide enough to reach under a fully-centered
+    // dot in its narrow tile).
     const Rect area = valueArea(tile);
-    tft_->fillRect(area.x, area.y, area.w, area.h, kRawWhite);
-
-    const int16_t cx = static_cast<int16_t>(area.x + area.w / 2);
-    const int16_t cy = static_cast<int16_t>(area.y + area.h / 2);
     const int16_t shorterSide = (area.w < area.h) ? area.w : area.h;
     int16_t radius = static_cast<int16_t>(shorterSide / 2 - 2);
     if (radius < 2) {
         radius = 2;
     }
+
+    const int16_t cx = static_cast<int16_t>(tile.x + tile.w / 2);
+    const int16_t labelRight = static_cast<int16_t>(tile.x + 3 + static_cast<int16_t>(std::strlen(label)) * 6);
+    const int16_t labelBottom = static_cast<int16_t>(tile.y + 2 + 8);
+
+    int16_t cy = static_cast<int16_t>(tile.y + tile.h / 2);
+    if (labelRight > cx - radius) {
+        cy = static_cast<int16_t>(labelBottom + radius + 2);
+    }
+
+    const int16_t clearSide = static_cast<int16_t>(radius * 2 + 2);
+    const int16_t clearX = static_cast<int16_t>(cx - radius - 1);
+    const int16_t clearY = static_cast<int16_t>(cy - radius - 1);
+    tft_->fillRect(clearX, clearY, clearSide, clearSide, kRawWhite);
 
     tft_->fillCircle(cx, cy, radius, color);
 }
@@ -222,6 +242,9 @@ void LcdDashboard::showMessage(const String& text, uint16_t color) {
     tft_->setCursor(static_cast<int16_t>(messageRect_.x + 2), static_cast<int16_t>(messageRect_.y + (messageRect_.h - 8) / 2));
     tft_->setTextColor(color, kRawWhite);
     tft_->print(oneLine);
+
+    messageExpireMs_ = millis() + MESSAGE_HOLD_MS;
+    messageActive_ = true;
 }
 
 void LcdDashboard::notifyRx() {
@@ -317,6 +340,19 @@ void LcdDashboard::tick() {
     refreshDropped();
     refreshRxTile(now);
     refreshTxTile(now);
+    refreshMessageExpiry(now);
+}
+
+void LcdDashboard::refreshMessageExpiry(uint32_t now) {
+    if (!messageActive_) {
+        return;
+    }
+    if (static_cast<int32_t>(now - messageExpireMs_) < 0) {
+        return;
+    }
+    messageActive_ = false;
+
+    tft_->fillRect(messageRect_.x, messageRect_.y, messageRect_.w, messageRect_.h, kRawWhite);
 }
 
 void LcdDashboard::refreshClock() {
@@ -357,7 +393,7 @@ void LcdDashboard::refreshLink() {
     // No result yet (no peer heard from since boot): neutral. Otherwise a
     // steady green/red reflecting the latest heartbeat probe outcome.
     const uint16_t logicalColor = !hasResult ? kNeutralGray565 : (ok ? ST77XX_GREEN : ST77XX_RED);
-    drawActivityDot(linkTile_, toPanelColor(logicalColor));
+    drawActivityDot(linkTile_, "", toPanelColor(logicalColor));
 }
 
 void LcdDashboard::refreshDropped() {
@@ -382,7 +418,7 @@ void LcdDashboard::refreshRxTile(uint32_t now) {
     rxHotDrawn_ = hot;
 
     const uint16_t color = toPanelColor(hot ? ST77XX_CYAN : kNeutralGray565);
-    drawActivityDot(rxTile_, color);
+    drawActivityDot(rxTile_, "RX", color);
 }
 
 void LcdDashboard::refreshTxTile(uint32_t now) {
@@ -404,5 +440,5 @@ void LcdDashboard::refreshTxTile(uint32_t now) {
         logicalColor = ok ? ST77XX_GREEN : ST77XX_RED;
     }
 
-    drawActivityDot(txTile_, toPanelColor(logicalColor));
+    drawActivityDot(txTile_, "TX", toPanelColor(logicalColor));
 }
