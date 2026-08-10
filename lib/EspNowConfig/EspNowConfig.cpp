@@ -1,5 +1,6 @@
 #include "EspNowConfig.h"
 #include "LcdDashboard.h"
+#include "SerialMux.h"
 #include "ShellConfig.h"
 #include "ShellOutput.h"
 #include "BtpTransport.h"
@@ -159,6 +160,16 @@ void handleRoutedCommandResult(const uint8_t mac[6], const btp::Header& header, 
     BtpTransport::btp_command::ResultView result{};
     if (BtpTransport::btp_command::parse_result(header, payload, &result) !=
         BtpTransport::btp_command::ParseError::Ok) {
+        return;
+    }
+
+    // Only meaningful as human-readable console text; the serial BTP session
+    // (when protocolled) owns its own COMMAND_RESULT semantics for whatever
+    // it requested itself -- an ESP-NOW peer's reply to an unrelated
+    // espnow -send_to is not relayed onto that session (see SerialMux.h /
+    // ShellCommandSupport::printLine for the "single writer" rule this
+    // avoids breaking).
+    if (!SerialMux::isConsoleOwned()) {
         return;
     }
 
@@ -348,17 +359,30 @@ void handleLogItem(const ProtocolRouter::RoutedMessage& routed) {
         }
     }
 
-    if (g_io != nullptr) {
-        char tag[16] = {0};
-        std::snprintf(tag, sizeof(tag), "log %08lX", static_cast<unsigned long>(routed.header.source_id));
-        ShellOutput::printTagged(*g_io, tag, text);
+    // Plain human console: unchanged behavior, print as before. Protocolled
+    // session (topico 13): relay the original LOG frame verbatim to the
+    // desktop instead -- printing here would leak raw console text onto a
+    // port SerialMux owns exclusively (TRANSPORT_SERIAL.md section 7).
+    if (SerialMux::isConsoleOwned()) {
+        if (g_io != nullptr) {
+            char tag[16] = {0};
+            std::snprintf(tag, sizeof(tag), "log %08lX", static_cast<unsigned long>(routed.header.source_id));
+            ShellOutput::printTagged(*g_io, tag, text);
+        }
+        return;
     }
+
+    SerialMux::forwardRelay(routed.header, routed.payload, routed.payloadSize);
 }
 
-// TELEMETRY has no consumer in this topic yet (bally_protocol topico 13/14):
-// bytes are routed and preserved, but never turned into String/printf text
-// here (topico 12 step 11). Draining just frees the queue slot.
-void handleTelemetryItem(const ProtocolRouter::RoutedMessage&) {}
+// TELEMETRY finally has a consumer as of topico 13: relayed byte-for-byte
+// (never turned into String/printf text, per PLANO_GERAL.txt decisions 5/6)
+// to a protocolled desktop session. With no session attached, forwardRelay()
+// is a no-op (counted, not queued) -- same net effect as topico 12's
+// drain-and-discard placeholder.
+void handleTelemetryItem(const ProtocolRouter::RoutedMessage& routed) {
+    SerialMux::forwardRelay(routed.header, routed.payload, routed.payloadSize);
+}
 
 // TERMINAL_IN/OUT protocol handling belongs to topico 19; drop for now.
 void handleTerminalItem(const ProtocolRouter::RoutedMessage&) {}

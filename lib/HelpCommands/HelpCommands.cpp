@@ -105,6 +105,7 @@ uint8_t wrapper_help_e() {
     printLine("Script (1 comando por linha no SD): dongle -run_script <arquivo>");
     printLine("Historico rapido de comandos: dongle -history 20");
     printLine("Sistema: dongle -info | dongle -reboot");
+    printLine("Sessao BTP v1 nesta porta: dongle -btp_v1 (ou o cliente manda BTP/1 ENTER <16 hex> direto); volta ao console com SESSION_CLOSE ou por timeout");
     printLine("Banco sqlite no SD: database -status | database -tables | database -read peers, 20");
     printLine("Logs comando+saida: database -logs 20");
     printLine("Historico ESP-NOW RX/TX: database -espnow_history 30");

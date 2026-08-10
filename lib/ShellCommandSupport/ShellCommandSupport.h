@@ -85,12 +85,6 @@ bool parseDateTimeText(const std::string& text, time_t& outEpoch);
 uint8_t clampByte(int32_t value);
 
 /**
- * @brief Resolves the broadcast MAC used by espnow send_to/send_all peer "000":
- * the default stored in the database, falling back to FF:FF:FF:FF:FF:FF.
- */
-void resolveDefaultBroadcastMac(uint8_t outMac[6]);
-
-/**
  * @brief Prints one line to serial/LCD and records it in the command output buffer.
  */
 void printLine(const std::string& text);

@@ -5,12 +5,14 @@
 #include <esp_random.h>
 
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 #include "config.h"
 #include "StartupConfig.h"
 #include "ShellConfig.h"
 #include "EspNowConfig.h"
+#include "SerialMux.h"
 #include "ShellOutput.h"
 #include "BtpTransport.h"
 
@@ -137,7 +139,7 @@ void AppRuntime::processAsyncWarnings(bool& needPromptRefresh) {
 
 void AppRuntime::flushPendingEspNowOutput(bool& needPromptRefresh) {
     const size_t flushed = EspNowConfig::drainRoutedQueues(kRxDisplayFlushBurst);
-    if (flushed > 0) {
+    if (flushed > 0 && SerialMux::isConsoleOwned()) {
         needPromptRefresh = true;
     }
 
@@ -147,26 +149,52 @@ void AppRuntime::flushPendingEspNowOutput(bool& needPromptRefresh) {
     dropped += EspNowConfig::takeDroppedReassemblyCount();
     dropped += EspNowConfig::takeDroppedQueueFullCount();
     if (dropped > 0) {
-        char line[64] = {0};
-        std::snprintf(line, sizeof(line), "rx_dropped=%lu", static_cast<unsigned long>(dropped));
-        ShellOutput::printTagged(Serial, "espnow", line);
         lcdDashboard_.notifyDropped(dropped);
-        needPromptRefresh = true;
+
+        // A BTP-protocolled session owns the port exclusively (PASSO 11):
+        // this diagnostic line is console-only and simply not emitted while
+        // protocolled, same choice as ShellCommandSupport::printLine.
+        if (SerialMux::isConsoleOwned()) {
+            char line[64] = {0};
+            std::snprintf(line, sizeof(line), "rx_dropped=%lu", static_cast<unsigned long>(dropped));
+            ShellOutput::printTagged(Serial, "espnow", line);
+            needPromptRefresh = true;
+        }
     }
 }
 
 void AppRuntime::handleShellInput() {
+    // SerialMux (topico 13) owns the port instead of ShellSerial once a BTP
+    // v1 session is negotiating/protocolled -- its own tick() call below
+    // does the reading/dispatch in that case.
+    if (!SerialMux::isConsoleOwned()) {
+        return;
+    }
+
     String command;
     if (!serialShell_.readInputLine(command)) {
         return;
     }
 
-    const std::string response = ShellConfig::runLine(std::string(command.c_str()));
-    if (!response.empty()) {
+    const std::string commandText(command.c_str());
+
+    // "BTP/1 ENTER <16 hex>" is recognized as a reserved control line, not a
+    // TinyShell command: on match, SerialMux already wrote "BTP/1 READY
+    // ...\r\n" and took over the port.
+    if (SerialMux::tryEnterFromConsoleLine(commandText.c_str(), millis())) {
+        return;
+    }
+
+    const std::string response = ShellConfig::runLine(commandText);
+    if (!response.empty() && SerialMux::isConsoleOwned()) {
         ShellOutput::printResponse(Serial, response);
     }
 
-    serialShell_.refreshLine();
+    // A command itself may have entered protocol mode (e.g. "dongle
+    // -btp_v1"): do not print a stray prompt into the middle of a handshake.
+    if (SerialMux::isConsoleOwned()) {
+        serialShell_.refreshLine();
+    }
 }
 
 void AppRuntime::begin() {
@@ -198,6 +226,20 @@ void AppRuntime::begin() {
         bootId = 1;
     }
     BtpTransport::configureIdentity(BtpTransport::btp_command::source_id_from_mac(selfMac), bootId);
+
+    // SerialMux (topico 13): the port's single writer once a BTP v1 session
+    // negotiates on this same USB link. selfUuid has no separate persisted
+    // identity yet (topico 16 may add one) -- MAC bytes plus a fixed,
+    // non-zero suffix keep it stable for the boot and satisfy HELLO_RESULT's
+    // "peer_uuid nao pode ser toda zero" without inventing real UUID storage.
+    uint8_t selfUuid[16] = {0};
+    std::memcpy(selfUuid, selfMac, 6);
+    for (size_t i = 6; i < sizeof(selfUuid); ++i) {
+        selfUuid[i] = static_cast<uint8_t>(0xB0 + i);
+    }
+    SerialMux::begin(Serial, [](const char* cmd, const char* source, const char* userId, std::string* out) {
+        ShellConfig::runLine(std::string(cmd), source, out, userId);
+    }, selfUuid);
 
     EspNowConfig::attachCallbacks(espNowManager_, Serial, &databaseStore_, &lcdDashboard_);
 
@@ -276,15 +318,22 @@ void AppRuntime::tick() {
     handleShellInput();
     flushPendingEspNowOutput(asyncOutputOccurred);
 
+    // SerialMux (topico 13): pumps RX decode/dispatch, the watchdog and TX
+    // queue draining while a BTP v1 session is negotiating/protocolled; a
+    // fast no-op otherwise (ShellSerial owns the port instead, above).
+    SerialMux::tick(millis());
+
     if (asyncOutputOccurred) {
         lastAsyncOutputTime = millis();
         pendingPromptRefresh = true;
     }
 
     // Aguarda 150ms de "silencio" antes de redesenhar o prompt.
-    // Isso permite que pacotes ESP-NOW fragmentados (ex: [1/5], [2/5]) 
+    // Isso permite que pacotes ESP-NOW fragmentados (ex: [1/5], [2/5])
     // sejam impressos de forma contigua sem que o prompt quebre a linha no meio.
-    if (pendingPromptRefresh && (millis() - lastAsyncOutputTime > 150)) {
+    // Nunca roda fora do console: um SerialMux protocolado e o unico dono da
+    // porta (PASSO 11).
+    if (pendingPromptRefresh && SerialMux::isConsoleOwned() && (millis() - lastAsyncOutputTime > 150)) {
         Serial.println(); // Garante que o prompt inicie em uma linha limpa
         serialShell_.refreshLine();
         pendingPromptRefresh = false;

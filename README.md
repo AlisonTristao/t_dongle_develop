@@ -70,12 +70,17 @@ Serviços/domínio
                      envelope COMMAND_REQUEST/COMMAND_RESULT (namespace btp_command)
   ProtocolRouter  -> decode BTP + validação de CRC + reassembly compartilhado
                      (btp::Reassembler); puro C++, sem Arduino, testável em env:native
+  SerialSession   -> estado Console/AwaitingHello/Protocolled da sessão BTP v1 na serial
+                     USB; parse/build de HELLO, HELLO_RESULT, SESSION_CLOSE(_RESULT), STATUS;
+                     puro C++, sem Arduino, testável em env:native
   DatabaseStore   -> schema SQLite, migrações, leituras/gravações
   DonglePeripherals -> LED, LCD (driver), SD
   LcdDashboard    -> dashboard em grade sobre DonglePeripherals
   SudoManager     -> elevação de permissão por identidade (RAM, reseta no boot)
   EspNowConfig    -> callbacks ESP-NOW, fila RX assíncrona, roteamento por MessageType,
                      filas priorizadas por tipo, heartbeat BTP, execução remota (COMMAND)
+  SerialMux       -> único escritor da porta serial no modo protocolado: decode COBS
+                     incremental, filas FreeRTOS priorizadas por classe, encode COBS + write
 
 Plataforma
   ShellSerial (input não bloqueante) / ShellOutput (formatação) / StartupConfig (boot)
@@ -117,9 +122,15 @@ graph TD
     ShellCommandSupport --> DonglePeripherals
     ShellCommandSupport --> LcdDashboard
     ShellCommandSupport --> DatabaseStore
+    ShellCommandSupport --> SerialMux
     DatabaseStore --> EspNowManager
     LcdDashboard --> DonglePeripherals
     StartupConfig --> DonglePeripherals
+    DongleCommands --> SerialMux
+    EspNowConfig --> SerialMux
+    SerialMux --> SerialSession
+    SerialMux --> BtpTransport
+    SerialSession --> BtpTransport
 ```
 
 `BtpTransport` e `ProtocolRouter` entram como serviços de domínio (nível 5), lado a lado
@@ -133,6 +144,19 @@ adaptador de uma linha que chama o `EspNowManager` real. `ProtocolRouter` não d
 nada do projeto além de `bally_protocol`. Como nenhum dos dois toca Arduino/FreeRTOS, ambos
 compilam e têm testes rodando sob `env:native` (`test/test_protocol_router`).
 
+`SerialMux` (tópico 13) é alcançado tanto por `EspNowConfig` (para retransmitir
+TELEMETRY/LOG roteados do ESP-NOW para uma sessão serial protocolada) quanto por
+`DongleCommands`/`ShellCommandSupport` (comando `dongle -btp_v1`, e para saber se a porta
+ainda pertence ao console antes de escrever nela). Isso criaria o mesmo tipo de ciclo via
+`ShellConfig` se `SerialMux` incluísse `ShellConfig.h` para chamar `runLine()` -- por isso
+ele recebe um `RunShellLineFn` (mesmo padrão de callback de `BtpTransport::SendFn`) em vez
+de incluir o módulo de shell direto; `AppRuntime::begin()` é quem liga os dois com uma
+lambda sem captura. `SerialSession` (a lógica pura de handshake/estado da sessão, sem
+Arduino) só depende de `BtpTransport` (reaproveita `btp_command::parse_request`/
+`copy_shell_command`/`build_result` para o `COMMAND_REQUEST`/`COMMAND_RESULT` da sessão
+serial, o mesmo parser usado no caminho ESP-NOW) e roda sob `env:native`
+(`test/test_serial_session`), igual a `ProtocolRouter`/`BtpTransport`.
+
 Ver [CONTRIBUTING.md § Arquitetura e camadas](CONTRIBUTING.md#arquitetura-e-camadas) para
 a regra de quando um módulo novo deve entrar em `Context` ou pode ser incluído direto.
 
@@ -144,20 +168,28 @@ a regra de quando um módulo novo deve entrar em `Context` ou pode ser incluído
 
 1. `BoardConfig::initBoardPins(false)` — pinos em estado seguro (LCD apagado)
 2. inicia `ShellSerial` na baudrate de `platformio.ini` (`BAUDRATE`)
-3. aguarda monitor serial conectar, animando o LED (`StartupConfig`)
+3. aguarda monitor serial conectar, animando o LED (`StartupConfig`) — o prompt de "pressione
+   ENTER" agora tem teto de 6s (`kAutoConfirmMs`, tópico 13 PASSO 3): um cliente automático
+   que nunca aperta Enter ainda assim chega ao shell interativo em tempo finito
 4. inicia SD, imprime MAC Wi-Fi, pede/ajusta data-hora do RTC local
-5. conecta callbacks ESP-NOW e habilita a fila RX assíncrona (`EspNowConfig`)
-6. `espNowManager_.begin(...)`, depois `databaseStore_.begin(...)` + `logBootEvent("power_on")`
-7. sobe as tasks FreeRTOS (RX worker, heartbeat worker)
-8. `ShellConfig::bind(...)` + `ShellConfig::registerDefaultModules()`
-9. restaura histórico do shell a partir do banco (`readRecentCommands`)
+5. deriva a identidade BTP deste boot (`BtpTransport::configureIdentity`) e chama
+   `SerialMux::begin(...)`, ligando-o ao `ShellConfig::runLine` via callback
+6. conecta callbacks ESP-NOW e habilita a fila RX assíncrona (`EspNowConfig`)
+7. `espNowManager_.begin(...)`, depois `databaseStore_.begin(...)` + `logBootEvent("power_on")`
+8. sobe as tasks FreeRTOS (RX worker, heartbeat worker)
+9. `ShellConfig::bind(...)` + `ShellConfig::registerDefaultModules()`
+10. restaura histórico do shell a partir do banco (`readRecentCommands`)
 
 ### `AppRuntime::tick()` (chamado a cada `loop()`)
 
 1. processa avisos assíncronos e saída ESP-NOW pendente
 2. `lcdDashboard_.tick()` — redesenha tiles que mudaram (throttled internamente)
-3. lê input da serial e roda o comando (`ShellConfig::runLine`)
-4. `delay(1)` cooperativo
+3. lê input da serial e roda o comando (`ShellConfig::runLine`) -- só quando `SerialMux`
+   ainda não é dono da porta (ver seção 7bis)
+4. `SerialMux::tick(millis())` — no-op rápido em modo console; decodifica/despacha bytes
+   recebidos, checa o watchdog da sessão e drena as filas de saída priorizadas quando uma
+   sessão BTP v1 está negociando/protocolada
+5. `delay(1)` cooperativo
 
 ### Tasks FreeRTOS (fora do loop principal)
 
@@ -203,6 +235,7 @@ Sintaxe: `<modulo> -<comando> [args]`. Comandos podem ser encadeados com `;`
 | `history` | `dongle -history 20` | reimprime comandos recentes do histórico persistido |
 | `info` | `dongle -info` | chip/heap/flash/uptime/MAC |
 | `reboot` | `dongle -reboot` | reinicia o ESP32 |
+| `btp_v1` | `dongle -btp_v1` | negocia uma sessão BTP v1 protocolada nesta mesma porta (ver seção 7bis) |
 
 ### 5.3 `espnow` — peers e mensagens
 
@@ -363,6 +396,44 @@ malicioso é (a) não deixar MACs não confiáveis virarem peers cadastrados, e 
 `sudo` para os comandos destrutivos. Um peer cadastrado que souber a senha tem controle total
 do dongle.
 
+### 7.6 Sessão BTP v1 na serial USB (`SerialSession`/`SerialMux`, tópico 13)
+
+A mesma porta USB do console humano também serve BTP v1 para um cliente automático (ex.:
+TraceView), seguindo `bally_protocol/docs/TRANSPORT_SERIAL.md`:
+
+- **Entrada**: a porta começa em modo console (`ShellSerial`). Uma linha completa
+  `BTP/1 ENTER <16 hex>\r\n` é reconhecida como controle reservado (não é um comando
+  TinyShell) e responde `BTP/1 READY <hex minúsculo>\r\n`; a partir daí a sessão fica
+  `AwaitingHello` aguardando um frame `HELLO` por até 2s. Alternativamente, um humano num
+  terminal pode digitar `dongle -btp_v1` (PASSO 2) para o mesmo efeito, sem precisar montar a
+  linha crua na mão.
+- **Negociação**: `HELLO` é validado (`SerialSession::parseHello`) e os limites efetivos são
+  o mínimo entre o que o cliente pediu e os limites locais deste dongle
+  (`SerialSession::LocalLimits`); sucesso responde `HELLO_RESULT` e a sessão vira
+  `Protocolled`. Sem versão em comum, responde `HELLO_RESULT`/`UNSUPPORTED` e volta direto pro
+  console.
+- **`SerialMux`** é o único escritor da porta nesse modo: decodifica bytes recebidos com
+  `btp::SerialDecoder` (COBS incremental) e serializa a saída em quatro filas FreeRTOS
+  priorizadas (`SerialSession::PriorityClass`) — sessão/`COMMAND_RESULT`, terminal, log/status,
+  telemetria, nessa ordem — cada uma com profundidade e contador de descarte próprios.
+  `ShellCommandSupport::printLine` e os pontos de log direto do `EspNowConfig`/`AppRuntime`
+  passam a checar `SerialMux::isConsoleOwned()` antes de escrever na `Serial`, para nenhuma
+  task nunca escrever a porta por fora do mux enquanto uma sessão está ativa.
+- **Canais**: `TELEMETRY`/`LOG` roteados pelo `EspNowConfig` (vindos do robô via ESP-NOW) são
+  retransmitidos byte a byte para a sessão via `SerialMux::forwardRelay`, sob o header
+  original (nunca reescreve `source_id`/`timestamp_us`). `COMMAND_REQUEST`/`TERMINAL_IN`
+  vindos do cliente rodam via `ShellConfig::runLine` com identidade `"serial"` (mesmo
+  perímetro de confiança do console físico) e respondem `COMMAND_RESULT`/`TERMINAL_OUT`.
+  `STATUS` (contadores de `frames_rx/tx`, CRC, decode, etc.) é publicado a cada 2s.
+- **Saída**: `SESSION_CLOSE` do cliente ou o watchdog (`session_timeout_ms` negociado, sem
+  frame BTP válido) fecham a sessão: o dongle descarta o que ainda não foi enviado nas filas,
+  escreve exatamente `BTP/1 CONSOLE\r\n` e devolve a porta para `ShellSerial`.
+- **Fora de escopo deste tópico** (ver RESULTADO em
+  `bally_protocol/topicos/13_dongle_serial_mux_sessao.txt`): fragmentação/reassembly de
+  mensagens lógicas maiores que um frame serial (4096 octetos já é folgado para os payloads
+  atuais), `MANIFEST`/`SUBSCRIBE` (tópicos 16/17) e o protocolo interativo completo de
+  terminal (tópico 19) — `TERMINAL_IN`/`OUT` aqui é uma linha de shell por mensagem.
+
 ## 8. LCD Dashboard (`LcdDashboard`)
 
 Substitui o antigo terminal de rolagem (o texto já existe na serial e no banco). Layout
@@ -403,9 +474,13 @@ platformio run -e tdongle-s3 -t monitor
 `scripts/pio_warnings.py` aplica `-Wno-discarded-qualifiers` na compilação C do
 `Sqlite3Esp32` (upstream gera esse warning, não é nosso código).
 
-Há também um ambiente host-only, `env:native`, que roda `ProtocolRouter`/`BtpTransport`
-contra os vetores canônicos de `C:\git\bally_protocol\test-vectors\v1` sem precisar de
-hardware (mesmo padrão de `bally_software`, exige `bally_protocol` como diretório irmão):
+Há também um ambiente host-only, `env:native`, que roda `ProtocolRouter`/`BtpTransport`/
+`SerialSession` contra os vetores canônicos de `C:\git\bally_protocol\test-vectors\v1` sem
+precisar de hardware (mesmo padrão de `bally_software`, exige `bally_protocol` como diretório
+irmão). `test_serial_session` cobre o handshake HELLO/HELLO_RESULT, SESSION_CLOSE, o
+round-trip COBS de um payload com `0x00`/CR/LF, recuperação após ruído/frame truncado e um
+teste de estresse com TELEMETRY e TERMINAL_IN intercalados (tópico 13, PASSOS 6/12 e os
+CRITERIOS DE ACEITE 1-3):
 
 ```bash
 platformio test -e native
@@ -427,6 +502,8 @@ lib/
   BtpTransport/           # identidade BTP, sequência, envio fragmentado, COMMAND envelope
   ProtocolRouter/         # decode BTP + CRC + reassembly compartilhado (puro C++)
   EspNowConfig/           # callbacks ESP-NOW, filas priorizadas por tipo, heartbeat, exec remota
+  SerialSession/          # estado console/handshake BTP v1 da sessão serial (puro C++)
+  SerialMux/              # unico escritor da serial no modo protocolado: COBS + filas FreeRTOS
   DatabaseStore/                 # schema SQLite e leituras/gravações
   DonglePeripherals/ LcdDashboard/  # LED/LCD/SD e dashboard em grade
   SudoManager/                   # elevação de permissão por identidade
@@ -440,6 +517,7 @@ scripts/
 test/
   test_tablelinker/      # demo antiga do TinyShell, hardware-only
   test_protocol_router/  # BTP vs. vetores canônicos, roda em env:native
+  test_serial_session/   # handshake/COBS/estresse da sessão serial, roda em env:native
 platformio.ini
 CONTRIBUTING.md
 ```
@@ -457,8 +535,17 @@ CONTRIBUTING.md
   forma) — o antigo alias de broadcast `000` foi removido por isso
 - RTC depende de ajuste manual no boot (sem RTC externo dedicado)
 - fila RX pode perder pacotes sob alta carga (contador de dropped exposto no tile `ERR`)
-- `TELEMETRY`/`TERMINAL`/`CONTROL` roteados ainda não têm consumidor nesta versão (ficam
-  para os tópicos 13/14/16/19) — são drenados e descartados, só contabilizados
+- `CONTROL` roteado do lado ESP-NOW (HELLO/MANIFEST/SUBSCRIBE) ainda não tem consumidor
+  nesta versão (fica para os tópicos 16/17) — é drenado e descartado, só contabilizado.
+  `TELEMETRY`/`LOG` do ESP-NOW já têm consumidor real desde o tópico 13: são retransmitidos
+  para uma sessão serial protocolada (`SerialMux::forwardRelay`); sem sessão ativa, o efeito
+  observável continua sendo "drenado e descartado, só contabilizado" como antes
+- a sessão serial (tópico 13) não reassembla mensagens lógicas fragmentadas em mais de um
+  frame serial (limite prático de 700 bytes de payload por mensagem própria deste dongle,
+  bem abaixo do teto de 4096 do wire format) — suficiente para HELLO/STATUS/COMMAND_RESULT/
+  TERMINAL_OUT atuais, mas um manifesto grande (tópico 16) vai precisar dessa reassembly
+- `TERMINAL_IN`/`TERMINAL_OUT` na sessão serial é uma linha de shell por mensagem (sem
+  dedup de `COMMAND_REQUEST`, sem pty real) — o protocolo interativo completo é tópico 19
 - banco em arquivo local no SD (sujeito a falhas de cartão/contato)
 - senha do `sudo` é uma constante compilada — trocar exige reflash; qualquer peer
   cadastrado que souber a senha tem controle total do dongle (ver seção 7.5)
@@ -474,3 +561,5 @@ CONTRIBUTING.md
 - teste local: `dongle -ping`
 - teste remoto (depois que o peer já tiver mandado algo, ver seção 7.2): `espnow -send_to 1, "dongle -ping"`
 - elevar permissão antes de um comando destrutivo: `sudo -login <senha>`
+- negociar uma sessão BTP v1 manualmente para testes: `dongle -btp_v1` (ver seção 7.6);
+  `SESSION_CLOSE` do lado do cliente (ou silêncio por `session_timeout_ms`) devolve o console

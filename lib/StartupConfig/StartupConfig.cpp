@@ -230,10 +230,21 @@ void waitForSerialAndAnimateLed(DonglePeripherals& peripherals) {
     drainSerialInput();
 
     ShellOutput::printTagged(Serial, "startup", "monitor conectado. pressione ENTER para iniciar");
+    ShellOutput::printTagged(Serial, "startup", "(sem entrada: segue sozinho em alguns segundos)");
     Serial.print(ShellOutput::commandPrefix());
+
+    // PASSO 3 (topico 13): this used to be an unbounded while(!enterConfirmed)
+    // loop -- a real block for any automatic client (e.g. TraceView) that
+    // opens the port but does not know to press Enter, since it never reads
+    // past this point in AppRuntime::begin(). Bounded here so the boot
+    // sequence always reaches the interactive shell (and from there, BTP v1
+    // negotiation) in finite time; a human typing normally still exits the
+    // loop immediately on their own Enter, unchanged from before.
+    constexpr uint32_t kAutoConfirmMs = 6000;
 
     bool enterConfirmed = false;
     uint32_t lastPromptMs = millis();
+    const uint32_t waitStartMs = millis();
     while (!enterConfirmed) {
         if (Serial.available()) {
             const int value = Serial.read();
@@ -259,6 +270,12 @@ void waitForSerialAndAnimateLed(DonglePeripherals& peripherals) {
                     Serial.print(c);
                 }
             }
+        }
+
+        if ((millis() - waitStartMs) >= kAutoConfirmMs) {
+            ShellOutput::writeRawLine(Serial, "");
+            enterConfirmed = true;
+            continue;
         }
 
         if ((millis() - lastPromptMs) >= 2000) {

@@ -31,6 +31,7 @@ enum class Code : uint16_t {
     SD_FILE_WRITE_FAILED = 1114,
     SD_FILE_REMOVE_FAILED = 1115,
     SD_MKDIR_FAILED = 1116,
+    SERIAL_SESSION_BUSY = 1117,
 
     // ESP-NOW
     ESPNOW_NOT_READY = 1201,
@@ -111,6 +112,8 @@ inline const char* name(Code code) {
         return "SD_FILE_REMOVE_FAILED";
     case Code::SD_MKDIR_FAILED:
         return "SD_MKDIR_FAILED";
+    case Code::SERIAL_SESSION_BUSY:
+        return "SERIAL_SESSION_BUSY";
     case Code::ESPNOW_NOT_READY:
         return "ESPNOW_NOT_READY";
     case Code::INVALID_MAC_FORMAT:

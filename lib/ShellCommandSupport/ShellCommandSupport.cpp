@@ -1,5 +1,6 @@
 #include "ShellCommandSupport.h"
 
+#include "SerialMux.h"
 #include "ShellOutput.h"
 
 #include <algorithm>
@@ -15,7 +16,6 @@ ShellCommandSupport::Context g_ctx = {nullptr, nullptr, nullptr, nullptr, nullpt
 string g_commandOutputBuffer;
 string g_shellResponseBuffer;
 string g_currentUserId = "serial";
-constexpr uint8_t kFallbackBroadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 bool isTagToken(const string& token) {
     if (token.empty()) {
@@ -287,27 +287,19 @@ uint8_t clampByte(int32_t value) {
     return static_cast<uint8_t>(value);
 }
 
-void resolveDefaultBroadcastMac(uint8_t outMac[6]) {
-    if (outMac == nullptr) {
-        return;
-    }
-
-    memcpy(outMac, kFallbackBroadcastMac, 6);
-    if (g_ctx.database != nullptr && g_ctx.database->isReady()) {
-        uint8_t dbMac[6] = {0};
-        if (g_ctx.database->getDefaultBroadcastMac(dbMac)) {
-            memcpy(outMac, dbMac, 6);
-        }
-    }
-}
-
 void printLine(const string& text) {
     const string normalized = normalizeOutputTag(text);
 
     g_commandOutputBuffer += normalized;
     g_commandOutputBuffer += "\n";
 
-    if (g_ctx.io != nullptr) {
+    // In a BTP-protocolled session SerialMux is the port's only writer
+    // (bally_protocol/docs/TRANSPORT_SERIAL.md section 7): a raw console
+    // print here would interleave with COBS frames on the wire. Command
+    // output during that session already reaches the caller through
+    // ShellConfig::runLine's captured text (see SerialMux's COMMAND_REQUEST/
+    // TERMINAL_IN handling), so it is simply not echoed to the port here.
+    if (g_ctx.io != nullptr && SerialMux::isConsoleOwned()) {
         // Limpa a linha onde está o cursor (geralmente o prompt) antes de imprimir
         g_ctx.io->print("\r\033[K");
         ShellOutput::writeLine(*g_ctx.io, normalized.c_str());

@@ -1,5 +1,6 @@
 #include "DongleCommands.h"
 
+#include "SerialMux.h"
 #include "ShellCommandSupport.h"
 #include "SudoManager.h"
 #include "error_codes.h"
@@ -621,6 +622,26 @@ uint8_t wrapper_dongle_info() {
     return RESULT_OK;
 }
 
+// PASSO 2 (topico 13): manual affordance to negotiate a BTP v1 protocolled
+// session on this same port, for a human at a terminal emulator who does not
+// want to hand-type the raw "BTP/1 ENTER <16 hex>\r\n" wire line -- an
+// automatic client (TraceView) still uses that raw line directly, recognized
+// straight off ShellSerial's input (see SerialMux::tryEnterFromConsoleLine,
+// called from AppRuntime::handleShellInput). Prints its confirmation BEFORE
+// calling SerialMux::enterFromCommand(), never after: once that call
+// succeeds, "BTP/1 READY ...\r\n" is already on the wire and no further
+// plain-text output may follow it (bally_protocol/docs/TRANSPORT_SERIAL.md
+// section 7 -- "impedir qualquer saida textual entre READY e BTP/1 CONSOLE").
+uint8_t wrapper_dongle_btp_v1() {
+    printLine("[dongle] negociando sessao BTP v1 (aguardando HELLO por 2s)...");
+
+    if (!SerialMux::enterFromCommand(millis())) {
+        return failWithCode(AppError::Code::SERIAL_SESSION_BUSY, "sessao serial ja esta negociando ou protocolada");
+    }
+
+    return RESULT_OK;
+}
+
 } // namespace
 
 namespace DongleCommands {
@@ -658,6 +679,7 @@ uint8_t registerAll() {
     context().shell->add(wrapper_dongle_run_script, "run_script", "run one command per line from a SD file: <path>", "dongle");
     context().shell->add(wrapper_dongle_reboot, "reboot", "restart the ESP32", "dongle");
     context().shell->add(wrapper_dongle_info, "info", "chip/heap/flash/uptime/mac summary", "dongle");
+    context().shell->add(wrapper_dongle_btp_v1, "btp_v1", "negotiate a BTP v1 protocolled session on this port", "dongle");
 
     return RESULT_OK;
 }
