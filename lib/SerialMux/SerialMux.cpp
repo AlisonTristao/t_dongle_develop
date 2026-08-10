@@ -3,6 +3,7 @@
 #include "TerminalPtyStream.h"
 
 #include <BtpTransport.h>
+#include <ManifestCache.h>
 #include <ShellOutput.h>
 #include <btp/stream.hpp>
 
@@ -305,6 +306,52 @@ void handleTerminalIn(const btp::DecodedFrame& decoded) noexcept {
     g_terminalPty.feedInput(decoded.payload.data, decoded.payload.size);
 }
 
+std::uint32_t readU32Le(const std::uint8_t* data) noexcept {
+    return static_cast<std::uint32_t>(data[0]) | (static_cast<std::uint32_t>(data[1]) << 8U) |
+           (static_cast<std::uint32_t>(data[2]) << 16U) | (static_cast<std::uint32_t>(data[3]) << 24U);
+}
+
+// Desktop -> dongle catalog discovery (topico 16 PASSO 6/7): answers from
+// ManifestCache, which already holds this dongle's own self-description plus
+// whatever robot manifests have been cached over ESP-NOW (EspNowConfig's
+// primeManifestIfNeeded). Every response is a single, already-bounded
+// MANIFEST_DATA payload (ManifestCache truncates to whole records that fit
+// kOutboundPayloadCap, see this repo's topico 16 RESULTADO for why that
+// stays within the existing single-frame outbound path rather than a new
+// large-buffer/multi-fragment queue for a message this small in practice)
+// and goes out through the normal kLogStatus-priority queue like STATUS/
+// HELLO_RESULT -- no bypass, so it cannot jump ahead of already-queued
+// session/terminal traffic.
+void handleManifestRequest(const btp::DecodedFrame& decoded) noexcept {
+    if (decoded.payload.size != 12U || decoded.payload.data == nullptr) {
+        return;  // malformed MANIFEST_REQUEST; silently dropped like any other malformed CONTROL payload
+    }
+
+    const std::uint32_t targetSourceId = readU32Le(decoded.payload.data);
+    const std::uint32_t targetBootId = readU32Le(decoded.payload.data + 4U);
+    const std::uint32_t knownRevision = readU32Le(decoded.payload.data + 8U);
+
+    std::uint8_t payload[kOutboundPayloadCap];
+
+    if (targetSourceId == 0U) {
+        const std::size_t total = ManifestCache::enumerationCount();
+        for (std::size_t index = 0U; index < total; ++index) {
+            const std::size_t size =
+                ManifestCache::buildEnumerationResponse(index, decoded.header, payload, sizeof(payload));
+            if (size > 0U) {
+                enqueueOwn(btp::MessageType::Control, ManifestCache::kManifestDataObjectId, payload, size);
+            }
+        }
+        return;
+    }
+
+    const std::size_t size = ManifestCache::buildTargetedResponse(targetSourceId, targetBootId, knownRevision,
+                                                                   decoded.header, payload, sizeof(payload));
+    if (size > 0U) {
+        enqueueOwn(btp::MessageType::Control, ManifestCache::kManifestDataObjectId, payload, size);
+    }
+}
+
 // Drains whatever g_terminalShell wrote back (echo/prompt/redraw) since the
 // last call and chunks it into TERMINAL_OUT frame(s) of at most
 // kOutboundPayloadCap bytes each -- unlike topico 13's MVP, a long command
@@ -385,6 +432,9 @@ void dispatchFrame(const btp::DecodedFrame& decoded, std::uint32_t nowMs) noexce
             break;
         case SerialSession::Session::FrameOutcome::TerminalIn:
             handleTerminalIn(decoded);
+            break;
+        case SerialSession::Session::FrameOutcome::ManifestRequest:
+            handleManifestRequest(decoded);
             break;
     }
 }
@@ -573,6 +623,11 @@ void tick(std::uint32_t nowMs) noexcept {
     if (g_session.isConsole()) {
         return; // ShellSerial owns the port; nothing for the mux to do.
     }
+
+    // Refreshed every tick (cheap: a global read + one field write) so
+    // whatever HELLO_RESULT this session answers next always reports this
+    // dongle's current manifest-catalog revision (topico 16 PASSO 5).
+    g_session.setLocalConfigRevision(ManifestCache::catalogRevision());
 
     pumpRx(nowMs);
     if (g_session.isConsole()) {

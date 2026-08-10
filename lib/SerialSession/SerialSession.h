@@ -11,9 +11,13 @@
  * bally_protocol/docs/TRANSPORT_SERIAL.md section 5-7 and
  * bally_protocol/docs/COMMANDS_AND_ACTIONS.md sections 5, 8 and 10. Also
  * builds/parses the small set of CONTROL/logical payloads a session needs
- * (HELLO, HELLO_RESULT, SESSION_CLOSE, SESSION_CLOSE_RESULT, STATUS) --
- * deliberately NOT MANIFEST/SUBSCRIBE, which stay out of scope for topico 13
- * (see bally_protocol/topicos/13_dongle_serial_mux_sessao.txt RESULTADO).
+ * (HELLO, HELLO_RESULT, SESSION_CLOSE, SESSION_CLOSE_RESULT, STATUS) and
+ * recognizes MANIFEST_REQUEST (topico 16 -- the payload itself is built by
+ * ManifestCache, kept out of this native-testable session-state module to
+ * avoid a dependency on the cache). SUBSCRIBE/UNSUBSCRIBE still stay out of
+ * scope (topico 17, not implemented yet; see
+ * bally_protocol/topicos/13_dongle_serial_mux_sessao.txt RESULTADO for the
+ * original topico 13 scoping).
  *
  * Kept free of Serial/FreeRTOS so it compiles and is unit-tested under
  * env:native, exactly like ProtocolRouter/BtpTransport (topico 12). The
@@ -32,6 +36,8 @@ enum class State : std::uint8_t {
 // MessageType namespaces (bally_protocol/docs/COMMANDS_AND_ACTIONS.md 3.2/3.3).
 constexpr std::uint16_t kHelloObjectId = 0x0001U;
 constexpr std::uint16_t kHelloResultObjectId = 0x0002U;
+constexpr std::uint16_t kManifestRequestObjectId = 0x0003U;
+constexpr std::uint16_t kManifestDataObjectId = 0x0004U;
 constexpr std::uint16_t kStatusObjectId = 0x0009U;
 constexpr std::uint16_t kSessionCloseObjectId = 0x000AU;
 constexpr std::uint16_t kSessionCloseResultObjectId = 0x000BU;
@@ -57,7 +63,7 @@ constexpr std::uint32_t kHelloDeadlineMs = 2000U; // COMMANDS_AND_ACTIONS.md sec
 enum class PriorityClass : std::uint8_t {
     kSession = 0,   // HELLO_RESULT, SESSION_CLOSE_RESULT, COMMAND_RESULT
     kTerminal = 1,  // TERMINAL_IN / TERMINAL_OUT
-    kLogStatus = 2, // LOG, STATUS, MANIFEST_DATA (unused)
+    kLogStatus = 2, // LOG, STATUS, MANIFEST_DATA
     kTelemetry = 3, // TELEMETRY
     kCount = 4,
 };
@@ -177,6 +183,14 @@ public:
 
     void setLocalUuid(const std::uint8_t uuid[16]) noexcept;
 
+    // This dongle's own manifest-catalog revision (ManifestCache::
+    // catalogRevision(), topico 16 PASSO 5), reported in HELLO_RESULT's
+    // config_revision field. Kept as a plain setter rather than a
+    // ManifestCache dependency here -- SerialSession stays a leaf, native-
+    // testable module; the caller (SerialMux) refreshes this before each
+    // HELLO exchange.
+    void setLocalConfigRevision(std::uint32_t configRevision) noexcept { localConfigRevision_ = configRevision; }
+
     // Called once a "BTP/1 ENTER ..." line was recognized (or synthesized by
     // a shell command). Arms the HELLO deadline and moves to AwaitingHello.
     void beginNegotiation(std::uint64_t nowMs) noexcept;
@@ -188,6 +202,7 @@ public:
         SessionClosed,  // outPayload carries SESSION_CLOSE_RESULT; state is back to Console
         CommandRequest, // frame is a COMMAND_REQUEST; caller parses/executes/replies via BtpTransport::btp_command
         TerminalIn,     // frame is a TERMINAL_IN block; caller relays frame.payload bytes to the local shell
+        ManifestRequest, // frame is a MANIFEST_REQUEST; caller parses/answers via ManifestCache (topico 16)
     };
 
     struct FrameResult {
@@ -220,6 +235,7 @@ private:
     std::uint8_t localUuid_[16];
     std::uint32_t peerSourceId_;
     std::uint32_t peerBootId_;
+    std::uint32_t localConfigRevision_ = 0U;
 };
 
 } // namespace SerialSession

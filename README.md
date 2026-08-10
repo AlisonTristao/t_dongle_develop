@@ -72,7 +72,14 @@ Serviços/domínio
                      (btp::Reassembler); puro C++, sem Arduino, testável em env:native
   SerialSession   -> estado Console/AwaitingHello/Protocolled da sessão BTP v1 na serial
                      USB; parse/build de HELLO, HELLO_RESULT, SESSION_CLOSE(_RESULT), STATUS;
-                     puro C++, sem Arduino, testável em env:native
+                     reconhece MANIFEST_REQUEST (tópico 16); puro C++, sem Arduino,
+                     testável em env:native
+  ManifestCache   -> cache em memória de MANIFEST_DATA por source_id (tópico 16): guarda os
+                     registros de tópico/ação de cada robô verbatim (opacos, delimitados por
+                     record_size), monta MANIFEST_DATA para o desktop (alvo único ou
+                     enumeração target=0, incluindo a auto-descrição do dongle como
+                     role=DONGLE) e mantém a revisão agregada do catálogo (HELLO do dongle);
+                     puro C++, sem Arduino
   DatabaseStore   -> schema SQLite, migrações, leituras/gravações
   DonglePeripherals -> LED, LCD (driver), SD
   LcdDashboard    -> dashboard em grade sobre DonglePeripherals

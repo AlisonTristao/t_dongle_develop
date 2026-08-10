@@ -348,7 +348,7 @@ Session::FrameResult Session::onFrame(const btp::DecodedFrame& frame, std::uint6
                 peerBootId_ = frame.header.boot_id;
                 const std::size_t written = buildHelloResultSuccess(
                     frame.header.source_id, frame.header.boot_id, frame.header.sequence,
-                    effective_, localUuid_, /*configRevision=*/0U, outPayload, outPayloadCapacity);
+                    effective_, localUuid_, localConfigRevision_, outPayload, outPayloadCapacity);
                 if (written > 0U) {
                     state_ = State::Protocolled;
                     deadlineMs_ = nowMs + effective_.sessionTimeoutMs;
@@ -412,8 +412,13 @@ Session::FrameResult Session::onFrame(const btp::DecodedFrame& frame, std::uint6
         return result;
     }
 
-    // Reserved/unsupported object for this topic (e.g. MANIFEST_*, SUBSCRIBE*,
-    // a stray HELLO mid-session): ignored, watchdog already renewed above.
+    if (frame.header.type == btp::MessageType::Control && frame.header.object_id == kManifestRequestObjectId) {
+        result.outcome = FrameOutcome::ManifestRequest;
+        return result;
+    }
+
+    // Reserved/unsupported object for this topic (e.g. SUBSCRIBE*, a stray
+    // HELLO mid-session): ignored, watchdog already renewed above.
     return result;
 }
 

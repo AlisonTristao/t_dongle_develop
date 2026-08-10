@@ -12,6 +12,7 @@
 #include "StartupConfig.h"
 #include "ShellConfig.h"
 #include "EspNowConfig.h"
+#include "ManifestCache.h"
 #include "SerialMux.h"
 #include "ShellOutput.h"
 #include "BtpTransport.h"
@@ -232,15 +233,19 @@ void AppRuntime::begin() {
     BtpTransport::configureIdentity(BtpTransport::btp_command::source_id_from_mac(selfMac), bootId);
 
     // SerialMux (topico 13): the port's single writer once a BTP v1 session
-    // negotiates on this same USB link. selfUuid has no separate persisted
-    // identity yet (topico 16 may add one) -- MAC bytes plus a fixed,
-    // non-zero suffix keep it stable for the boot and satisfy HELLO_RESULT's
-    // "peer_uuid nao pode ser toda zero" without inventing real UUID storage.
+    // negotiates on this same USB link. selfUuid still has no separate
+    // persisted identity store (topico 16 did not add one either) -- MAC
+    // bytes plus a fixed, non-zero suffix keep it stable for the boot and
+    // satisfy HELLO_RESULT's "peer_uuid nao pode ser toda zero" without
+    // inventing real UUID storage. The same bytes double as this dongle's
+    // own MANIFEST_DATA source_uuid (topico 16 PASSO 3/5) -- one identity,
+    // reused by both, not two independent UUIDs to keep in sync.
     uint8_t selfUuid[16] = {0};
     std::memcpy(selfUuid, selfMac, 6);
     for (size_t i = 6; i < sizeof(selfUuid); ++i) {
         selfUuid[i] = static_cast<uint8_t>(0xB0 + i);
     }
+    ManifestCache::configure(selfUuid);
     SerialMux::begin(Serial, [](const char* cmd, const char* source, const char* userId, std::string* out) {
         ShellConfig::runLine(std::string(cmd), source, out, userId);
     }, selfUuid, ShellOutput::commandPrompt().c_str());

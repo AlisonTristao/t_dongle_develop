@@ -1,5 +1,6 @@
 #include "EspNowConfig.h"
 #include "LcdDashboard.h"
+#include "ManifestCache.h"
 #include "SerialMux.h"
 #include "ShellConfig.h"
 #include "ShellOutput.h"
@@ -43,6 +44,34 @@ bool g_hasHeartbeatTarget = false;
 // dongle's actual EspNowManager instance.
 bool sendViaManager(void* context, const uint8_t mac[6], const uint8_t* data, size_t size) {
     return static_cast<EspNowManager*>(context)->sendToMac(mac, data, size);
+}
+
+// Proactively asks a peer for its manifest the moment this dongle has no
+// usable cache entry for its current (source_id, boot_id) -- topico 16
+// PASSO 3's "cachear/agregar manifests por source", primed automatically
+// rather than waiting for a desktop client to ask first (decision 13:
+// "o dongle e dono do catalogo apresentado ao computador"). Rate-limited by
+// ManifestCache::shouldRequestManifest itself so a steady TELEMETRY stream
+// from a not-yet-cached robot cannot flood it with duplicate requests.
+void primeManifestIfNeeded(const uint8_t mac[6], const btp::Header& header) {
+    if (g_manager == nullptr) {
+        return;
+    }
+    const uint32_t nowMs = millis();
+    if (!ManifestCache::shouldRequestManifest(header.source_id, header.boot_id, nowMs)) {
+        return;
+    }
+
+    uint8_t requestPayload[12];
+    const size_t requestSize =
+        ManifestCache::buildRequest(header.source_id, header.boot_id, 0U, requestPayload, sizeof(requestPayload));
+    if (requestSize == 0) {
+        return;
+    }
+
+    const uint64_t timestampUs = static_cast<uint64_t>(nowMs) * 1000ULL;
+    BtpTransport::sendLogical(sendViaManager, g_manager, mac, btp::MessageType::Control,
+                              ManifestCache::kManifestRequestObjectId, requestPayload, requestSize, timestampUs);
 }
 
 // "state changed: SETUP -> WAIT" style lines emitted by the robot's Logger.
@@ -295,6 +324,7 @@ void processRxDatagramInternal(const uint8_t mac[6], const uint8_t* data, size_t
         std::memcpy(g_heartbeatTargetMac, mac, sizeof(g_heartbeatTargetMac));
         g_hasHeartbeatTarget = true;
         BtpTransport::rememberPeer(mac, routed.header.source_id, routed.header.boot_id);
+        primeManifestIfNeeded(mac, routed.header);
     }
 
     if (mac != nullptr && g_manager != nullptr && g_manager->deviceIndexByMac(mac) < 0) {
@@ -387,8 +417,16 @@ void handleTelemetryItem(const ProtocolRouter::RoutedMessage& routed) {
 // TERMINAL_IN/OUT protocol handling belongs to topico 19; drop for now.
 void handleTerminalItem(const ProtocolRouter::RoutedMessage&) {}
 
-// HELLO/MANIFEST/STATUS payload handling belongs to topico 16; drop for now.
-void handleControlItem(const ProtocolRouter::RoutedMessage&) {}
+// A robot answering a MANIFEST_REQUEST this dongle sent it (see
+// primeManifestIfNeeded above). Any other CONTROL object_id received over
+// ESP-NOW (a stray HELLO, a reserved id) is ignored -- robots never
+// originate MANIFEST_REQUEST or STATUS toward this dongle in this topic.
+void handleControlItem(const ProtocolRouter::RoutedMessage& routed) {
+    if (routed.header.object_id != ManifestCache::kManifestDataObjectId) {
+        return;
+    }
+    ManifestCache::ingestManifestData({routed.payload, routed.payloadSize}, millis());
+}
 
 } // namespace
 
