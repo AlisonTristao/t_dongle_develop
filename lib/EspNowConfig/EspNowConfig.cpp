@@ -4,6 +4,7 @@
 #include "SerialMux.h"
 #include "ShellConfig.h"
 #include "ShellOutput.h"
+#include "SubscriptionRegistry.h"
 #include "BtpTransport.h"
 
 #include <cstdio>
@@ -105,6 +106,23 @@ bool tryExtractRobotState(const char* text, String& outState) {
 
 void macToText(const uint8_t mac[6], char out[18]) {
     std::snprintf(out, 18, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+void writeU16Le(uint8_t* out, uint16_t value) {
+    out[0] = static_cast<uint8_t>(value);
+    out[1] = static_cast<uint8_t>(value >> 8U);
+}
+
+void writeU32Le(uint8_t* out, uint32_t value) {
+    out[0] = static_cast<uint8_t>(value);
+    out[1] = static_cast<uint8_t>(value >> 8U);
+    out[2] = static_cast<uint8_t>(value >> 16U);
+    out[3] = static_cast<uint8_t>(value >> 24U);
+}
+
+uint32_t readU32Le(const uint8_t* data) {
+    return static_cast<uint32_t>(data[0]) | (static_cast<uint32_t>(data[1]) << 8U) |
+           (static_cast<uint32_t>(data[2]) << 16U) | (static_cast<uint32_t>(data[3]) << 24U);
 }
 
 // Copies a routed payload into a NUL-terminated stack buffer for display
@@ -417,15 +435,34 @@ void handleTelemetryItem(const ProtocolRouter::RoutedMessage& routed) {
 // TERMINAL_IN/OUT protocol handling belongs to topico 19; drop for now.
 void handleTerminalItem(const ProtocolRouter::RoutedMessage&) {}
 
-// A robot answering a MANIFEST_REQUEST this dongle sent it (see
-// primeManifestIfNeeded above). Any other CONTROL object_id received over
+// A robot answering a MANIFEST_REQUEST (topico 16) or SUBSCRIBE/UNSUBSCRIBE
+// (topico 17) this dongle sent it. Any other CONTROL object_id received over
 // ESP-NOW (a stray HELLO, a reserved id) is ignored -- robots never
 // originate MANIFEST_REQUEST or STATUS toward this dongle in this topic.
 void handleControlItem(const ProtocolRouter::RoutedMessage& routed) {
-    if (routed.header.object_id != ManifestCache::kManifestDataObjectId) {
+    if (routed.header.object_id == ManifestCache::kManifestDataObjectId) {
+        ManifestCache::ingestManifestData({routed.payload, routed.payloadSize}, millis());
         return;
     }
-    ManifestCache::ingestManifestData({routed.payload, routed.payloadSize}, millis());
+    if (routed.header.object_id == SubscriptionRegistry::kSubscribeResultObjectId) {
+        // COMMANDS_AND_ACTIONS.md section 7: ref(12) + status(1) +
+        // reserved(1) + error_code(2) + subscription_id(4) +
+        // effective_rate_millihz(4) + granted_lease_ms(4) = 28 bytes.
+        if (routed.payloadSize < 24U) return;
+        const uint32_t replyToSequence = readU32Le(routed.payload + 8U);
+        const uint8_t status = routed.payload[12];
+        const uint32_t subscriptionId = readU32Le(routed.payload + 16U);
+        const uint32_t effectiveRateMillihz = readU32Le(routed.payload + 20U);
+        SubscriptionRegistry::onUpstreamSubscribeResult(replyToSequence, status, subscriptionId,
+                                                        effectiveRateMillihz);
+        return;
+    }
+    // UNSUBSCRIBE_RESULT (object_id 0x0008) carries only the reference triple
+    // + status/error_code; this dongle already cleared its local grant the
+    // moment it decided to send the upstream UNSUBSCRIBE (see
+    // SubscriptionRegistry::onDesktopUnsubscribe/onClientDisconnected/
+    // expireLeases), so there is nothing further to update here even on
+    // success. Intentionally not parsed further.
 }
 
 } // namespace
@@ -572,6 +609,72 @@ void heartbeatTick() {
     if (g_lcdDashboard != nullptr) {
         g_lcdDashboard->notifyHeartbeat(gotStatus && delivered);
     }
+}
+
+void requestUpstreamSubscribe(uint32_t sourceId, uint32_t topicId, uint32_t rateMillihz, uint32_t leaseMs) {
+    if (g_manager == nullptr || sourceId == 0 || topicId == 0 || topicId > 0xFFFFU) return;
+
+    uint8_t mac[6] = {0};
+    uint32_t bootId = 0;
+    if (!BtpTransport::lookupPeerMacBySourceId(sourceId, mac, &bootId) || bootId == 0) {
+        return;  // never heard from this robot yet; cannot address it (see EspNowConfig.h)
+    }
+
+    uint32_t sequence = 0;
+    if (!BtpTransport::reserveSequence(&sequence)) return;
+
+    uint8_t payload[20];
+    writeU32Le(payload, sourceId);
+    writeU32Le(payload + 4U, bootId);
+    writeU16Le(payload + 8U, static_cast<uint16_t>(topicId));
+    writeU16Le(payload + 10U, 0U);  // flags, zero in v1
+    writeU32Le(payload + 12U, rateMillihz);
+    writeU32Le(payload + 16U, leaseMs);
+
+    uint8_t frame[btp::kEspNowMaxFrameSize];
+    size_t frameSize = 0;
+    const uint64_t timestampUs = static_cast<uint64_t>(millis()) * 1000ULL;
+    if (!BtpTransport::encodeSingleFrame(btp::MessageType::Control, SubscriptionRegistry::kSubscribeObjectId,
+                                         sequence, timestampUs, payload, sizeof(payload), frame, sizeof(frame),
+                                         &frameSize)) {
+        return;
+    }
+
+    // Remembered before the send so a very fast SUBSCRIBE_RESULT (unlikely
+    // but not impossible) is never missed by a race between send and note.
+    SubscriptionRegistry::noteUpstreamRequestSent(sourceId, topicId, sequence);
+    g_manager->sendToMac(mac, frame, frameSize);
+}
+
+void requestUpstreamUnsubscribe(uint32_t sourceId, uint32_t topicId, uint32_t upstreamSubscriptionId) {
+    (void)topicId;  // UNSUBSCRIBE addresses a subscription_id, not a topic_id (see header comment)
+    if (g_manager == nullptr || sourceId == 0 || upstreamSubscriptionId == 0) {
+        return;  // nothing was ever granted upstream for this topic; no-op
+    }
+
+    uint8_t mac[6] = {0};
+    uint32_t bootId = 0;
+    if (!BtpTransport::lookupPeerMacBySourceId(sourceId, mac, &bootId) || bootId == 0) {
+        return;
+    }
+
+    uint32_t sequence = 0;
+    if (!BtpTransport::reserveSequence(&sequence)) return;
+
+    uint8_t payload[12];
+    writeU32Le(payload, sourceId);
+    writeU32Le(payload + 4U, bootId);
+    writeU32Le(payload + 8U, upstreamSubscriptionId);
+
+    uint8_t frame[btp::kEspNowMaxFrameSize];
+    size_t frameSize = 0;
+    const uint64_t timestampUs = static_cast<uint64_t>(millis()) * 1000ULL;
+    if (!BtpTransport::encodeSingleFrame(btp::MessageType::Control, SubscriptionRegistry::kUnsubscribeObjectId,
+                                         sequence, timestampUs, payload, sizeof(payload), frame, sizeof(frame),
+                                         &frameSize)) {
+        return;
+    }
+    g_manager->sendToMac(mac, frame, frameSize);
 }
 
 } // namespace EspNowConfig

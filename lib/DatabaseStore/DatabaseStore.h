@@ -84,11 +84,6 @@ public:
     bool logBootEvent(const char* reason = "power_on");
 
     /**
-     * @brief Returns default broadcast MAC configured in DB.
-     */
-    bool getDefaultBroadcastMac(uint8_t outMac[6]);
-
-    /**
      * @brief Persists all peers currently registered in EspNowManager.
      */
     bool syncPeersFromManager(const EspNowManager& espNow);

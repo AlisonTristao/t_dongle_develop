@@ -101,4 +101,29 @@ uint32_t takeDroppedQueueFullCount();
  */
 void heartbeatTick();
 
+/**
+ * @brief Topico 17 (PASSO 3): sends a SUBSCRIBE toward the robot identified
+ * by sourceId, over ESP-NOW, so it starts (or adjusts) publishing topicId at
+ * (up to) rateMillihz. Fire-and-forget, matching every other best-effort
+ * CONTROL exchange in this dongle (primeManifestIfNeeded, heartbeatTick) --
+ * SerialMux already answered the desktop client synchronously from its own
+ * cached knowledge (see SerialMux.cpp's handleSubscribeRequest), so this call
+ * is not on that reply's critical path. No-op if this dongle has never heard
+ * a BTP frame from sourceId yet (BtpTransport::lookupPeerMacBySourceId
+ * fails) -- matches the same "can only target an already-observed peer"
+ * limitation topico 12 documented for COMMAND_REQUEST. Meant to be passed as
+ * SerialMux::RequestUpstreamSubscribeFn.
+ */
+void requestUpstreamSubscribe(uint32_t sourceId, uint32_t topicId, uint32_t rateMillihz, uint32_t leaseMs);
+
+/**
+ * @brief Topico 17 (PASSO 5): sends an UNSUBSCRIBE toward the robot,
+ * releasing upstreamSubscriptionId (the id the robot itself granted, from
+ * SubscriptionRegistry::upstreamSubscriptionId -- COMMANDS_AND_ACTIONS.md
+ * section 7's UNSUBSCRIBE targets a subscription_id, not a topic_id). Same
+ * fire-and-forget/no-op-if-unknown-peer contract as requestUpstreamSubscribe.
+ * Meant to be passed as SerialMux::RequestUpstreamUnsubscribeFn.
+ */
+void requestUpstreamUnsubscribe(uint32_t sourceId, uint32_t topicId, uint32_t upstreamSubscriptionId);
+
 } // namespace EspNowConfig

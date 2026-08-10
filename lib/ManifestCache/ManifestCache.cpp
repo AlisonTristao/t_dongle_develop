@@ -459,4 +459,29 @@ std::size_t buildTargetedResponse(std::uint32_t targetSourceId, std::uint32_t ta
                              recordsSize, topicCount, actionCount, output, outputCapacity);
 }
 
+bool lookupTopicMaxRateMillihz(std::uint32_t sourceId, std::uint32_t topicId,
+                               std::uint32_t* outMaxRateMillihz) noexcept {
+    if (outMaxRateMillihz == nullptr || topicId == 0U || topicId > 0xFFFFU) return false;
+
+    const Entry* entry = findEntry(sourceId);
+    if (entry == nullptr) return false;
+
+    std::size_t pos = 0U;
+    for (std::uint16_t i = 0U; i < entry->topicCount; ++i) {
+        if (pos + 4U > entry->recordsSize) return false;  // corrupt cache; defensive
+        const std::uint32_t contentSize = read_u32_le(entry->records + pos);
+        const std::size_t recordTotalLen = 4U + static_cast<std::size_t>(contentSize);
+        if (pos + recordTotalLen > entry->recordsSize || contentSize < 12U) return false;
+
+        const std::uint8_t* content = entry->records + pos + 4U;
+        const std::uint16_t recordTopicId = read_u16_le(content);
+        if (recordTopicId == static_cast<std::uint16_t>(topicId)) {
+            *outMaxRateMillihz = read_u32_le(content + 8U);
+            return true;
+        }
+        pos += recordTotalLen;
+    }
+    return false;
+}
+
 }  // namespace ManifestCache

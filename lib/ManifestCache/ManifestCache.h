@@ -122,4 +122,16 @@ std::size_t buildTargetedResponse(std::uint32_t targetSourceId, std::uint32_t ta
                                   std::uint32_t knownRevision, const btp::Header& requestHeader,
                                   std::uint8_t* output, std::size_t outputCapacity) noexcept;
 
+// Topico 17: walks the cached, verbatim topic records for sourceId (this
+// dongle's own self-description has none) looking for topicId, and reads
+// its max_rate_millihz (COMMANDS_AND_ACTIONS.md section 6.2's per-topic
+// record, offset 8 of the record's content -- topic_id/schema_version(2
+// each), encoding/flags(1 each), field_count(2), then max_rate_millihz(4)).
+// Returns false when the source or topic is not cached; SubscriptionRegistry
+// callers treat that as "cannot grant a subscription for an unknown topic"
+// (REJECTED/NOT_FOUND), the same way a MANIFEST_REQUEST for an unknown topic
+// would be handled by the source itself.
+bool lookupTopicMaxRateMillihz(std::uint32_t sourceId, std::uint32_t topicId,
+                               std::uint32_t* outMaxRateMillihz) noexcept;
+
 }  // namespace ManifestCache

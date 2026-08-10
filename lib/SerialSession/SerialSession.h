@@ -12,12 +12,12 @@
  * bally_protocol/docs/COMMANDS_AND_ACTIONS.md sections 5, 8 and 10. Also
  * builds/parses the small set of CONTROL/logical payloads a session needs
  * (HELLO, HELLO_RESULT, SESSION_CLOSE, SESSION_CLOSE_RESULT, STATUS) and
- * recognizes MANIFEST_REQUEST (topico 16 -- the payload itself is built by
- * ManifestCache, kept out of this native-testable session-state module to
- * avoid a dependency on the cache). SUBSCRIBE/UNSUBSCRIBE still stay out of
- * scope (topico 17, not implemented yet; see
+ * recognizes MANIFEST_REQUEST (topico 16) and SUBSCRIBE/UNSUBSCRIBE
+ * (topico 17) -- the payloads themselves are built by ManifestCache /
+ * SubscriptionRegistry respectively, kept out of this native-testable
+ * session-state module to avoid pulling either dependency in here (see
  * bally_protocol/topicos/13_dongle_serial_mux_sessao.txt RESULTADO for the
- * original topico 13 scoping).
+ * original topico 13 scoping, which this topico closes).
  *
  * Kept free of Serial/FreeRTOS so it compiles and is unit-tested under
  * env:native, exactly like ProtocolRouter/BtpTransport (topico 12). The
@@ -38,6 +38,10 @@ constexpr std::uint16_t kHelloObjectId = 0x0001U;
 constexpr std::uint16_t kHelloResultObjectId = 0x0002U;
 constexpr std::uint16_t kManifestRequestObjectId = 0x0003U;
 constexpr std::uint16_t kManifestDataObjectId = 0x0004U;
+constexpr std::uint16_t kSubscribeObjectId = 0x0005U;
+constexpr std::uint16_t kSubscribeResultObjectId = 0x0006U;
+constexpr std::uint16_t kUnsubscribeObjectId = 0x0007U;
+constexpr std::uint16_t kUnsubscribeResultObjectId = 0x0008U;
 constexpr std::uint16_t kStatusObjectId = 0x0009U;
 constexpr std::uint16_t kSessionCloseObjectId = 0x000AU;
 constexpr std::uint16_t kSessionCloseResultObjectId = 0x000BU;
@@ -49,7 +53,7 @@ constexpr std::uint16_t kTerminalOutObjectId = 0x0002U;
 struct LocalLimits {
     std::uint32_t maxLogicalPayload = 700U;      // matches SerialMux's outbound payload cap
     std::uint16_t maxInflightReassemblies = 1U;  // topico 13 does not reassemble serial fragments (see deviation note)
-    std::uint16_t maxSubscriptions = 8U;         // declared for forward compat; topico 17 not implemented
+    std::uint16_t maxSubscriptions = 8U;         // matches SubscriptionRegistry::kMaxTopics (topico 17)
     std::uint32_t maxDedupEntries = 32U;         // declared; command dedup not implemented on this transport yet
     std::uint32_t sessionTimeoutMs = 15000U;     // watchdog: no valid BTP frame in this window -> back to console
 };
@@ -147,6 +151,30 @@ constexpr std::size_t kStatusPayloadSize = 92U;
 std::size_t buildStatus(const StatusCounters& counters, std::uint8_t* output,
                         std::size_t outputCapacity) noexcept;
 
+// COMMANDS_AND_ACTIONS.md section 8.1 (topico 17, status_version=2): one
+// fixed-size 24-byte record per (source_id, topic_id) this dongle currently
+// tracks a subscription state for. Kept as a plain wire-shaped struct here
+// (not SubscriptionRegistry::TopicStatusEntry) so this module stays free of
+// a SubscriptionRegistry dependency, matching the ManifestCache precedent
+// for MANIFEST_REQUEST/DATA above -- the caller (SerialMux) converts.
+struct TopicStatusRecord {
+    std::uint32_t sourceId = 0U;
+    std::uint16_t topicId = 0U;
+    std::uint16_t subscriberCount = 0U;
+    std::uint32_t effectiveRateMillihz = 0U;
+    std::uint64_t bytesTotal = 0U;
+    std::uint64_t samplesDroppedTotal = 0U;
+};
+
+constexpr std::size_t kTopicStatusRecordSize = 24U;
+
+// Builds a status_version=2 payload: the same 92-byte v1 prefix (with
+// status_version patched to 2) followed by topicCount 24-byte
+// TopicStatusRecord entries. Returns 0 on capacity failure (caller falls
+// back to buildStatus()'s v1-only payload rather than sending nothing).
+std::size_t buildStatusV2(const StatusCounters& counters, const TopicStatusRecord* topics, std::size_t topicCount,
+                          std::uint8_t* output, std::size_t outputCapacity) noexcept;
+
 // ---- ENTER/READY/CONSOLE console handshake text (TRANSPORT_SERIAL.md 5-6) --
 
 constexpr std::size_t kNonceHexLength = 16U;
@@ -203,6 +231,8 @@ public:
         CommandRequest, // frame is a COMMAND_REQUEST; caller parses/executes/replies via BtpTransport::btp_command
         TerminalIn,     // frame is a TERMINAL_IN block; caller relays frame.payload bytes to the local shell
         ManifestRequest, // frame is a MANIFEST_REQUEST; caller parses/answers via ManifestCache (topico 16)
+        SubscribeRequest,   // frame is a SUBSCRIBE; caller parses/answers via SubscriptionRegistry (topico 17)
+        UnsubscribeRequest, // frame is an UNSUBSCRIBE; caller parses/answers via SubscriptionRegistry (topico 17)
     };
 
     struct FrameResult {

@@ -243,6 +243,35 @@ std::size_t buildStatus(const StatusCounters& counters, std::uint8_t* output,
     return kStatusPayloadSize;
 }
 
+std::size_t buildStatusV2(const StatusCounters& counters, const TopicStatusRecord* topics, std::size_t topicCount,
+                          std::uint8_t* output, std::size_t outputCapacity) noexcept {
+    const std::size_t total = kStatusPayloadSize + 2U + topicCount * kTopicStatusRecordSize;
+    if (output == nullptr || outputCapacity < total || (topics == nullptr && topicCount != 0U)) {
+        return 0U;
+    }
+
+    // Same v1 prefix (buildStatus's own bounds check is redundant here since
+    // total >= kStatusPayloadSize was just checked above), then patch
+    // status_version to 2.
+    if (buildStatus(counters, output, outputCapacity) == 0U) return 0U;
+    writeU16(output, 2U);  // status_version
+
+    std::size_t offset = kStatusPayloadSize;
+    writeU16(output + offset, static_cast<std::uint16_t>(topicCount));
+    offset += 2U;
+    for (std::size_t i = 0U; i < topicCount; ++i) {
+        const TopicStatusRecord& record = topics[i];
+        writeU32(output + offset, record.sourceId);
+        writeU16(output + offset + 4U, record.topicId);
+        writeU16(output + offset + 6U, record.subscriberCount);
+        writeU32(output + offset + 8U, record.effectiveRateMillihz);
+        writeU64(output + offset + 12U, record.bytesTotal);
+        writeU64(output + offset + 20U, record.samplesDroppedTotal);
+        offset += kTopicStatusRecordSize;
+    }
+    return offset;
+}
+
 bool tryParseEnterLine(const char* line, char outReadyLine[kReadyLineCapacity]) noexcept {
     if (line == nullptr) {
         return false;
@@ -417,8 +446,18 @@ Session::FrameResult Session::onFrame(const btp::DecodedFrame& frame, std::uint6
         return result;
     }
 
-    // Reserved/unsupported object for this topic (e.g. SUBSCRIBE*, a stray
-    // HELLO mid-session): ignored, watchdog already renewed above.
+    if (frame.header.type == btp::MessageType::Control && frame.header.object_id == kSubscribeObjectId) {
+        result.outcome = FrameOutcome::SubscribeRequest;
+        return result;
+    }
+
+    if (frame.header.type == btp::MessageType::Control && frame.header.object_id == kUnsubscribeObjectId) {
+        result.outcome = FrameOutcome::UnsubscribeRequest;
+        return result;
+    }
+
+    // Reserved/unsupported object for this topic (a stray HELLO mid-session,
+    // etc.): ignored, watchdog already renewed above.
     return result;
 }
 

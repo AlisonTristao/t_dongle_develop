@@ -248,7 +248,8 @@ void AppRuntime::begin() {
     ManifestCache::configure(selfUuid);
     SerialMux::begin(Serial, [](const char* cmd, const char* source, const char* userId, std::string* out) {
         ShellConfig::runLine(std::string(cmd), source, out, userId);
-    }, selfUuid, ShellOutput::commandPrompt().c_str());
+    }, selfUuid, ShellOutput::commandPrompt().c_str(), EspNowConfig::requestUpstreamSubscribe,
+    EspNowConfig::requestUpstreamUnsubscribe);
 
     EspNowConfig::attachCallbacks(espNowManager_, Serial, &databaseStore_, &lcdDashboard_);
 

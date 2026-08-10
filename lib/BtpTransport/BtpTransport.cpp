@@ -261,6 +261,19 @@ bool lookupPeer(const std::uint8_t mac[6], std::uint32_t* outSourceId, std::uint
     return false;
 }
 
+bool lookupPeerMacBySourceId(std::uint32_t sourceId, std::uint8_t outMac[6], std::uint32_t* outBootId) noexcept {
+    if (sourceId == 0U || outMac == nullptr) return false;
+
+    for (std::size_t index = 0U; index < kPeerIdentityCapacity; ++index) {
+        if (g_peers[index].used && g_peers[index].sourceId == sourceId) {
+            std::memcpy(outMac, g_peers[index].mac, 6U);
+            if (outBootId != nullptr) *outBootId = g_peers[index].bootId;
+            return true;
+        }
+    }
+    return false;
+}
+
 namespace btp_command {
 
 ParseError parse_request(const btp::Header& header,

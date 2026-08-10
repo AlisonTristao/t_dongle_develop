@@ -120,6 +120,15 @@ bool lookupPeer(const std::uint8_t mac[6],
                 std::uint32_t* outSourceId,
                 std::uint32_t* outBootId) noexcept;
 
+/** Reverse of lookupPeer: finds the MAC (and boot_id) last associated with
+ * sourceId, when any. Used by topico 17 to address an upstream SUBSCRIBE/
+ * UNSUBSCRIBE at the robot a desktop client's target_source_id refers to --
+ * this dongle can only reach a peer it has already heard a BTP frame from
+ * (same limitation topico 12 already documented for COMMAND_REQUEST). */
+bool lookupPeerMacBySourceId(std::uint32_t sourceId,
+                             std::uint8_t outMac[6],
+                             std::uint32_t* outBootId) noexcept;
+
 namespace btp_command {
 
 constexpr std::uint16_t kCommandRequestObjectId = 0x0001U;

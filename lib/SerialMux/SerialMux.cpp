@@ -5,6 +5,7 @@
 #include <BtpTransport.h>
 #include <ManifestCache.h>
 #include <ShellOutput.h>
+#include <SubscriptionRegistry.h>
 #include <btp/stream.hpp>
 
 #include <esp_random.h>
@@ -48,6 +49,8 @@ struct QueuedFrame {
 
 Stream* g_io = nullptr;
 RunShellLineFn g_runShellLine = nullptr;
+RequestUpstreamSubscribeFn g_requestUpstreamSubscribe = nullptr;
+RequestUpstreamUnsubscribeFn g_requestUpstreamUnsubscribe = nullptr;
 
 std::uint8_t g_encodedBuffer[btp::kSerialMaxCobsBlockSize];
 std::uint8_t g_decodedBuffer[btp::kSerialMaxFrameSize];
@@ -205,6 +208,10 @@ bool enqueueOwn(btp::MessageType type, std::uint16_t objectId, const std::uint8_
     return enqueueFrameBytes(SerialSession::classify(type, objectId), frameBytes, frameSize);
 }
 
+// Forward declaration: defined below (topico 17), used by finalizeToConsole
+// (PASSO 6) ahead of its own definition further down this file.
+void dispatchUpstreamUnsubscribes(const SubscriptionRegistry::UpstreamAction* actions, std::size_t count) noexcept;
+
 // Sends the session's last frame synchronously (bypassing the queues -- it
 // must go out before anything else and nothing lower-priority should delay
 // it), then discards every not-yet-sent queued item and hands the port back
@@ -218,6 +225,19 @@ void finalizeToConsole(std::uint16_t objectId, const std::uint8_t* payload, std:
     if (encodeOwnFrame(btp::MessageType::Control, objectId, payload, payloadSize, frameBytes,
                        sizeof(frameBytes), &frameSize)) {
         writeFrameCobs(frameBytes, frameSize);
+    }
+
+    // PASSO 6 (topico 17): a session ending -- SESSION_CLOSE here, or a
+    // rejected HELLO whose leftover peerSourceId() (see Session::
+    // beginNegotiation's peerSourceId_=0 reset) still names the *previous*
+    // protocolled client -- clears every subscription that client owned.
+    // Harmless no-op when peerSourceId() is 0 (no protocolled session ever
+    // reached SUBSCRIBE, e.g. straight to HelloRejected on a first attempt).
+    {
+        SubscriptionRegistry::UpstreamAction actions[SubscriptionRegistry::kMaxTopics];
+        const std::size_t count =
+            SubscriptionRegistry::onClientDisconnected(g_session.peerSourceId(), actions, SubscriptionRegistry::kMaxTopics);
+        dispatchUpstreamUnsubscribes(actions, count);
     }
 
     resetQueues();
@@ -311,6 +331,18 @@ std::uint32_t readU32Le(const std::uint8_t* data) noexcept {
            (static_cast<std::uint32_t>(data[2]) << 16U) | (static_cast<std::uint32_t>(data[3]) << 24U);
 }
 
+void writeU16(std::uint8_t* output, std::uint16_t value) noexcept {
+    output[0] = static_cast<std::uint8_t>(value);
+    output[1] = static_cast<std::uint8_t>(value >> 8U);
+}
+
+void writeU32(std::uint8_t* output, std::uint32_t value) noexcept {
+    output[0] = static_cast<std::uint8_t>(value);
+    output[1] = static_cast<std::uint8_t>(value >> 8U);
+    output[2] = static_cast<std::uint8_t>(value >> 16U);
+    output[3] = static_cast<std::uint8_t>(value >> 24U);
+}
+
 // Desktop -> dongle catalog discovery (topico 16 PASSO 6/7): answers from
 // ManifestCache, which already holds this dongle's own self-description plus
 // whatever robot manifests have been cached over ESP-NOW (EspNowConfig's
@@ -350,6 +382,145 @@ void handleManifestRequest(const btp::DecodedFrame& decoded) noexcept {
     if (size > 0U) {
         enqueueOwn(btp::MessageType::Control, ManifestCache::kManifestDataObjectId, payload, size);
     }
+}
+
+// This session's own identity (from HELLO, see SerialSession::Session::
+// peerSourceId()) doubles as SubscriptionRegistry's opaque clientId --
+// unique per desktop process (topico 15's BtpHandshake generates a fresh
+// random source_id per run) and already tracked, so no separate session
+// counter is needed. Only meaningful while Protocolled; callers here are
+// only reached in that state.
+std::uint32_t currentClientId() noexcept { return g_session.peerSourceId(); }
+
+// Every UpstreamAction produced by SubscriptionRegistry::onClientDisconnected/
+// expireLeases means "this topic's refcount just hit zero" -- always an
+// unsubscribe, never a subscribe (a fresh/renewed subscribe is dispatched
+// inline from handleSubscribeRequest below, not through this helper).
+void dispatchUpstreamUnsubscribes(const SubscriptionRegistry::UpstreamAction* actions, std::size_t count) noexcept {
+    if (g_requestUpstreamUnsubscribe == nullptr) return;
+    for (std::size_t i = 0U; i < count; ++i) {
+        g_requestUpstreamUnsubscribe(actions[i].sourceId, actions[i].topicId, actions[i].upstreamSubscriptionId);
+    }
+}
+
+std::uint32_t readU16LeAsU32(const std::uint8_t* data) noexcept {
+    return static_cast<std::uint32_t>(readU32Le(data) & 0xFFFFU);
+}
+
+// Desktop -> dongle SUBSCRIBE (COMMANDS_AND_ACTIONS.md section 7, 20-byte
+// payload). This dongle answers synchronously from its own local knowledge
+// (ManifestCache's already-cached schema max_rate_millihz) rather than
+// waiting on a round trip to the robot -- CRITERIO 2 ("pedido acima do
+// maximo e limitado e informado ao cliente") is satisfied immediately this
+// way, and PASSO 7 ("rate limiting sem bloquear tasks criticas") is
+// structurally true because the serial reply never waits on ESP-NOW.
+// SubscriptionRegistry::onDesktopSubscribe applies the same min/max clamp a
+// second (redundant but cheap) time against the *union* of every desktop
+// subscriber once the caller passes it the already-capped rate below, so a
+// second, lower-rate subscriber can never raise what the first one capped.
+void handleSubscribeRequest(const btp::DecodedFrame& decoded) noexcept {
+    if (decoded.payload.size < 20U || decoded.payload.data == nullptr) {
+        return;  // malformed; silently dropped like any other malformed CONTROL payload
+    }
+
+    const std::uint32_t targetSourceId = readU32Le(decoded.payload.data);
+    const std::uint32_t targetBootId = readU32Le(decoded.payload.data + 4U);
+    const std::uint32_t topicId = readU16LeAsU32(decoded.payload.data + 8U);
+    const std::uint32_t requestedRateMillihz = readU32Le(decoded.payload.data + 12U);
+    const std::uint32_t requestedLeaseMs = readU32Le(decoded.payload.data + 16U);
+
+    constexpr std::uint8_t kStatusSuccess = 0x00U;
+    constexpr std::uint8_t kStatusRejected = 0x01U;
+    constexpr std::uint16_t kErrorNone = 0x0000U;
+    constexpr std::uint16_t kErrorInvalidArgument = 0x0003U;
+    constexpr std::uint16_t kErrorNotFound = 0x000BU;
+    constexpr std::uint16_t kErrorCapacityExhausted = 0x0005U;
+
+    std::uint8_t status = kStatusSuccess;
+    std::uint16_t errorCode = kErrorNone;
+    std::uint32_t subscriptionId = 0U;
+    std::uint32_t effectiveRateMillihz = 0U;
+    std::uint32_t grantedLeaseMs = 0U;
+
+    if (targetSourceId == 0U || targetBootId == 0U || topicId == 0U || topicId > 0xFFFFU ||
+        requestedRateMillihz == 0U || requestedLeaseMs == 0U) {
+        status = kStatusRejected;
+        errorCode = kErrorInvalidArgument;
+    } else {
+        std::uint32_t schemaMaxRateMillihz = 0U;
+        if (!ManifestCache::lookupTopicMaxRateMillihz(targetSourceId, topicId, &schemaMaxRateMillihz)) {
+            status = kStatusRejected;
+            errorCode = kErrorNotFound;
+        } else {
+            // Same clamp rule the robot itself applies (COMMANDS_AND_ACTIONS.md
+            // section 7): effective never exceeds requested nor the schema max.
+            // A schema max of zero means "not periodic" (event-driven topic);
+            // the request is still accepted, capped only by what was asked.
+            std::uint32_t cappedRateMillihz = requestedRateMillihz;
+            if (schemaMaxRateMillihz != 0U && cappedRateMillihz > schemaMaxRateMillihz) {
+                cappedRateMillihz = schemaMaxRateMillihz;
+            }
+
+            const SubscriptionRegistry::DesktopSubscribeOutcome outcome = SubscriptionRegistry::onDesktopSubscribe(
+                currentClientId(), targetSourceId, topicId, cappedRateMillihz, requestedLeaseMs, millis());
+            if (!outcome.accepted) {
+                status = kStatusRejected;
+                errorCode = kErrorCapacityExhausted;
+            } else {
+                subscriptionId = outcome.subscriptionId;
+                effectiveRateMillihz = cappedRateMillihz;
+                grantedLeaseMs = (requestedLeaseMs < SubscriptionRegistry::kMinLeaseMs)
+                    ? SubscriptionRegistry::kMinLeaseMs
+                    : (requestedLeaseMs > SubscriptionRegistry::kMaxLeaseMs) ? SubscriptionRegistry::kMaxLeaseMs
+                                                                              : requestedLeaseMs;
+                if (outcome.needsUpstreamSubscribe && g_requestUpstreamSubscribe != nullptr) {
+                    g_requestUpstreamSubscribe(outcome.upstream.sourceId, outcome.upstream.topicId,
+                                              outcome.upstream.rateMillihz, outcome.upstream.leaseMs);
+                }
+            }
+        }
+    }
+
+    std::uint8_t responsePayload[28];
+    writeU32(responsePayload, decoded.header.source_id);
+    writeU32(responsePayload + 4U, decoded.header.boot_id);
+    writeU32(responsePayload + 8U, decoded.header.sequence);
+    responsePayload[12] = status;
+    responsePayload[13] = 0U;  // reserved
+    writeU16(responsePayload + 14U, errorCode);
+    writeU32(responsePayload + 16U, subscriptionId);
+    writeU32(responsePayload + 20U, effectiveRateMillihz);
+    writeU32(responsePayload + 24U, grantedLeaseMs);
+    enqueueOwn(btp::MessageType::Control, SerialSession::kSubscribeResultObjectId, responsePayload,
+              sizeof(responsePayload));
+}
+
+// Desktop -> dongle UNSUBSCRIBE (COMMANDS_AND_ACTIONS.md section 7, 12-byte
+// payload). Always answers SUCCESS/NONE once the envelope parses -- removing
+// an already-absent subscription is defined as idempotent success, not an
+// error (section 7: "torna retries idempotentes").
+void handleUnsubscribeRequest(const btp::DecodedFrame& decoded) noexcept {
+    if (decoded.payload.size < 12U || decoded.payload.data == nullptr) {
+        return;  // malformed; silently dropped like any other malformed CONTROL payload
+    }
+
+    const std::uint32_t subscriptionId = readU32Le(decoded.payload.data + 8U);
+    const SubscriptionRegistry::DesktopUnsubscribeOutcome outcome =
+        SubscriptionRegistry::onDesktopUnsubscribe(currentClientId(), subscriptionId);
+    if (outcome.needsUpstreamUnsubscribe && g_requestUpstreamUnsubscribe != nullptr) {
+        g_requestUpstreamUnsubscribe(outcome.upstream.sourceId, outcome.upstream.topicId,
+                                    outcome.upstream.upstreamSubscriptionId);
+    }
+
+    std::uint8_t responsePayload[16];
+    writeU32(responsePayload, decoded.header.source_id);
+    writeU32(responsePayload + 4U, decoded.header.boot_id);
+    writeU32(responsePayload + 8U, decoded.header.sequence);
+    responsePayload[12] = 0x00U;  // status: SUCCESS
+    responsePayload[13] = 0U;     // reserved
+    writeU16(responsePayload + 14U, 0x0000U);  // error_code: NONE
+    enqueueOwn(btp::MessageType::Control, SerialSession::kUnsubscribeResultObjectId, responsePayload,
+              sizeof(responsePayload));
 }
 
 // Drains whatever g_terminalShell wrote back (echo/prompt/redraw) since the
@@ -436,6 +607,12 @@ void dispatchFrame(const btp::DecodedFrame& decoded, std::uint32_t nowMs) noexce
         case SerialSession::Session::FrameOutcome::ManifestRequest:
             handleManifestRequest(decoded);
             break;
+        case SerialSession::Session::FrameOutcome::SubscribeRequest:
+            handleSubscribeRequest(decoded);
+            break;
+        case SerialSession::Session::FrameOutcome::UnsubscribeRequest:
+            handleUnsubscribeRequest(decoded);
+            break;
     }
 }
 
@@ -512,8 +689,35 @@ void maybeSendStatusHeartbeat(std::uint32_t nowMs) noexcept {
     counters.reassemblyRejected = g_reassemblyRejected;
     counters.telemetryDropped = g_telemetryDropped;
 
-    std::uint8_t payload[SerialSession::kStatusPayloadSize];
-    const std::size_t size = SerialSession::buildStatus(counters, payload, sizeof(payload));
+    // Topico 17 PASSO 9: status_version=2 with a per-(source,topic) record
+    // whenever this dongle currently tracks at least one topic (subscribed
+    // now or previously). Falls back to the plain v1 payload if the
+    // snapshot is empty (nothing to add) or somehow does not fit --
+    // COMMANDS_AND_ACTIONS.md section 8.1 makes topic_status_count=0 valid,
+    // but there is no reason to spend the extra 2 bytes when v1 already says
+    // everything there is to say.
+    SubscriptionRegistry::TopicStatusEntry snapshotEntries[SubscriptionRegistry::kMaxTopics];
+    const std::size_t topicCount =
+        SubscriptionRegistry::topicStatusSnapshot(snapshotEntries, SubscriptionRegistry::kMaxTopics);
+
+    std::uint8_t payload[SerialSession::kStatusPayloadSize +
+                         2U + SubscriptionRegistry::kMaxTopics * SerialSession::kTopicStatusRecordSize];
+    std::size_t size = 0U;
+    if (topicCount > 0U) {
+        SerialSession::TopicStatusRecord records[SubscriptionRegistry::kMaxTopics];
+        for (std::size_t i = 0U; i < topicCount; ++i) {
+            records[i].sourceId = snapshotEntries[i].sourceId;
+            records[i].topicId = snapshotEntries[i].topicId;
+            records[i].subscriberCount = snapshotEntries[i].subscriberCount;
+            records[i].effectiveRateMillihz = snapshotEntries[i].effectiveRateMillihz;
+            records[i].bytesTotal = snapshotEntries[i].bytesTotal;
+            records[i].samplesDroppedTotal = snapshotEntries[i].samplesDroppedTotal;
+        }
+        size = SerialSession::buildStatusV2(counters, records, topicCount, payload, sizeof(payload));
+    }
+    if (size == 0U) {
+        size = SerialSession::buildStatus(counters, payload, sizeof(payload));
+    }
     if (size > 0U) {
         enqueueOwn(btp::MessageType::Control, SerialSession::kStatusObjectId, payload, size);
     }
@@ -546,9 +750,12 @@ void drainTx() noexcept {
 } // namespace
 
 void begin(Stream& io, RunShellLineFn runShellLine, const std::uint8_t selfUuid[16],
-          const char* terminalPrompt) noexcept {
+          const char* terminalPrompt, RequestUpstreamSubscribeFn requestUpstreamSubscribe,
+          RequestUpstreamUnsubscribeFn requestUpstreamUnsubscribe) noexcept {
     g_io = &io;
     g_runShellLine = runShellLine;
+    g_requestUpstreamSubscribe = requestUpstreamSubscribe;
+    g_requestUpstreamUnsubscribe = requestUpstreamUnsubscribe;
     g_session.setLocalUuid(selfUuid);
 
     for (std::size_t i = 0U; i < kPriorityClassCount; ++i) {
@@ -636,6 +843,16 @@ void tick(std::uint32_t nowMs) noexcept {
 
     char consoleLine[SerialSession::kConsoleLineCapacity];
     if (g_session.pollTimeout(nowMs, consoleLine)) {
+        // PASSO 6: same "session ended" cleanup as finalizeToConsole() above,
+        // for the timeout path that does not go through it. peerSourceId()
+        // still names the client that just timed out (pollTimeout only
+        // flips state_, never touches identity).
+        {
+            SubscriptionRegistry::UpstreamAction actions[SubscriptionRegistry::kMaxTopics];
+            const std::size_t count = SubscriptionRegistry::onClientDisconnected(
+                g_session.peerSourceId(), actions, SubscriptionRegistry::kMaxTopics);
+            dispatchUpstreamUnsubscribes(actions, count);
+        }
         resetQueues();
         writeConsoleText(consoleLine);
         g_decoder.reset();
@@ -646,6 +863,18 @@ void tick(std::uint32_t nowMs) noexcept {
     if (g_session.isProtocolled()) {
         pumpTerminalShell();
         maybeSendStatusHeartbeat(nowMs);
+
+        // Lease sweep (topico 17): a client that stopped renewing a
+        // SUBSCRIBE (without ever sending UNSUBSCRIBE or disconnecting) has
+        // its grant time out here, independent of the session's own
+        // session_timeout_ms watchdog.
+        {
+            SubscriptionRegistry::UpstreamAction actions[SubscriptionRegistry::kMaxTopics];
+            const std::size_t count =
+                SubscriptionRegistry::expireLeases(nowMs, actions, SubscriptionRegistry::kMaxTopics);
+            dispatchUpstreamUnsubscribes(actions, count);
+        }
+
         drainTx();
     }
 }
@@ -657,6 +886,23 @@ bool forwardRelay(const btp::Header& header, const std::uint8_t* payload, std::s
         }
         return false;
     }
+
+    // PASSO 3/5 (topico 17): only relay a TELEMETRY topic someone actually
+    // subscribed to -- this is the local half of "fechar um grafico reduz
+    // trafego"; the desktop-facing UNSUBSCRIBE already stopped the upstream
+    // ask towards the robot (handleUnsubscribeRequest), this gate just makes
+    // sure any sample still in flight from before that lands isn't relayed
+    // either. LOG keeps flowing unconditionally: it is not part of the
+    // subscribe/rate-control model (COMMANDS_AND_ACTIONS.md section 7 only
+    // ever mentions telemetry topics), same as before this topico.
+    if (header.type == btp::MessageType::Telemetry) {
+        if (!SubscriptionRegistry::isWanted(header.source_id, header.object_id)) {
+            ++g_telemetryDropped;
+            SubscriptionRegistry::recordDropped(header.source_id, header.object_id);
+            return false;
+        }
+    }
+
     if (payload == nullptr && payloadSize != 0U) {
         return false;
     }
@@ -672,7 +918,15 @@ bool forwardRelay(const btp::Header& header, const std::uint8_t* payload, std::s
         return false;
     }
 
-    return enqueueFrameBytes(SerialSession::classify(header.type, header.object_id), frameBytes, frameSize);
+    const bool queued = enqueueFrameBytes(SerialSession::classify(header.type, header.object_id), frameBytes, frameSize);
+    if (header.type == btp::MessageType::Telemetry) {
+        if (queued) {
+            SubscriptionRegistry::recordForwarded(header.source_id, header.object_id, payloadSize);
+        } else {
+            SubscriptionRegistry::recordDropped(header.source_id, header.object_id);
+        }
+    }
+    return queued;
 }
 
 } // namespace SerialMux

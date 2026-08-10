@@ -44,6 +44,19 @@ namespace SerialMux {
 using RunShellLineFn = void (*)(const char* commandLine, const char* source,
                                 const char* userId, std::string* outFullText);
 
+// Topico 17: SerialMux decides *whether* an upstream (dongle -> robot)
+// SUBSCRIBE/UNSUBSCRIBE is newly needed (SubscriptionRegistry's refcounting),
+// but sending it is EspNowConfig's job (it owns EspNowManager/BtpTransport
+// peer lookup) -- same callback-injection pattern as RunShellLineFn above,
+// used for the same reason: SerialMux must not depend on EspNowConfig
+// (would create the cycle CONTRIBUTING.md section 3 already warns about for
+// ShellConfig). rateMillihz/leaseMs are the union across every remaining
+// desktop subscriber of that topic (already computed by SubscriptionRegistry).
+using RequestUpstreamSubscribeFn = void (*)(std::uint32_t sourceId, std::uint32_t topicId,
+                                            std::uint32_t rateMillihz, std::uint32_t leaseMs);
+using RequestUpstreamUnsubscribeFn = void (*)(std::uint32_t sourceId, std::uint32_t topicId,
+                                              std::uint32_t upstreamSubscriptionId);
+
 // selfUuid is a 16-byte, non-zero, session-stable identifier reported in
 // HELLO_RESULT (BTP has no separate concept of "dongle UUID" yet outside
 // this field -- topico 16 may formalize one). Caller derives it (e.g. from
@@ -52,8 +65,13 @@ using RunShellLineFn = void (*)(const char* commandLine, const char* source,
 // ShellSerial's prompt text -- callers may pass a temporary's c_str() (e.g.
 // ShellOutput::commandPrompt().c_str()); the pointer only needs to remain
 // valid for the duration of this call.
+// requestUpstreamSubscribe/requestUpstreamUnsubscribe may be nullptr in a
+// context that never expects any topic to actually be reachable upstream
+// (e.g. a future test harness); production callers (AppRuntime) always pass
+// EspNowConfig::requestUpstreamSubscribe/requestUpstreamUnsubscribe.
 void begin(Stream& io, RunShellLineFn runShellLine, const std::uint8_t selfUuid[16],
-          const char* terminalPrompt) noexcept;
+          const char* terminalPrompt, RequestUpstreamSubscribeFn requestUpstreamSubscribe = nullptr,
+          RequestUpstreamUnsubscribeFn requestUpstreamUnsubscribe = nullptr) noexcept;
 
 // Tab completion for the BTP terminal session (topico 19, PASSO 1/2): the
 // caller (AppRuntime) passes the same provider it gives serialShell_
