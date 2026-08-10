@@ -50,15 +50,18 @@ std::vector<string> splitTopLevelSemicolons(const string& line) {
 // whether the command actually runs.
 string g_lastCommandLine;
 
-// Fills in the default broadcast peer (000) when send_to is called with only a
-// message and no device number, e.g. "espnow -send_to \"dongle -run status\"".
+// Redirects to send_all when send_to is called with only a message and no
+// device number, e.g. "espnow -send_to \"dongle -run status\"". There is no
+// broadcast peer index anymore (a BTP COMMAND_REQUEST needs a real per-peer
+// boot_id, see EspNowCommands.cpp), so "no index given" now means "every
+// peer we can currently address", same as calling send_all directly.
 string applyEspNowSendToDefault(const string& command) {
     const string prefix = "espnow -send_to ";
 
     if (command.rfind(prefix, 0) == 0) {
         const string args = ShellCommandSupport::trimCopy(command.substr(prefix.length()));
         if (!args.empty() && args.find(',') == string::npos) {
-            return "espnow -send_to 000, " + args;
+            return "espnow -send_all " + args;
         }
     }
 

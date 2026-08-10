@@ -2,16 +2,21 @@
 
 #include <Arduino.h>
 #include <esp_now.h>
-#include <SharedMessageTypes.h>
 
 /**
- * @brief EspNowManager wraps peer registration and messaging over ESP-NOW.
+ * @brief EspNowManager wraps peer registration and raw-byte messaging over
+ * ESP-NOW.
  *
  * Responsibilities:
  * - initialize/deinitialize ESP-NOW stack
  * - maintain a local device registry with metadata
  * - provide send helpers (broadcast over registered peers or direct target)
  * - expose callbacks for receive and send status events
+ *
+ * This class is deliberately protocol-agnostic: it moves bytes and knows
+ * nothing about BTP (type/CRC/fragmentation). Decoding lives one layer up in
+ * ProtocolRouter/EspNowConfig, so this file has no dependency on
+ * bally_protocol.
  */
 class EspNowManager final {
 public:
@@ -21,18 +26,8 @@ public:
     static constexpr size_t DEVICE_NAME_SIZE = 32;
     /** Maximum length for device description, including terminator. */
     static constexpr size_t DEVICE_DESCRIPTION_SIZE = 96;
-    /** Payload text size compatible with message struct. */
-    static constexpr size_t MESSAGE_TEXT_SIZE = MAX_CONTENT_SIZE;
-
-    /**
-     * @brief Message category used in ESP-NOW payloads.
-     */
-    using logType = ::logType;
-
-    /**
-     * @brief Wire payload structure shared between sender and receiver.
-     */
-    using message = ::message;
+    /** Hard ESP-NOW datagram size cap (driver limit), not a protocol constant. */
+    static constexpr size_t MAX_DATA_LEN = 250;
 
     /**
      * @brief Local device registry record.
@@ -43,8 +38,8 @@ public:
         char description[DEVICE_DESCRIPTION_SIZE];
     };
 
-    /** Callback for incoming message payloads. */
-    using ReceiveCallback = void (*)(const uint8_t* mac, const message& incoming);
+    /** Callback for incoming raw datagrams (bytes + size, as received from the radio). */
+    using ReceiveCallback = void (*)(const uint8_t* mac, const uint8_t* data, size_t len);
     /** Callback for delivery result notifications. */
     using SendCallback = void (*)(const uint8_t* mac, esp_now_send_status_t status);
 
@@ -132,50 +127,54 @@ public:
     int deviceIndexByMac(const uint8_t mac[6]) const;
 
     /**
-     * @brief Sends one message to all registered devices.
+     * @brief Sends one datagram to all registered devices.
      */
-    bool sendToAll(const message& outgoing) const;
+    bool sendToAll(const uint8_t* data, size_t len) const;
 
     /**
-     * @brief Sends one message to a device identified by index.
+     * @brief Sends one datagram to a device identified by index.
      */
-    bool sendToDevice(size_t index, const message& outgoing) const;
+    bool sendToDevice(size_t index, const uint8_t* data, size_t len) const;
 
     /**
-     * @brief Sends one message directly to a MAC address.
+     * @brief Sends one datagram directly to a MAC address.
      */
-    bool sendToMac(const uint8_t mac[6], const message& outgoing) const;
+    bool sendToMac(const uint8_t mac[6], const uint8_t* data, size_t len) const;
 
     /**
-     * @brief Sends message and waits for callback status for target index.
+     * @brief Sends datagram and waits for callback status for target index.
      * @param index Device index in registry.
-     * @param outgoing Payload to send.
+     * @param data Datagram bytes.
+     * @param len Datagram size.
      * @param outDelivered true when callback reports success.
      * @param timeoutMs Max wait time for callback.
      * @return true when send callback was received.
      */
-    bool sendToDeviceWithStatus(size_t index, const message& outgoing, bool& outDelivered, uint32_t timeoutMs = 600) const;
+    bool sendToDeviceWithStatus(size_t index, const uint8_t* data, size_t len, bool& outDelivered, uint32_t timeoutMs = 600) const;
 
     /**
-     * @brief Sends message and waits for callback status for target MAC.
+     * @brief Sends datagram and waits for callback status for target MAC.
      * @param mac Target MAC.
-     * @param outgoing Payload to send.
+     * @param data Datagram bytes.
+     * @param len Datagram size.
      * @param outDelivered true when callback reports success.
      * @param timeoutMs Max wait time for callback.
      * @return true when send callback was received.
      */
-    bool sendToMacWithStatus(const uint8_t mac[6], const message& outgoing, bool& outDelivered, uint32_t timeoutMs = 600) const;
+    bool sendToMacWithStatus(const uint8_t mac[6], const uint8_t* data, size_t len, bool& outDelivered, uint32_t timeoutMs = 600) const;
 
     /**
      * @brief Sends to all peers and aggregates callback delivery status.
-     * @param outgoing Payload to send.
+     * @param data Datagram bytes.
+     * @param len Datagram size.
      * @param outDeliveredCount Number of peers confirmed as delivered.
      * @param outTriedCount Number of peers attempted.
      * @param timeoutMs Per-peer callback timeout.
      * @return true when at least one peer was attempted.
      */
     bool sendToAllWithStatus(
-        const message& outgoing,
+        const uint8_t* data,
+        size_t len,
         size_t& outDeliveredCount,
         size_t& outTriedCount,
         uint32_t timeoutMs = 600

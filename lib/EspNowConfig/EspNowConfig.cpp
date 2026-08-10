@@ -2,129 +2,68 @@
 #include "LcdDashboard.h"
 #include "ShellConfig.h"
 #include "ShellOutput.h"
+#include "BtpTransport.h"
 
 #include <cstdio>
 #include <cstring>
-#include <ctime>
-#include <Esp.h>
+#include <string>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 
 namespace {
 
-// Shared output stream used by ESP-NOW callbacks.
+// Shared output stream and runtime services used by ESP-NOW callbacks.
 Stream* g_io = nullptr;
 EspNowManager* g_manager = nullptr;
 DatabaseStore* g_database = nullptr;
 LcdDashboard* g_lcdDashboard = nullptr;
-QueueHandle_t g_rxQueue = nullptr;
-QueueHandle_t g_rxDisplayQueue = nullptr;
-QueueHandle_t g_rxDbLogQueue = nullptr;
-volatile uint32_t g_droppedRxCount = 0;
-volatile uint32_t g_overwrittenRxDisplayCount = 0;
-volatile uint32_t g_droppedRxDbLogCount = 0;
-bool g_asyncRxEnabled = false;
-bool g_asyncDbLogEnabled = false;
 
-// Heartbeat target: last peer we received real (non-PING) data from.
+ProtocolRouter::Router g_router;
+
+QueueHandle_t g_rxQueue = nullptr;
+QueueHandle_t g_logQueue = nullptr;
+QueueHandle_t g_telemetryQueue = nullptr;
+QueueHandle_t g_terminalQueue = nullptr;
+QueueHandle_t g_controlQueue = nullptr;
+
+volatile uint32_t g_droppedRxCount = 0;      // raw datagram queue full
+volatile uint32_t g_droppedDecodeCount = 0;  // ProtocolRouter: bad envelope
+volatile uint32_t g_droppedCrcCount = 0;     // ProtocolRouter: CRC mismatch
+volatile uint32_t g_droppedReassemblyCount = 0; // ProtocolRouter: reassembly conflict/timeout/etc
+volatile uint32_t g_droppedQueueFullCount = 0;  // routed message, but its type queue was full
+bool g_asyncRxEnabled = false;
+
+// Heartbeat target: last peer we received real data from.
 uint8_t g_heartbeatTargetMac[6] = {0};
 bool g_hasHeartbeatTarget = false;
 
-struct RxDisplayLine {
-    char header[96];
-    char payload[EspNowManager::MESSAGE_TEXT_SIZE + 1];
-    char closeSuffix[24];
-    size_t payloadLen;
-    uint16_t color;
-    bool appendToPrevious;
-    bool keepLineOpen;
-};
-
-bool g_rxLineOpen = false;
-size_t g_rxContinuationPadding = 1;
-bool g_rxAssemblyActive = false;
-bool g_rxAssemblyHasMac = false;
-uint8_t g_rxAssemblyMac[6] = {0};
-uint16_t g_rxExpectedPacketNumber = 0;
-bool g_rxAssemblyZeroBased = false;
-
-uint16_t logTypeToLcdColor(EspNowManager::logType type) {
-    switch (type) {
-    case EspNowManager::logType::ERRO:
-        return ST77XX_RED;
-    case EspNowManager::logType::DEBG:
-        return ST77XX_YELLOW;
-    case EspNowManager::logType::INFO:
-    case EspNowManager::logType::NONE:
-    default:
-        return ST77XX_BLACK;
-    }
+// Adapter binding BtpTransport's transport-agnostic send callback to this
+// dongle's actual EspNowManager instance.
+bool sendViaManager(void* context, const uint8_t mac[6], const uint8_t* data, size_t size) {
+    return static_cast<EspNowManager*>(context)->sendToMac(mac, data, size);
 }
 
-String arrivalTimeText() {
-    const time_t nowEpoch = time(nullptr);
-    const unsigned long ms = static_cast<unsigned long>(millis() % 1000);
-    if (nowEpoch > 0) {
-        std::tm localTime = {};
-        if (localtime_r(&nowEpoch, &localTime) != nullptr) {
-            char out[32] = {0};
-            std::strftime(out, sizeof(out), "%H:%M:%S", &localTime);
-            char result[40] = {0};
-            std::snprintf(result, sizeof(result), "%s.%03lu", out, ms);
-            return String(result);
-        }
-    }
-
-    char fallback[32] = {0};
-    std::snprintf(fallback, sizeof(fallback), "ms%lu.%03lu", static_cast<unsigned long>(millis() / 1000), ms);
-    return String(fallback);
-}
-
-size_t copyIncomingPayload(const EspNowManager::message& incomingData, char* outPayload, size_t outSize) {
-    if (outPayload == nullptr || outSize == 0) {
-        return 0;
-    }
-
-    size_t length = incomingData.content.size;
-    if (length == 0) {
-        while (length < EspNowManager::MESSAGE_TEXT_SIZE && incomingData.content.text[length] != '\0') {
-            ++length;
-        }
-    } else if (length > EspNowManager::MESSAGE_TEXT_SIZE) {
-        length = EspNowManager::MESSAGE_TEXT_SIZE;
-    }
-
-    const size_t copyLen = (length < (outSize - 1)) ? length : (outSize - 1);
-    if (copyLen > 0) {
-        std::memcpy(outPayload, incomingData.content.text, copyLen);
-    }
-    outPayload[copyLen] = '\0';
-    return copyLen;
-}
-
-// Looks for lines like "state changed: SETUP -> WAIT" in a received payload
-// and pulls out the new state (always right after the last "->"). Checked
-// per-packet rather than on a fully reassembled message: in practice these
-// status lines are short and always fit in a single ESP-NOW packet.
-bool tryExtractRobotState(const char* payload, String& outState) {
-    if (payload == nullptr || payload[0] == '\0') {
+// "state changed: SETUP -> WAIT" style lines emitted by the robot's Logger.
+// Checked only on LOG payloads (never TELEMETRY, which stays opaque bytes).
+bool tryExtractRobotState(const char* text, String& outState) {
+    if (text == nullptr || text[0] == '\0') {
         return false;
     }
 
-    const String text(payload);
-    String lower = text;
+    const String line(text);
+    String lower = line;
     lower.toLowerCase();
     if (lower.indexOf("state changed") < 0) {
         return false;
     }
 
-    const int32_t arrowPos = text.lastIndexOf("->");
+    const int32_t arrowPos = line.lastIndexOf("->");
     if (arrowPos < 0) {
         return false;
     }
 
-    String state = text.substring(arrowPos + 2);
+    String state = line.substring(arrowPos + 2);
     state.trim();
     if (state.length() == 0) {
         return false;
@@ -134,496 +73,217 @@ bool tryExtractRobotState(const char* payload, String& outState) {
     return true;
 }
 
-void writeRawToStream(Stream* io, const char* data, size_t len);
-
-void resetRxAssemblyState() {
-    g_rxAssemblyActive = false;
-    g_rxAssemblyHasMac = false;
-    g_rxExpectedPacketNumber = 0;
-    g_rxAssemblyZeroBased = false;
+void macToText(const uint8_t mac[6], char out[18]) {
+    std::snprintf(out, 18, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
-bool sameMacAddress(const uint8_t* lhs, const uint8_t* rhs) {
-    return lhs != nullptr && rhs != nullptr && std::memcmp(lhs, rhs, 6) == 0;
+// Copies a routed payload into a NUL-terminated stack buffer for display
+// purposes only (routing itself already preserved the full byte range).
+size_t copyPayloadAsText(const ProtocolRouter::RoutedMessage& routed, char* out, size_t outCapacity) {
+    if (out == nullptr || outCapacity == 0) {
+        return 0;
+    }
+
+    const size_t copyLen = (routed.payloadSize < outCapacity - 1) ? routed.payloadSize : (outCapacity - 1);
+    if (copyLen > 0) {
+        std::memcpy(out, routed.payload, copyLen);
+    }
+    out[copyLen] = '\0';
+    return copyLen;
 }
 
-void closeOpenRxLine(Stream* io) {
-    if (io == nullptr || !g_rxLineOpen) {
-        return;
-    }
-
-    io->write('\r');
-    io->write('\n');
-    g_rxLineOpen = false;
-}
-
-void writePaddingSpaces(Stream* io, size_t count) {
-    if (io == nullptr || count == 0) {
-        return;
-    }
-
-    for (size_t i = 0; i < count; ++i) {
-        io->write(' ');
-    }
-}
-
-void writePayloadWithContinuation(Stream* io, const char* payload, size_t payloadLen, size_t continuationPadding) {
-    if (io == nullptr || payload == nullptr || payloadLen == 0) {
-        return;
-    }
-
-    size_t start = 0;
-    for (size_t i = 0; i < payloadLen; ++i) {
-        const char ch = payload[i];
-        if (ch != '\r' && ch != '\n') {
-            continue;
-        }
-
-        if (i > start) {
-            writeRawToStream(io, payload + start, i - start);
-        }
-
-        if (ch == '\r' && (i + 1) < payloadLen && payload[i + 1] == '\n') {
-            ++i;
-        }
-
-        io->write('\r');
-        io->write('\n');
-        if ((i + 1) < payloadLen) {
-            writePaddingSpaces(io, continuationPadding);
-        }
-
-        start = i + 1;
-    }
-
-    if (start < payloadLen) {
-        writeRawToStream(io, payload + start, payloadLen - start);
+QueueHandle_t queueForType(btp::MessageType type) {
+    switch (type) {
+        case btp::MessageType::Log: return g_logQueue;
+        case btp::MessageType::Telemetry: return g_telemetryQueue;
+        case btp::MessageType::Terminal: return g_terminalQueue;
+        case btp::MessageType::Control: return g_controlQueue;
+        case btp::MessageType::Command:
+        case btp::MessageType::Invalid:
+        default: return nullptr;
     }
 }
 
-void writeRawToStream(Stream* io, const char* data, size_t len) {
-    if (io == nullptr || data == nullptr || len == 0) {
-        return;
-    }
-
-    const uint8_t* ptr = reinterpret_cast<const uint8_t*>(data);
-    size_t remaining = len;
-    uint32_t retries = 0;
-
-    while (remaining > 0) {
-        const size_t sent = io->write(ptr, remaining);
-        if (sent == 0) {
-            ++retries;
-            if (retries > 8) {
-                break;
-            }
-            delay(1);
-            continue;
-        }
-
-        ptr += sent;
-        remaining -= sent;
-    }
-}
-
-void ensurePayloadTerminator(Stream* io, const char* payload, size_t payloadLen) {
-    if (io == nullptr) {
-        return;
-    }
-
-    if (payloadLen == 0) {
-        io->write('\r');
-        io->write('\n');
-        return;
-    }
-
-    const char last = payload[payloadLen - 1];
-    if (last != '\n' && last != '\r') {
-        io->write('\r');
-        io->write('\n');
-    }
-}
-
-void writeCloseSuffix(Stream* io, const char* closeSuffix) {
-    if (io == nullptr || closeSuffix == nullptr || closeSuffix[0] == '\0') {
-        return;
-    }
-
-    io->write(' ');
-    writeRawToStream(io, closeSuffix, std::strlen(closeSuffix));
-}
-
-void writeRxLineToStream(
-    Stream* io,
-    const char* header,
-    const char* payload,
-    size_t payloadLen,
-    bool keepLineOpen,
-    const char* closeSuffix
-) {
-    if (io == nullptr || header == nullptr) {
-        return;
-    }
-
-    closeOpenRxLine(io);
-
-    const size_t headerLen = std::strlen(header);
-    const size_t continuationPadding = headerLen + 1;
-    g_rxContinuationPadding = continuationPadding;
-
-    // Ensure the log starts from the beginning of the terminal line.
-    io->write('\r');
-    writeRawToStream(io, header, headerLen);
-    if (payload != nullptr && payloadLen > 0) {
-        io->write(' ');
-        writePayloadWithContinuation(io, payload, payloadLen, continuationPadding);
-    }
-
-    if (keepLineOpen) {
-        g_rxLineOpen = true;
-        return;
-    }
-
-    writeCloseSuffix(io, closeSuffix);
-    io->write('\r');
-    io->write('\n');
-    g_rxLineOpen = false;
-}
-
-void writeRxContinuationToStream(
-    Stream* io,
-    const char* payload,
-    size_t payloadLen,
-    bool keepLineOpen,
-    const char* closeSuffix
-) {
-    if (io == nullptr || payload == nullptr || payloadLen == 0) {
-        return;
-    }
-
-    if (!g_rxLineOpen) {
-        io->write('\r');
-    }
-
-    writePayloadWithContinuation(io, payload, payloadLen, g_rxContinuationPadding);
-
-    if (keepLineOpen) {
-        g_rxLineOpen = true;
-        return;
-    }
-
-    writeCloseSuffix(io, closeSuffix);
-    io->write('\r');
-    io->write('\n');
-    g_rxLineOpen = false;
-}
-
-bool enqueueDisplayLine(
-    const char* header,
-    const char* payload,
-    size_t payloadLen,
-    uint16_t color,
-    bool appendToPrevious,
-    bool keepLineOpen,
-    const char* closeSuffix
-) {
-    if (header == nullptr || payload == nullptr) {
+bool enqueueRouted(QueueHandle_t queue, const ProtocolRouter::RoutedMessage& routed) {
+    if (queue == nullptr) {
         return false;
     }
 
-    if (g_rxDisplayQueue == nullptr) {
-        return false;
-    }
-
-    RxDisplayLine item = {};
-    std::snprintf(item.header, sizeof(item.header), "%s", header);
-    std::snprintf(item.payload, sizeof(item.payload), "%s", payload);
-    std::snprintf(item.closeSuffix, sizeof(item.closeSuffix), "%s", (closeSuffix != nullptr) ? closeSuffix : "");
-    item.payloadLen = payloadLen;
-    item.color = color;
-    item.appendToPrevious = appendToPrevious;
-    item.keepLineOpen = keepLineOpen;
-
-    if (xQueueSend(g_rxDisplayQueue, &item, 0) == pdTRUE) {
+    if (xQueueSend(queue, &routed, 0) == pdTRUE) {
         return true;
     }
 
-    // Cyclic queue behavior: when full, drop oldest and keep newest.
-    RxDisplayLine oldest = {};
-    if (xQueueReceive(g_rxDisplayQueue, &oldest, 0) != pdTRUE) {
-        return false;
-    }
-
-    if (xQueueSend(g_rxDisplayQueue, &item, 0) == pdTRUE) {
-        ++g_overwrittenRxDisplayCount;
-        return true;
-    }
-
+    ++g_droppedQueueFullCount;
     return false;
 }
 
-bool createDbLogQueue() {
-    if (g_rxDbLogQueue != nullptr) {
-        return true;
+// Sends one COMMAND_RESULT back to the requester, correlated by the original
+// request's (source_id, boot_id, sequence) per bally_protocol/docs/
+// COMMANDS_AND_ACTIONS.md section 2.
+void replyCommandResult(
+    const uint8_t mac[6],
+    const btp::Header& requestHeader,
+    uint16_t actionId,
+    uint16_t actionVersion,
+    BtpTransport::btp_command::Status status,
+    BtpTransport::btp_command::ErrorCode errorCode,
+    const std::string& message
+) {
+    if (g_manager == nullptr) {
+        return;
     }
 
-    const size_t minDepth = (RX_DB_LOG_QUEUE_DEPTH > 0U)
-        ? static_cast<size_t>(RX_DB_LOG_QUEUE_DEPTH)
-        : static_cast<size_t>(1U);
+    const std::string truncated = message.substr(
+        0, BtpTransport::btp_command::kMaxResultMessageSize);
 
-#if RX_DB_LOG_DYNAMIC_ALLOC
-    const size_t entrySize = sizeof(EspNowConfig::RxDbLogEvent);
-    const size_t heapReserve = static_cast<size_t>(RX_DB_LOG_HEAP_RESERVE_BYTES);
-    const size_t freeHeap = static_cast<size_t>(ESP.getFreeHeap());
+    uint8_t resultPayload[BtpTransport::btp_command::kResultPrefixSize +
+                          BtpTransport::btp_command::kMaxResultMessageSize];
+    const size_t resultSize = BtpTransport::btp_command::build_result(
+        requestHeader.source_id, requestHeader.boot_id, requestHeader.sequence,
+        actionId, actionVersion, status, errorCode, truncated.c_str(),
+        nullptr, 0, resultPayload, sizeof(resultPayload));
 
-    size_t targetDepth = minDepth;
-    if (freeHeap > heapReserve + entrySize) {
-        targetDepth = (freeHeap - heapReserve) / entrySize;
-        if (targetDepth < minDepth) {
-            targetDepth = minDepth;
-        }
+    if (resultSize == 0) {
+        return;
     }
 
-    size_t candidateDepth = targetDepth;
-    while (candidateDepth >= minDepth) {
-        g_rxDbLogQueue = xQueueCreate(static_cast<UBaseType_t>(candidateDepth), sizeof(EspNowConfig::RxDbLogEvent));
-        if (g_rxDbLogQueue != nullptr) {
-            return true;
-        }
-
-        if (candidateDepth == minDepth) {
-            break;
-        }
-
-        const size_t reducedDepth = (candidateDepth * 9U) / 10U;
-        candidateDepth = (reducedDepth < minDepth) ? minDepth : reducedDepth;
-    }
-
-    return g_rxDbLogQueue != nullptr;
-#else
-    g_rxDbLogQueue = xQueueCreate(static_cast<UBaseType_t>(minDepth), sizeof(EspNowConfig::RxDbLogEvent));
-    return g_rxDbLogQueue != nullptr;
-#endif
+    const uint64_t timestampUs = static_cast<uint64_t>(millis()) * 1000ULL;
+    BtpTransport::sendLogical(sendViaManager, g_manager, mac, btp::MessageType::Command,
+                              BtpTransport::btp_command::kCommandResultObjectId,
+                              resultPayload, resultSize, timestampUs);
 }
 
-// Runs a command received from a trusted peer (CMDO type) and sends the
-// output back to that same peer. Only peers already in our registry are
-// trusted to trigger execution; unknown MACs are left alone here (the
-// message is still shown/logged normally like any other RX text).
-void handleRemoteCommand(const uint8_t mac[6], const char* payloadText) {
-    if (g_manager == nullptr || mac == nullptr || payloadText == nullptr || payloadText[0] == '\0') {
+// A peer we sent a COMMAND_REQUEST to (espnow -send_to/-send_all) replying
+// back. Replaces the old "reply arrives tagged INFO, shown like any RX line".
+void handleRoutedCommandResult(const uint8_t mac[6], const btp::Header& header, btp::ByteView payload) {
+    BtpTransport::btp_command::ResultView result{};
+    if (BtpTransport::btp_command::parse_result(header, payload, &result) !=
+        BtpTransport::btp_command::ParseError::Ok) {
         return;
     }
 
-    if (g_manager->deviceIndexByMac(mac) < 0) {
-        return;
-    }
-
-    // Each peer is its own sudo identity, so elevation granted to one robot
-    // doesn't leak to another that happens to also send CMDO messages.
     char macText[18] = {0};
-    std::snprintf(
-        macText,
-        sizeof(macText),
-        "%02X:%02X:%02X:%02X:%02X:%02X",
-        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-    );
+    macToText(mac, macText);
+
+    char line[64] = {0};
+    std::snprintf(line, sizeof(line), "%s status=%s", macText,
+                  BtpTransport::btp_command::status_string(result.status));
+    if (g_io != nullptr) {
+        ShellOutput::printTagged(*g_io, "cmd_result", line);
+    }
+
+    if (result.message.size > 0 && result.message.data != nullptr && g_io != nullptr) {
+        char messageText[BtpTransport::btp_command::kMaxResultMessageSize + 1] = {0};
+        const size_t messageLen = (result.message.size < sizeof(messageText) - 1)
+            ? result.message.size
+            : (sizeof(messageText) - 1);
+        std::memcpy(messageText, result.message.data, messageLen);
+        messageText[messageLen] = '\0';
+        ShellOutput::printTagged(*g_io, "cmd_result", messageText);
+    }
+}
+
+// Runs a shell command received from a trusted peer (COMMAND_REQUEST) and
+// replies with a COMMAND_RESULT. Only peers already in our registry are
+// trusted to trigger execution -- content of the command is never inspected
+// for authorization (see CONTRIBUTING.md section 5).
+void handleRoutedCommandRequest(const uint8_t mac[6], const ProtocolRouter::RoutedMessage& routed) {
+    if (g_manager == nullptr || g_manager->deviceIndexByMac(mac) < 0) {
+        return;
+    }
+
+    using namespace BtpTransport::btp_command;
+
+    const btp::ByteView payloadView{routed.payload, routed.payloadSize};
+    RequestView request{};
+    const ParseError parseError = parse_request(routed.header, payloadView, BtpTransport::sourceId(),
+                                                BtpTransport::bootId(), &request);
+    if (parseError == ParseError::WrongTarget) {
+        return; // not addressed to this dongle's current boot
+    }
+    if (parseError != ParseError::Ok) {
+        replyCommandResult(mac, routed.header, 0, 0, Status::Rejected, ErrorCode::MalformedPayload,
+                           parse_error_string(parseError));
+        return;
+    }
+
+    char commandText[kMaxShellCommandSize + 1] = {0};
+    const ParseError copyError = copy_shell_command(request, commandText, sizeof(commandText));
+    if (copyError != ParseError::Ok) {
+        const ErrorCode errorCode = (copyError == ParseError::UnsupportedAction)
+            ? ErrorCode::UnsupportedVersion
+            : ErrorCode::InvalidArgument;
+        replyCommandResult(mac, routed.header, request.action_id, request.action_version,
+                           Status::Rejected, errorCode, parse_error_string(copyError));
+        return;
+    }
+
+    char macText[18] = {0};
+    macToText(mac, macText);
     const std::string userId = std::string("espnow:") + macText;
 
     std::string fullOutput;
-    ShellConfig::runLine(std::string(payloadText), "espnow", &fullOutput, userId);
+    ShellConfig::runLine(std::string(commandText), "espnow", &fullOutput, userId);
 
-    EspNowManager::message reply = {};
-    reply.timer = millis();
-    reply.type = logType::INFO; // not CMDO: avoids a reply-triggers-reply loop with peers running the same logic
-    reply.packet_number = 0;
-    reply.total_packets = 1;
-    reply.checksum = 0;
-
-    const size_t maxLen = EspNowManager::MESSAGE_TEXT_SIZE;
-    const size_t copyLen = (fullOutput.size() < maxLen) ? fullOutput.size() : maxLen;
-    if (copyLen > 0) {
-        std::memcpy(reply.content.text, fullOutput.c_str(), copyLen);
-    }
-    reply.content.text[copyLen] = '\0';
-    reply.content.size = copyLen;
-
-    g_manager->sendToMac(mac, reply);
+    replyCommandResult(mac, routed.header, request.action_id, request.action_version,
+                       Status::Success, ErrorCode::None, fullOutput);
 }
 
-void processRxMessageInternal(const uint8_t mac[6], const EspNowManager::message& incomingData) {
+void handleRoutedCommand(const uint8_t mac[6], const ProtocolRouter::RoutedMessage& routed) {
+    if (routed.header.object_id == BtpTransport::btp_command::kCommandResultObjectId) {
+        handleRoutedCommandResult(mac, routed.header, {routed.payload, routed.payloadSize});
+        return;
+    }
+    if (routed.header.object_id == BtpTransport::btp_command::kCommandRequestObjectId) {
+        handleRoutedCommandRequest(mac, routed);
+        return;
+    }
+    // Reserved COMMAND object_id (bally_protocol/docs/COMMANDS_AND_ACTIONS.md
+    // section 3.1): a v1 receiver MUST reject it without reinterpreting it.
+}
+
+void dispatchRouted(const uint8_t mac[6], const ProtocolRouter::RoutedMessage& routed) {
+    if (routed.header.type == btp::MessageType::Command) {
+        // Latency sensitive (remote shell execution): handled synchronously,
+        // not queued -- see EspNowConfig.h for the rationale.
+        handleRoutedCommand(mac, routed);
+        return;
+    }
+
+    QueueHandle_t queue = queueForType(routed.header.type);
+    enqueueRouted(queue, routed);
+}
+
+void processRxDatagramInternal(const uint8_t mac[6], const uint8_t* data, size_t len) {
     if (g_lcdDashboard != nullptr) {
         g_lcdDashboard->notifyRx();
     }
 
-    if (incomingData.type == logType::PING) {
-        // Heartbeat probe from a peer: the ESP-NOW driver already sent the
-        // delivery ACK back to whoever pinged us, nothing else to do here.
-        // Skipped on purpose: display/DB logging (would spam at 5x/s) and
-        // heartbeat-target tracking (a ping isn't "real data" from a peer).
-        return;
+    ProtocolRouter::RoutedMessage routed{};
+    const ProtocolRouter::Outcome outcome = g_router.submit(mac, data, len, millis(), &routed);
+
+    switch (outcome) {
+        case ProtocolRouter::Outcome::DroppedDecode:
+            ++g_droppedDecodeCount;
+            return;
+        case ProtocolRouter::Outcome::DroppedCrc:
+            ++g_droppedCrcCount;
+            return;
+        case ProtocolRouter::Outcome::DroppedReassembly:
+            ++g_droppedReassemblyCount;
+            return;
+        case ProtocolRouter::Outcome::DroppedInvalidArgument:
+        case ProtocolRouter::Outcome::FragmentAccepted:
+        case ProtocolRouter::Outcome::DuplicateFragment:
+            return;
+        case ProtocolRouter::Outcome::Routed:
+            break;
     }
 
     if (mac != nullptr) {
         std::memcpy(g_heartbeatTargetMac, mac, sizeof(g_heartbeatTargetMac));
         g_hasHeartbeatTarget = true;
-    }
-
-    char payload[EspNowManager::MESSAGE_TEXT_SIZE + 1] = {0};
-    const size_t copiedPayloadLen = copyIncomingPayload(incomingData, payload, sizeof(payload));
-    const size_t payloadLen = copiedPayloadLen;
-
-    // Robot state accepted from any peer, not just the one being heartbeated.
-    String robotState;
-    if (g_lcdDashboard != nullptr && tryExtractRobotState(payload, robotState)) {
-        g_lcdDashboard->notifyRobotState(robotState);
-    }
-
-    // Single-packet only: a remote command line is short and always fits in
-    // one ESP-NOW packet, so this deliberately skips fragment reassembly.
-    if (incomingData.type == logType::CMDO && incomingData.total_packets <= 1) {
-        handleRemoteCommand(mac, payload);
-    }
-
-    if (g_rxAssemblyActive && g_rxAssemblyHasMac && mac != nullptr && !sameMacAddress(g_rxAssemblyMac, mac)) {
-        closeOpenRxLine(g_io);
-        resetRxAssemblyState();
-    }
-
-    const uint16_t totalPackets = (incomingData.total_packets == 0)
-        ? static_cast<uint16_t>(1)
-        : incomingData.total_packets;
-    const bool usesZeroBased = g_rxAssemblyActive ? g_rxAssemblyZeroBased : (incomingData.packet_number == 0);
-
-    uint16_t packetNumber = 1;
-    if (totalPackets <= 1U) {
-        packetNumber = 1U;
-    } else if (usesZeroBased) {
-        uint16_t packetIndex = incomingData.packet_number;
-        if (packetIndex >= totalPackets) {
-            packetIndex = static_cast<uint16_t>(totalPackets - 1U);
-        }
-        packetNumber = static_cast<uint16_t>(packetIndex + 1U);
-    } else {
-        packetNumber = (incomingData.packet_number == 0U)
-            ? static_cast<uint16_t>(1U)
-            : incomingData.packet_number;
-        if (packetNumber > totalPackets) {
-            packetNumber = totalPackets;
-        }
-    }
-
-    const bool packetIsLast = (totalPackets <= 1U) || (packetNumber >= totalPackets);
-    const bool keepLineOpen = (totalPackets > 1U) && !packetIsLast;
-    const bool isPackageContinuation = (totalPackets > 1U) && (packetNumber > 1U);
-
-    bool appendToPrevious = false;
-    if (isPackageContinuation) {
-        appendToPrevious = g_rxAssemblyActive &&
-                           packetNumber == g_rxExpectedPacketNumber &&
-                           (!g_rxAssemblyHasMac || sameMacAddress(g_rxAssemblyMac, mac));
-
-        if (!appendToPrevious) {
-            closeOpenRxLine(g_io);
-        }
-    } else {
-        closeOpenRxLine(g_io);
-    }
-
-    char packetProgress[16] = {0};
-    std::snprintf(
-        packetProgress,
-        sizeof(packetProgress),
-        "%u/%u",
-        static_cast<unsigned>(packetNumber),
-        static_cast<unsigned>(totalPackets)
-    );
-
-    char header[96] = {0};
-    if (!appendToPrevious) {
-        const String arrivedAt = arrivalTimeText();
-        const char* typeText = logTypeToString(incomingData.type);
-        std::snprintf(
-            header,
-            sizeof(header),
-            "[%s][%s][%s]",
-            typeText,
-            arrivedAt.c_str(),
-            packetProgress
-        );
-    }
-
-    char closeSuffix[24] = {0};
-    if (appendToPrevious && packetIsLast) {
-        std::snprintf(
-            closeSuffix,
-            sizeof(closeSuffix),
-            "[%u/%u]",
-            static_cast<unsigned>(packetNumber),
-            static_cast<unsigned>(totalPackets)
-        );
-    }
-
-    if (keepLineOpen) {
-        g_rxAssemblyActive = true;
-        g_rxExpectedPacketNumber = static_cast<uint16_t>(packetNumber + 1U);
-        g_rxAssemblyZeroBased = usesZeroBased;
-        if (mac != nullptr) {
-            std::memcpy(g_rxAssemblyMac, mac, sizeof(g_rxAssemblyMac));
-            g_rxAssemblyHasMac = true;
-        } else {
-            g_rxAssemblyHasMac = false;
-        }
-    } else {
-        resetRxAssemblyState();
-    }
-
-    const uint16_t color = logTypeToLcdColor(incomingData.type);
-    const bool displayQueueReady = (g_rxDisplayQueue != nullptr);
-    if (!enqueueDisplayLine(header, payload, payloadLen, color, appendToPrevious, keepLineOpen, closeSuffix)) {
-        // Fallback only when queue is unavailable.
-        if (!displayQueueReady) {
-            if (g_io != nullptr) {
-                if (appendToPrevious) {
-                    writeRxContinuationToStream(g_io, payload, payloadLen, keepLineOpen, closeSuffix);
-                } else {
-                    writeRxLineToStream(g_io, header, payload, payloadLen, keepLineOpen, closeSuffix);
-                }
-            }
-
-#if !HIGH_FREQUENCY_INCOMMING_ESPNOW
-            if (g_lcdDashboard != nullptr && g_lcdDashboard->isReady()) {
-                String lcdLine;
-                if (payloadLen > 0) {
-                    String lcdPayload = String(payload);
-                    lcdPayload.replace('\r', ' ');
-                    lcdPayload.replace('\n', ' ');
-                    lcdPayload.replace('\t', ' ');
-                    lcdPayload.trim();
-                    if (appendToPrevious) {
-                        lcdLine = lcdPayload;
-                    } else {
-                        lcdLine = String(header);
-                        lcdLine += " ";
-                        lcdLine += lcdPayload;
-                    }
-                } else if (!appendToPrevious) {
-                    lcdLine = String(header);
-                }
-
-                if (!keepLineOpen && closeSuffix[0] != '\0') {
-                    if (lcdLine.length() > 0) {
-                        lcdLine += " ";
-                    }
-                    lcdLine += closeSuffix;
-                }
-
-                if (lcdLine.length() > 0) {
-                    g_lcdDashboard->showMessage(lcdLine, color);
-                }
-            }
-#endif
-        }
+        BtpTransport::rememberPeer(mac, routed.header.source_id, routed.header.boot_id);
     }
 
     if (mac != nullptr && g_manager != nullptr && g_manager->deviceIndexByMac(mac) < 0) {
@@ -632,36 +292,20 @@ void processRxMessageInternal(const uint8_t mac[6], const EspNowManager::message
         g_manager->addDevice(mac, autoName, "adicionado automaticamente por RX ESP-NOW");
     }
 
-    if (g_database != nullptr && g_database->isReady() && mac != nullptr) {
-        if (g_asyncDbLogEnabled && g_rxDbLogQueue != nullptr) {
-            EspNowConfig::RxDbLogEvent dbLogEvent = {};
-            std::memcpy(dbLogEvent.mac, mac, sizeof(dbLogEvent.mac));
-            dbLogEvent.incoming = incomingData;
-            if (xQueueSend(g_rxDbLogQueue, &dbLogEvent, 0) != pdTRUE) {
-                ++g_droppedRxDbLogCount;
-            }
-        } else {
-#if HIGH_FREQUENCY_INCOMMING_ESPNOW
-            // High-frequency mode persists only through manual flush.
-            ++g_droppedRxDbLogCount;
-#else
-            if (!g_database->logIncomingEspNow(mac, incomingData)) {
-                ++g_droppedRxDbLogCount;
-            }
-#endif
-        }
-    }
+    dispatchRouted(mac, routed);
 }
 
-void onDataRecv(const uint8_t* mac, const EspNowManager::message& incomingData) {
-    if (mac == nullptr) {
+void onDataRecv(const uint8_t* mac, const uint8_t* data, size_t len) {
+    if (mac == nullptr || data == nullptr || len == 0) {
         return;
     }
 
     if (g_asyncRxEnabled && g_rxQueue != nullptr) {
-        EspNowConfig::RxMessageEvent event = {};
+        EspNowConfig::RxDatagramEvent event{};
         std::memcpy(event.mac, mac, sizeof(event.mac));
-        event.incoming = incomingData;
+        const size_t copyLen = (len < sizeof(event.data)) ? len : sizeof(event.data);
+        std::memcpy(event.data, data, copyLen);
+        event.len = copyLen;
 
         if (xQueueSend(g_rxQueue, &event, 0) == pdTRUE) {
             return;
@@ -671,7 +315,7 @@ void onDataRecv(const uint8_t* mac, const EspNowManager::message& incomingData) 
         return;
     }
 
-    processRxMessageInternal(mac, incomingData);
+    processRxDatagramInternal(mac, data, len);
 }
 
 void onDataSent(const uint8_t* mac_addr, esp_now_send_status_t status) {
@@ -679,12 +323,54 @@ void onDataSent(const uint8_t* mac_addr, esp_now_send_status_t status) {
     (void)status;
 }
 
+size_t drainOneQueue(QueueHandle_t queue, size_t maxItems, void (*handler)(const ProtocolRouter::RoutedMessage&)) {
+    if (queue == nullptr || maxItems == 0) {
+        return 0;
+    }
+
+    ProtocolRouter::RoutedMessage item{};
+    size_t drained = 0;
+    while (drained < maxItems && xQueueReceive(queue, &item, 0) == pdTRUE) {
+        handler(item);
+        ++drained;
+    }
+    return drained;
+}
+
+void handleLogItem(const ProtocolRouter::RoutedMessage& routed) {
+    char text[ProtocolRouter::kMaxPayloadSize + 1] = {0};
+    copyPayloadAsText(routed, text, sizeof(text));
+
+    if (g_lcdDashboard != nullptr) {
+        String robotState;
+        if (tryExtractRobotState(text, robotState)) {
+            g_lcdDashboard->notifyRobotState(robotState);
+        }
+    }
+
+    if (g_io != nullptr) {
+        char tag[16] = {0};
+        std::snprintf(tag, sizeof(tag), "log %08lX", static_cast<unsigned long>(routed.header.source_id));
+        ShellOutput::printTagged(*g_io, tag, text);
+    }
+}
+
+// TELEMETRY has no consumer in this topic yet (bally_protocol topico 13/14):
+// bytes are routed and preserved, but never turned into String/printf text
+// here (topico 12 step 11). Draining just frees the queue slot.
+void handleTelemetryItem(const ProtocolRouter::RoutedMessage&) {}
+
+// TERMINAL_IN/OUT protocol handling belongs to topico 19; drop for now.
+void handleTerminalItem(const ProtocolRouter::RoutedMessage&) {}
+
+// HELLO/MANIFEST/STATUS payload handling belongs to topico 16; drop for now.
+void handleControlItem(const ProtocolRouter::RoutedMessage&) {}
+
 } // namespace
 
 namespace EspNowConfig {
 
 void attachCallbacks(EspNowManager& manager, Stream& io, DatabaseStore* database, LcdDashboard* lcdDashboard) {
-    // Bind callbacks once and keep stream pointer for runtime logging.
     g_io = &io;
     g_manager = &manager;
     g_database = database;
@@ -695,211 +381,74 @@ void attachCallbacks(EspNowManager& manager, Stream& io, DatabaseStore* database
 
 bool enableAsyncRx(size_t queueDepth) {
     if (queueDepth == 0) {
-        queueDepth = 24;
+        queueDepth = RX_ASYNC_QUEUE_DEPTH;
     }
 
     if (g_rxQueue == nullptr) {
-        g_rxQueue = xQueueCreate(static_cast<UBaseType_t>(queueDepth), sizeof(RxMessageEvent));
-        if (g_rxQueue == nullptr) {
-            g_asyncRxEnabled = false;
-            return false;
-        }
+        g_rxQueue = xQueueCreate(static_cast<UBaseType_t>(queueDepth), sizeof(RxDatagramEvent));
+    }
+    if (g_logQueue == nullptr) {
+        g_logQueue = xQueueCreate(static_cast<UBaseType_t>(RX_LOG_QUEUE_DEPTH), sizeof(ProtocolRouter::RoutedMessage));
+    }
+    if (g_telemetryQueue == nullptr) {
+        g_telemetryQueue = xQueueCreate(static_cast<UBaseType_t>(RX_TELEMETRY_QUEUE_DEPTH), sizeof(ProtocolRouter::RoutedMessage));
+    }
+    if (g_terminalQueue == nullptr) {
+        g_terminalQueue = xQueueCreate(static_cast<UBaseType_t>(RX_TERMINAL_QUEUE_DEPTH), sizeof(ProtocolRouter::RoutedMessage));
+    }
+    if (g_controlQueue == nullptr) {
+        g_controlQueue = xQueueCreate(static_cast<UBaseType_t>(RX_CONTROL_QUEUE_DEPTH), sizeof(ProtocolRouter::RoutedMessage));
     }
 
-    if (g_rxDisplayQueue == nullptr) {
-        g_rxDisplayQueue = xQueueCreate(static_cast<UBaseType_t>(queueDepth), sizeof(RxDisplayLine));
-        if (g_rxDisplayQueue == nullptr) {
-            g_asyncRxEnabled = false;
-            return false;
-        }
+    if (g_rxQueue == nullptr || g_logQueue == nullptr || g_telemetryQueue == nullptr ||
+        g_terminalQueue == nullptr || g_controlQueue == nullptr) {
+        g_asyncRxEnabled = false;
+        return false;
     }
 
     xQueueReset(g_rxQueue);
-    xQueueReset(g_rxDisplayQueue);
-    if (g_rxDbLogQueue != nullptr) {
-        xQueueReset(g_rxDbLogQueue);
-    }
+    xQueueReset(g_logQueue);
+    xQueueReset(g_telemetryQueue);
+    xQueueReset(g_terminalQueue);
+    xQueueReset(g_controlQueue);
     g_droppedRxCount = 0;
-    g_overwrittenRxDisplayCount = 0;
-    g_droppedRxDbLogCount = 0;
-    g_rxLineOpen = false;
-    g_rxContinuationPadding = 1;
-    resetRxAssemblyState();
-    g_asyncDbLogEnabled = false;
+    g_droppedDecodeCount = 0;
+    g_droppedCrcCount = 0;
+    g_droppedReassemblyCount = 0;
+    g_droppedQueueFullCount = 0;
     g_asyncRxEnabled = true;
     return true;
 }
 
 void disableAsyncRx() {
-    closeOpenRxLine(g_io);
-    resetRxAssemblyState();
     g_asyncRxEnabled = false;
-    g_asyncDbLogEnabled = false;
-    if (g_rxQueue != nullptr) {
-        xQueueReset(g_rxQueue);
-    }
-    if (g_rxDisplayQueue != nullptr) {
-        xQueueReset(g_rxDisplayQueue);
-    }
-    if (g_rxDbLogQueue != nullptr) {
-        xQueueReset(g_rxDbLogQueue);
-    }
+    if (g_rxQueue != nullptr) xQueueReset(g_rxQueue);
+    if (g_logQueue != nullptr) xQueueReset(g_logQueue);
+    if (g_telemetryQueue != nullptr) xQueueReset(g_telemetryQueue);
+    if (g_terminalQueue != nullptr) xQueueReset(g_terminalQueue);
+    if (g_controlQueue != nullptr) xQueueReset(g_controlQueue);
 }
 
-bool dequeueRxMessage(RxMessageEvent& outEvent, uint32_t timeoutMs) {
+bool dequeueRxDatagram(RxDatagramEvent& outEvent, uint32_t timeoutMs) {
     if (g_rxQueue == nullptr) {
         return false;
     }
 
-    const TickType_t waitTicks = (timeoutMs == 0)
-        ? static_cast<TickType_t>(0)
-        : pdMS_TO_TICKS(timeoutMs);
-
+    const TickType_t waitTicks = (timeoutMs == 0) ? static_cast<TickType_t>(0) : pdMS_TO_TICKS(timeoutMs);
     return xQueueReceive(g_rxQueue, &outEvent, waitTicks) == pdTRUE;
 }
 
-void processRxMessage(const RxMessageEvent& event) {
-    processRxMessageInternal(event.mac, event.incoming);
+void processRxDatagram(const RxDatagramEvent& event) {
+    processRxDatagramInternal(event.mac, event.data, event.len);
 }
 
-bool dequeueRxDbLog(RxDbLogEvent& outEvent, uint32_t timeoutMs) {
-    if (g_rxDbLogQueue == nullptr) {
-        return false;
-    }
-
-    const TickType_t waitTicks = (timeoutMs == 0)
-        ? static_cast<TickType_t>(0)
-        : pdMS_TO_TICKS(timeoutMs);
-
-    return xQueueReceive(g_rxDbLogQueue, &outEvent, waitTicks) == pdTRUE;
-}
-
-void processRxDbLog(const RxDbLogEvent& event) {
-    if (g_database != nullptr && g_database->isReady()) {
-        if (!g_database->logIncomingEspNow(event.mac, event.incoming)) {
-            ++g_droppedRxDbLogCount;
-        }
-    }
-}
-
-void setAsyncDbLogEnabled(bool enabled) {
-    if (enabled && g_rxDbLogQueue == nullptr) {
-        (void)createDbLogQueue();
-    }
-
-    g_asyncDbLogEnabled = enabled && (g_rxDbLogQueue != nullptr);
-}
-
-size_t flushRxDbLogBuffer(size_t maxItems) {
-    if (g_rxDbLogQueue == nullptr || g_database == nullptr || !g_database->isReady()) {
-        return 0;
-    }
-
-    const size_t limit = (maxItems == 0) ? static_cast<size_t>(-1) : maxItems;
-    const bool wantsBatch = (maxItems == 0) || (maxItems > 1);
-    const bool hasTransaction = wantsBatch && g_database->beginTransaction();
-    size_t flushed = 0;
-    RxDbLogEvent event = {};
-
-    while (flushed < limit && dequeueRxDbLog(event, 0)) {
-        processRxDbLog(event);
-        ++flushed;
-    }
-
-    if (hasTransaction) {
-        if (!g_database->commitTransaction()) {
-            (void)g_database->rollbackTransaction();
-            g_droppedRxDbLogCount += static_cast<uint32_t>(flushed);
-        }
-    }
-
-    return flushed;
-}
-
-size_t pendingRxDbLogCount() {
-    if (g_rxDbLogQueue == nullptr) {
-        return 0;
-    }
-
-    return static_cast<size_t>(uxQueueMessagesWaiting(g_rxDbLogQueue));
-}
-
-size_t rxDbLogCapacity() {
-    if (g_rxDbLogQueue == nullptr) {
-        return 0;
-    }
-
-    const size_t pending = static_cast<size_t>(uxQueueMessagesWaiting(g_rxDbLogQueue));
-    const size_t available = static_cast<size_t>(uxQueueSpacesAvailable(g_rxDbLogQueue));
-    return pending + available;
-}
-
-size_t flushRxDisplayLines(size_t maxLines) {
-    if (g_rxDisplayQueue == nullptr || maxLines == 0) {
-        return 0;
-    }
-
-    RxDisplayLine item = {};
-    size_t drained = 0;
-    while (drained < maxLines && xQueueReceive(g_rxDisplayQueue, &item, 0) == pdTRUE) {
-        if (g_io != nullptr) {
-            if (item.appendToPrevious) {
-                writeRxContinuationToStream(
-                    g_io,
-                    item.payload,
-                    item.payloadLen,
-                    item.keepLineOpen,
-                    item.closeSuffix
-                );
-            } else {
-                writeRxLineToStream(
-                    g_io,
-                    item.header,
-                    item.payload,
-                    item.payloadLen,
-                    item.keepLineOpen,
-                    item.closeSuffix
-                );
-            }
-        }
-
-#if !HIGH_FREQUENCY_INCOMMING_ESPNOW
-        if (g_lcdDashboard != nullptr && g_lcdDashboard->isReady()) {
-            String lcdLine;
-            if (item.payloadLen > 0) {
-                String lcdPayload = String(item.payload);
-                lcdPayload.replace('\r', ' ');
-                lcdPayload.replace('\n', ' ');
-                lcdPayload.replace('\t', ' ');
-                lcdPayload.trim();
-                if (item.appendToPrevious) {
-                    lcdLine = lcdPayload;
-                } else {
-                    lcdLine = String(item.header);
-                    lcdLine += " ";
-                    lcdLine += lcdPayload;
-                }
-            } else if (!item.appendToPrevious) {
-                lcdLine = String(item.header);
-            }
-
-            if (!item.keepLineOpen && item.closeSuffix[0] != '\0') {
-                if (lcdLine.length() > 0) {
-                    lcdLine += " ";
-                }
-                lcdLine += item.closeSuffix;
-            }
-
-            if (lcdLine.length() > 0) {
-                g_lcdDashboard->showMessage(lcdLine, item.color);
-            }
-        }
-#endif
-
-        ++drained;
-    }
-
-    return drained;
+size_t drainRoutedQueues(size_t maxItemsPerQueue) {
+    size_t total = 0;
+    total += drainOneQueue(g_controlQueue, maxItemsPerQueue, handleControlItem);
+    total += drainOneQueue(g_logQueue, maxItemsPerQueue, handleLogItem);
+    total += drainOneQueue(g_telemetryQueue, maxItemsPerQueue, handleTelemetryItem);
+    total += drainOneQueue(g_terminalQueue, maxItemsPerQueue, handleTerminalItem);
+    return total;
 }
 
 uint32_t takeDroppedRxCount() {
@@ -908,20 +457,27 @@ uint32_t takeDroppedRxCount() {
     return dropped;
 }
 
-uint32_t takeOverwrittenRxDisplayCount() {
-    const uint32_t overwritten = g_overwrittenRxDisplayCount;
-    g_overwrittenRxDisplayCount = 0;
-    return overwritten;
+uint32_t takeDroppedDecodeCount() {
+    const uint32_t dropped = g_droppedDecodeCount;
+    g_droppedDecodeCount = 0;
+    return dropped;
 }
 
-uint32_t takeDroppedRxDisplayCount() {
-    // Backward-compatible alias.
-    return takeOverwrittenRxDisplayCount();
+uint32_t takeDroppedCrcCount() {
+    const uint32_t dropped = g_droppedCrcCount;
+    g_droppedCrcCount = 0;
+    return dropped;
 }
 
-uint32_t takeDroppedRxDbLogCount() {
-    const uint32_t dropped = g_droppedRxDbLogCount;
-    g_droppedRxDbLogCount = 0;
+uint32_t takeDroppedReassemblyCount() {
+    const uint32_t dropped = g_droppedReassemblyCount;
+    g_droppedReassemblyCount = 0;
+    return dropped;
+}
+
+uint32_t takeDroppedQueueFullCount() {
+    const uint32_t dropped = g_droppedQueueFullCount;
+    g_droppedQueueFullCount = 0;
     return dropped;
 }
 
@@ -930,17 +486,26 @@ void heartbeatTick() {
         return;
     }
 
-    EspNowManager::message ping = {};
-    ping.timer = millis();
-    ping.type = logType::PING;
-    ping.packet_number = 0;
-    ping.total_packets = 1;
-    ping.checksum = 0;
-    ping.content.size = 0;
-    ping.content.text[0] = '\0';
+    uint32_t sequence = 0;
+    if (!BtpTransport::reserveSequence(&sequence)) {
+        return;
+    }
+
+    uint8_t frame[btp::kV1MinimumFrameSize];
+    size_t frameSize = 0;
+    const uint64_t timestampUs = static_cast<uint64_t>(millis()) * 1000ULL;
+    // STATUS (bally_protocol/docs/COMMANDS_AND_ACTIONS.md 3.2, object_id
+    // 0x0009): "publicação espontânea e não possui resposta" -- an empty
+    // payload is a legitimate liveness probe until topico 17 defines a real
+    // STATUS payload schema.
+    if (!BtpTransport::encodeSingleFrame(btp::MessageType::Control, 0x0009U, sequence, timestampUs,
+                                         nullptr, 0, frame, sizeof(frame), &frameSize)) {
+        return;
+    }
 
     bool delivered = false;
-    const bool gotStatus = g_manager->sendToMacWithStatus(g_heartbeatTargetMac, ping, delivered, HEARTBEAT_SEND_TIMEOUT_MS);
+    const bool gotStatus = g_manager->sendToMacWithStatus(g_heartbeatTargetMac, frame, frameSize, delivered,
+                                                           HEARTBEAT_SEND_TIMEOUT_MS);
 
     if (g_lcdDashboard != nullptr) {
         g_lcdDashboard->notifyHeartbeat(gotStatus && delivered);

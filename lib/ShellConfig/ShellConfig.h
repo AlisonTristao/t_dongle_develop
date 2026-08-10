@@ -51,7 +51,7 @@ uint8_t registerDefaultModules();
  * - Multiple commands separated by ';' (outside quotes) run in sequence,
  *   each with its own alias/persistence handling, e.g. "dongle -ping; dongle -clock".
  * - Command aliases are expanded first (see ShellAliases).
- * - "espnow -send_to <texto>" is mapped to broadcast send.
+ * - "espnow -send_to <texto>" (no device index) is redirected to send_all.
  * - "espnow -send_to <indice>, <texto>" sends to one device.
  * - A command identical to the immediately previous one still runs, but is
  *   not written to command_log again (avoids flooding the SD history when

@@ -93,9 +93,9 @@ uint8_t wrapper_help_e() {
     printLine("Se LCD estiver invertido: dongle -lcd_rot 0..3");
     printLine("Exemplo local LED: dongle -led 255, 0, 0");
     printLine("Exemplo espnow unicast: espnow -send_to 1, \"dongle -clock\"");
-    printLine("Exemplo espnow broadcast: espnow -send_to 000, \"dongle -clock\"");
-    printLine("Alias 000 no send_to = envia para todos os peers");
-    printLine("send_to/send_all executam o comando remotamente (so em peers ja cadastrados) e respondem com a saida");
+    printLine("Exemplo espnow para todos: espnow -send_all \"dongle -clock\"");
+    printLine("send_to/send_all so alcancam peer ja cadastrado do qual ja recebemos alguma mensagem (BTP precisa do boot_id dele)");
+    printLine("Executam o comando remotamente e respondem com a saida (aparece aqui como [cmd_result])");
     printLine("Editar peer: espnow -update 1, \"nome novo\", \"descricao nova\"");
     printLine("Encadear comandos: dongle -ping; dongle -clock");
     printLine("Permissao (sudo): sudo -login <senha> eleva o usuario atual (serial, ou o peer ESP-NOW que mandou o comando)");

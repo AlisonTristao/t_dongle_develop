@@ -104,22 +104,24 @@ struct IntQueryContext {
     int32_t value;
 };
 
-String messagePayloadText(const EspNowManager::message& msg) {
-    const size_t maxLen = EspNowManager::MESSAGE_TEXT_SIZE;
-    size_t length = msg.content.size;
-    if (length == 0 || length > maxLen) {
-        length = 0;
-        while (length < maxLen && msg.content.text[length] != '\0') {
-            ++length;
-        }
-    }
+// Human-readable preview for the espnow_outgoing_log audit trail: this call
+// site only ever logs the shell one-liner text sent by "espnow -send_to/
+// -send_all" (see EspNowCommands.cpp), never a raw BTP envelope, but is kept
+// byte-safe (control bytes escaped, hard length cap) in case that changes.
+String payloadPreviewText(const uint8_t* payload, size_t payloadSize) {
+    constexpr size_t kPreviewCap = 256;
+    const size_t length = (payloadSize < kPreviewCap) ? payloadSize : kPreviewCap;
 
-    char buffer[EspNowManager::MESSAGE_TEXT_SIZE + 1] = {0};
-    if (length > 0) {
-        std::memcpy(buffer, msg.content.text, length);
+    String out;
+    out.reserve(length + 4);
+    for (size_t i = 0; i < length; ++i) {
+        const uint8_t byte = (payload != nullptr) ? payload[i] : 0;
+        out += (byte >= 0x20 && byte < 0x7F) ? static_cast<char>(byte) : '.';
     }
-    buffer[length] = '\0';
-    return String(buffer);
+    if (payloadSize > kPreviewCap) {
+        out += "...";
+    }
+    return out;
 }
 
 int queryIntCallback(void* rawContext, int argc, char** argv, char**) {
@@ -504,12 +506,7 @@ bool DatabaseStore::logCommandWithOutput(const char* command, const char* output
     return executeNoResult(sql);
 }
 
-bool DatabaseStore::logIncomingEspNow(const uint8_t mac[6], const EspNowManager::message& incoming) {
-    // Removido: logs recebidos via ESP-NOW não são mais salvos no banco
-    return true;
-}
-
-bool DatabaseStore::logOutgoingEspNow(const uint8_t mac[6], const EspNowManager::message& outgoing, bool delivered) {
+bool DatabaseStore::logOutgoingEspNow(const uint8_t mac[6], btp::MessageType type, const uint8_t* payload, size_t payloadSize, bool delivered) {
     if (!ready_ || mac == nullptr) {
         return false;
     }
@@ -531,9 +528,9 @@ bool DatabaseStore::logOutgoingEspNow(const uint8_t mac[6], const EspNowManager:
     sql += ",'";
     sql += escapeSqlText(macToText(mac));
     sql += "','";
-    sql += escapeSqlText(messagePayloadText(outgoing));
+    sql += escapeSqlText(payloadPreviewText(payload, payloadSize));
     sql += "',";
-    sql += String(static_cast<int>(outgoing.type));
+    sql += String(static_cast<int>(type));
     sql += ",";
     sql += delivered ? "1" : "0";
     sql += ",";

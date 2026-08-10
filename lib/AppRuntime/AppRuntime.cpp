@@ -2,6 +2,7 @@
 
 #include <WiFi.h>
 #include <Esp.h>
+#include <esp_random.h>
 
 #include <cstdio>
 #include <vector>
@@ -11,27 +12,22 @@
 #include "ShellConfig.h"
 #include "EspNowConfig.h"
 #include "ShellOutput.h"
+#include "BtpTransport.h"
 
 namespace {
 
-constexpr uint8_t kRxDbWarningPercent = RX_DB_WARNING_PERCENT;
 constexpr size_t kRxDisplayFlushBurst = 48;
 
 } // namespace
 
 void AppRuntime::espNowRxWorkerTask(void*) {
-    EspNowConfig::RxMessageEvent event = {};
+    EspNowConfig::RxDatagramEvent event = {};
 
     while (true) {
-        if (EspNowConfig::dequeueRxMessage(event, 250)) {
-            EspNowConfig::processRxMessage(event);
+        if (EspNowConfig::dequeueRxDatagram(event, 250)) {
+            EspNowConfig::processRxDatagram(event);
         }
     }
-}
-
-void AppRuntime::espNowRxDbWorkerTask(void*) {
-    // Desativado: Os logs de RX no banco não são mais necessários
-    vTaskDelete(nullptr);
 }
 
 void AppRuntime::espNowHeartbeatWorkerTask(void*) {
@@ -140,26 +136,21 @@ void AppRuntime::processAsyncWarnings(bool& needPromptRefresh) {
 }
 
 void AppRuntime::flushPendingEspNowOutput(bool& needPromptRefresh) {
-    const size_t flushed = EspNowConfig::flushRxDisplayLines(kRxDisplayFlushBurst);
+    const size_t flushed = EspNowConfig::drainRoutedQueues(kRxDisplayFlushBurst);
     if (flushed > 0) {
         needPromptRefresh = true;
     }
 
-    const uint32_t dropped = EspNowConfig::takeDroppedRxCount();
+    uint32_t dropped = EspNowConfig::takeDroppedRxCount();
+    dropped += EspNowConfig::takeDroppedDecodeCount();
+    dropped += EspNowConfig::takeDroppedCrcCount();
+    dropped += EspNowConfig::takeDroppedReassemblyCount();
+    dropped += EspNowConfig::takeDroppedQueueFullCount();
     if (dropped > 0) {
         char line[64] = {0};
         std::snprintf(line, sizeof(line), "rx_dropped=%lu", static_cast<unsigned long>(dropped));
         ShellOutput::printTagged(Serial, "espnow", line);
         lcdDashboard_.notifyDropped(dropped);
-        needPromptRefresh = true;
-    }
-
-    const uint32_t overwrittenDisplay = EspNowConfig::takeOverwrittenRxDisplayCount();
-    if (overwrittenDisplay > 0) {
-        char line[72] = {0};
-        std::snprintf(line, sizeof(line), "rx_display_overwritten=%lu", static_cast<unsigned long>(overwrittenDisplay));
-        ShellOutput::printTagged(Serial, "espnow", line);
-        lcdDashboard_.notifyDropped(overwrittenDisplay);
         needPromptRefresh = true;
     }
 }
@@ -194,6 +185,19 @@ void AppRuntime::begin() {
 
     ShellOutput::printTagged(Serial, "startup", String("mac=") + WiFi.macAddress());
     StartupConfig::promptAndSetDateTime(Serial);
+
+    // BTP identity: source_id derived from this dongle's own MAC (same
+    // formula every firmware in the ecosystem uses, so it needs no
+    // handshake); boot_id is a random nonzero value for this boot only --
+    // there is no HELLO/MANIFEST yet (topico 16) to persist/announce it, and
+    // nothing here requires it to survive a reboot.
+    uint8_t selfMac[6] = {0};
+    WiFi.macAddress(selfMac);
+    uint32_t bootId = esp_random();
+    if (bootId == 0) {
+        bootId = 1;
+    }
+    BtpTransport::configureIdentity(BtpTransport::btp_command::source_id_from_mac(selfMac), bootId);
 
     EspNowConfig::attachCallbacks(espNowManager_, Serial, &databaseStore_, &lcdDashboard_);
 

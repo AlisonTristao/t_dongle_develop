@@ -96,6 +96,13 @@ adicionar um novo `#include` entre libs, confirme que a lib alvo (no `.h` e no `
 inclui de volta, nem transitivamente, a lib de origem.** Um `grep` rápido pelos includes já
 resolve a dúvida.
 
+Quando duas libs em ramos diferentes do DAG (ex.: `EspNowConfig` e `EspNowCommands`)
+precisam da mesma capacidade de uma lib de baixo nível (ex.: enviar bytes via
+`EspNowManager`), e essa lib de baixo nível não pode saber quem está chamando: prefira um
+callback de função (`BtpTransport::SendFn`) em vez de incluir a lib de topo direto — foi o
+padrão usado para `BtpTransport` não incluir `EspNowManager.h` (ver README.md § 3), o que
+também mantém `BtpTransport`/`ProtocolRouter` portáveis pro `env:native` (sem Arduino).
+
 Camadas atuais (de cima pra baixo, cada uma só depende das de baixo):
 
 1. **`AppRuntime`** — único dono dos objetos runtime (`EspNowManager`, `DatabaseStore`,
@@ -147,11 +154,12 @@ ter referências antigas.
 - **Identidade** = string livre: `"serial"` pro console local, `"espnow:<MAC>"` por peer
   registrado. Um transporte novo (ex. MQTT) só precisa de um prefixo de identidade novo,
   sem mudar `SudoManager`.
-- **Execução remota via ESP-NOW (`CMDO`)**: só roda comando de um MAC já cadastrado no
-  registry de peers. Decisão deliberada: **sem restrição de conteúdo** — um peer cadastrado
-  pode mandar qualquer comando, incluindo `sudo -login`. Ou seja, a defesa contra um peer
-  malicioso é (a) controlar quem vira peer cadastrado e (b) a senha do `sudo`. Não adicione
-  uma lista de comandos "permitidos"/"proibidos" via `CMDO` sem alinhar antes — foi uma
+- **Execução remota via ESP-NOW (frame BTP `COMMAND`/`COMMAND_REQUEST`, antigo `CMDO`
+  pré-tópico-12)**: só roda comando de um MAC já cadastrado no registry de peers. Decisão
+  deliberada: **sem restrição de conteúdo** — um peer cadastrado pode mandar qualquer
+  comando, incluindo `sudo -login`. Ou seja, a defesa contra um peer malicioso é (a)
+  controlar quem vira peer cadastrado e (b) a senha do `sudo`. Não adicione uma lista de
+  comandos "permitidos"/"proibidos" via `COMMAND_REQUEST` sem alinhar antes — foi uma
   escolha explícita, não uma lacuna esquecida.
 - Se um comando novo for destrutivo o suficiente pra merecer o mesmo tratamento, siga o
   padrão da seção 2, passo 5 — não invente um mecanismo de confirmação novo.

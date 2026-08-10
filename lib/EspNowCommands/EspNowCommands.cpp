@@ -1,6 +1,7 @@
 #include "EspNowCommands.h"
 
 #include "ShellCommandSupport.h"
+#include "BtpTransport.h"
 #include "error_codes.h"
 
 #include <cstdio>
@@ -13,7 +14,6 @@ using ShellCommandSupport::context;
 using ShellCommandSupport::failWithCode;
 using ShellCommandSupport::parseMacAddress;
 using ShellCommandSupport::printLine;
-using ShellCommandSupport::resolveDefaultBroadcastMac;
 using ShellCommandSupport::stripOuterQuotes;
 using ShellCommandSupport::warnWithCode;
 
@@ -21,8 +21,6 @@ uint8_t wrapper_espnow_list() {
     if (context().espNow == nullptr) {
         return failWithCode(AppError::Code::ESPNOW_NOT_READY, "espnow indisponivel para comando list");
     }
-
-    printLine("[000] todos - FF:FF:FF:FF:FF:FF (alias broadcast)");
 
     const size_t total = context().espNow->deviceCount();
     if (total == 0) {
@@ -45,15 +43,20 @@ uint8_t wrapper_espnow_list() {
             item.mac[3], item.mac[4], item.mac[5]
         );
 
+        uint32_t knownSourceId = 0;
+        uint32_t knownBootId = 0;
+        const bool bootKnown = BtpTransport::lookupPeer(item.mac, &knownSourceId, &knownBootId);
+
         char line[256] = {0};
         std::snprintf(
             line,
             sizeof(line),
-            "[%03u] %s - %s - %s",
+            "[%03u] %s - %s - %s - boot_id=%s",
             static_cast<unsigned>(i + 1),
             item.name,
             item.description,
-            macText
+            macText,
+            bootKnown ? "conhecido" : "desconhecido (send_to vai falhar ate chegar algo dele)"
         );
         printLine(line);
     }
@@ -173,64 +176,79 @@ uint8_t wrapper_espnow_update(int32_t deviceNumber, string name, string descript
     return RESULT_OK;
 }
 
+// Sends one BTP COMMAND_REQUEST (shell action) to a MAC whose boot_id we've
+// already learned from received traffic (see BtpTransport::rememberPeer --
+// there is no HELLO/MANIFEST handshake yet, topico 16). A peer we've never
+// heard from cannot be addressed: unlike the old CMDO, a COMMAND_REQUEST
+// needs a real target_boot_id, not just a MAC.
+bool sendWithStatusViaManager(void* rawContext, const uint8_t mac[6], const uint8_t* data, size_t size,
+                              bool* outDelivered, uint32_t timeoutMs) {
+    return static_cast<EspNowManager*>(rawContext)->sendToMacWithStatus(mac, data, size, *outDelivered, timeoutMs);
+}
+
+bool sendShellCommandRequest(const uint8_t mac[6], const string& commandText, bool& outDelivered) {
+    uint32_t targetSourceId = 0;
+    uint32_t targetBootId = 0;
+    if (!BtpTransport::lookupPeer(mac, &targetSourceId, &targetBootId)) {
+        return false;
+    }
+
+    uint8_t payload[BtpTransport::btp_command::kRequestPrefixSize + BtpTransport::btp_command::kMaxShellCommandSize];
+    const size_t textLen = (commandText.size() < BtpTransport::btp_command::kMaxShellCommandSize)
+        ? commandText.size()
+        : BtpTransport::btp_command::kMaxShellCommandSize;
+
+    payload[0] = static_cast<uint8_t>(targetSourceId);
+    payload[1] = static_cast<uint8_t>(targetSourceId >> 8);
+    payload[2] = static_cast<uint8_t>(targetSourceId >> 16);
+    payload[3] = static_cast<uint8_t>(targetSourceId >> 24);
+    payload[4] = static_cast<uint8_t>(targetBootId);
+    payload[5] = static_cast<uint8_t>(targetBootId >> 8);
+    payload[6] = static_cast<uint8_t>(targetBootId >> 16);
+    payload[7] = static_cast<uint8_t>(targetBootId >> 24);
+    payload[8] = static_cast<uint8_t>(BtpTransport::btp_command::kShellActionId);
+    payload[9] = static_cast<uint8_t>(BtpTransport::btp_command::kShellActionId >> 8);
+    payload[10] = static_cast<uint8_t>(BtpTransport::btp_command::kShellActionVersion);
+    payload[11] = static_cast<uint8_t>(BtpTransport::btp_command::kShellActionVersion >> 8);
+    payload[12] = 0; payload[13] = 0; // flags, zero in v1
+    payload[14] = 0; payload[15] = 0; // reserved
+    payload[16] = static_cast<uint8_t>(textLen);
+    payload[17] = static_cast<uint8_t>(textLen >> 8);
+    payload[18] = static_cast<uint8_t>(textLen >> 16);
+    payload[19] = static_cast<uint8_t>(textLen >> 24);
+    std::memcpy(payload + BtpTransport::btp_command::kRequestPrefixSize, commandText.data(), textLen);
+
+    const size_t payloadSize = BtpTransport::btp_command::kRequestPrefixSize + textLen;
+    const uint64_t timestampUs = static_cast<uint64_t>(millis()) * 1000ULL;
+    return BtpTransport::sendLogicalWithStatus(
+        sendWithStatusViaManager, context().espNow, mac, btp::MessageType::Command,
+        BtpTransport::btp_command::kCommandRequestObjectId,
+        payload, payloadSize, timestampUs, outDelivered, 700);
+}
+
 uint8_t wrapper_espnow_send_to(int32_t deviceNumber, string command) {
     if (context().espNow == nullptr) {
         return failWithCode(AppError::Code::ESPNOW_NOT_READY, "espnow indisponivel para comando send_to");
     }
 
-    if (deviceNumber < 0) {
-        return failWithCode(AppError::Code::INVALID_DEVICE_INDEX, "indice invalido. Use 000 ou valores >= 1");
-    }
-
-    EspNowManager::message outgoing = {};
-    outgoing.timer = millis();
-    // CMDO tells a registered receiving peer "run this as a shell command and
-    // reply with the output" (see EspNowConfig::processRxMessageInternal).
-    outgoing.type = EspNowManager::logType::CMDO;
-    outgoing.packet_number = 0;
-    outgoing.total_packets = 1;
-    outgoing.checksum = 0;
-
-    const string msg = stripOuterQuotes(command);
-    const size_t maxLen = EspNowManager::MESSAGE_TEXT_SIZE;
-    const size_t copyLen = (msg.size() < maxLen) ? msg.size() : maxLen;
-    if (copyLen > 0) {
-        std::memcpy(outgoing.content.text, msg.c_str(), copyLen);
-    }
-    outgoing.content.text[copyLen] = '\0';
-    outgoing.content.size = copyLen;
-
-    if (deviceNumber == 0) {
-        // Peer virtual 000: route to default broadcast MAC (stored in DB, with FF fallback).
-        uint8_t broadcastMac[6] = {0, 0, 0, 0, 0, 0};
-        resolveDefaultBroadcastMac(broadcastMac);
-
-        const bool queued = context().espNow->sendToMac(broadcastMac, outgoing);
-
-        if (context().database != nullptr && context().database->isReady()) {
-            context().database->logOutgoingEspNow(broadcastMac, outgoing, queued);
-        }
-
-        if (context().lcdDashboard != nullptr) {
-            context().lcdDashboard->notifyTx(queued);
-        }
-
-        if (!queued) {
-            return failWithCode(AppError::Code::BROADCAST_QUEUE_FAILED, "000 status=false");
-        }
-
-        printLine("[espnow] 000 status=true");
-        return RESULT_OK;
+    if (deviceNumber <= 0) {
+        return failWithCode(AppError::Code::INVALID_DEVICE_INDEX, "indice invalido. Use valores >= 1 (000/broadcast nao e mais enderecavel, ver help -e)");
     }
 
     const size_t index = static_cast<size_t>(deviceNumber - 1);
-
-    bool delivered = false;
-    const bool gotStatus = context().espNow->sendToDeviceWithStatus(index, outgoing, delivered, 700);
-
     EspNowManager::deviceInfo target = {};
-    if (context().database != nullptr && context().database->isReady() && context().espNow->deviceAt(index, target)) {
-        context().database->logOutgoingEspNow(target.mac, outgoing, gotStatus && delivered);
+    if (!context().espNow->deviceAt(index, target)) {
+        return failWithCode(AppError::Code::INVALID_DEVICE_INDEX, "indice invalido");
+    }
+
+    const string msg = stripOuterQuotes(command);
+    bool delivered = false;
+    const bool gotStatus = sendShellCommandRequest(target.mac, msg, delivered);
+
+    if (context().database != nullptr && context().database->isReady()) {
+        context().database->logOutgoingEspNow(
+            target.mac, btp::MessageType::Command,
+            reinterpret_cast<const uint8_t*>(msg.data()), msg.size(), gotStatus && delivered);
     }
 
     if (context().lcdDashboard != nullptr) {
@@ -238,14 +256,14 @@ uint8_t wrapper_espnow_send_to(int32_t deviceNumber, string command) {
     }
 
     if (!gotStatus) {
-        return failWithCode(AppError::Code::SEND_STATUS_TIMEOUT, "status=false (sem callback/timeout)");
+        return failWithCode(AppError::Code::PEER_BOOT_UNKNOWN,
+                            "boot_id do peer ainda desconhecido (aguarde uma mensagem dele chegar)");
     }
-
     if (!delivered) {
         return failWithCode(AppError::Code::SEND_DELIVERY_FAILED, "status=false");
     }
 
-    printLine("[espnow] status=true");
+    printLine("[espnow] status=true (resposta chega como cmd_result)");
     return RESULT_OK;
 }
 
@@ -254,65 +272,56 @@ uint8_t wrapper_espnow_send_all(string command) {
         return failWithCode(AppError::Code::ESPNOW_NOT_READY, "espnow indisponivel para comando send_all");
     }
 
-    EspNowManager::message outgoing = {};
-    outgoing.timer = millis();
-    // CMDO tells a registered receiving peer "run this as a shell command and
-    // reply with the output" (see EspNowConfig::processRxMessageInternal).
-    outgoing.type = EspNowManager::logType::CMDO;
-    outgoing.packet_number = 0;
-    outgoing.total_packets = 1;
-    outgoing.checksum = 0;
-
     const string msg = stripOuterQuotes(command);
-    const size_t maxLen = EspNowManager::MESSAGE_TEXT_SIZE;
-    const size_t copyLen = (msg.size() < maxLen) ? msg.size() : maxLen;
-    if (copyLen > 0) {
-        std::memcpy(outgoing.content.text, msg.c_str(), copyLen);
-    }
-    outgoing.content.text[copyLen] = '\0';
-    outgoing.content.size = copyLen;
+    const size_t total = context().espNow->deviceCount();
+    size_t attempted = 0;
+    size_t delivered = 0;
 
-    size_t deliveredCount = 0;
-    size_t triedCount = 0;
-    const bool attempted = context().espNow->sendToAllWithStatus(outgoing, deliveredCount, triedCount, 700);
+    for (size_t i = 0; i < total; ++i) {
+        EspNowManager::deviceInfo target = {};
+        if (!context().espNow->deviceAt(i, target)) {
+            continue;
+        }
 
-    if (!attempted || triedCount == 0) {
-        uint8_t broadcastMac[6] = {0, 0, 0, 0, 0, 0};
-        resolveDefaultBroadcastMac(broadcastMac);
+        bool oneDelivered = false;
+        const bool gotStatus = sendShellCommandRequest(target.mac, msg, oneDelivered);
+        if (!gotStatus) {
+            continue; // boot_id ainda desconhecido para este peer
+        }
 
-        const bool queued = context().espNow->sendToMac(broadcastMac, outgoing);
+        ++attempted;
+        if (oneDelivered) {
+            ++delivered;
+        }
+
         if (context().database != nullptr && context().database->isReady()) {
-            context().database->logOutgoingEspNow(broadcastMac, outgoing, queued);
+            context().database->logOutgoingEspNow(
+                target.mac, btp::MessageType::Command,
+                reinterpret_cast<const uint8_t*>(msg.data()), msg.size(), oneDelivered);
         }
+    }
 
-        if (context().lcdDashboard != nullptr) {
-            context().lcdDashboard->notifyTx(queued);
-        }
-
-        if (!queued) {
-            return failWithCode(AppError::Code::BROADCAST_QUEUE_FAILED, "status=false (nenhum peer e broadcast falhou)");
-        }
-
-        printLine("[espnow] status=true (broadcast 000)");
-        return RESULT_OK;
+    if (attempted == 0) {
+        return failWithCode(AppError::Code::PEER_BOOT_UNKNOWN,
+                            "nenhum peer com boot_id conhecido (aguarde alguma mensagem chegar)");
     }
 
     char line[120] = {0};
     std::snprintf(
         line,
         sizeof(line),
-        "[espnow] status=%s delivered=%u/%u",
-        (deliveredCount == triedCount) ? "true" : "false",
-        static_cast<unsigned>(deliveredCount),
-        static_cast<unsigned>(triedCount)
+        "[espnow] status=%s delivered=%u/%u (respostas chegam como cmd_result)",
+        (delivered == attempted) ? "true" : "false",
+        static_cast<unsigned>(delivered),
+        static_cast<unsigned>(attempted)
     );
     printLine(line);
 
     if (context().lcdDashboard != nullptr) {
-        context().lcdDashboard->notifyTx(deliveredCount == triedCount);
+        context().lcdDashboard->notifyTx(delivered == attempted);
     }
 
-    if (deliveredCount != triedCount) {
+    if (delivered != attempted) {
         return failWithCode(AppError::Code::SEND_PARTIAL_DELIVERY, "entrega parcial no envio para todos os peers");
     }
 
@@ -335,8 +344,8 @@ uint8_t registerAll() {
     context().shell->add(wrapper_espnow_remove, "remove", "remove peer by index: <number>", "espnow");
     context().shell->add(wrapper_espnow_remove_mac, "remove_mac", "remove peer by MAC: <mac>", "espnow");
     context().shell->add(wrapper_espnow_update, "update", "update peer: <number>, <name>, <description>", "espnow");
-    context().shell->add(wrapper_espnow_send_to, "send_to", "send to index: <number|000>, <command> (000=all)", "espnow");
-    context().shell->add(wrapper_espnow_send_all, "send_all", "send to all: <command>", "espnow");
+    context().shell->add(wrapper_espnow_send_to, "send_to", "send to index: <number>, <command> (peer must have sent something first)", "espnow");
+    context().shell->add(wrapper_espnow_send_all, "send_all", "send to all peers with known boot_id: <command>", "espnow");
 
     return RESULT_OK;
 }

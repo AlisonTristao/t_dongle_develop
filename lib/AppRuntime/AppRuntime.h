@@ -18,7 +18,6 @@ public:
 
 private:
     static void espNowRxWorkerTask(void* param);
-    static void espNowRxDbWorkerTask(void* param);
     static void espNowHeartbeatWorkerTask(void* param);
 
     void restoreShellHistoryFromDatabase();
@@ -37,6 +36,5 @@ private:
     TinyShell tinyShell_;
 
     TaskHandle_t espNowRxTaskHandle_ = nullptr;
-    TaskHandle_t espNowRxDbTaskHandle_ = nullptr;
     TaskHandle_t espNowHeartbeatTaskHandle_ = nullptr;
 };

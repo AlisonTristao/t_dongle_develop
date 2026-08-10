@@ -5,6 +5,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
+#include <btp/codec.hpp>
+
 struct sqlite3;
 
 /**
@@ -69,14 +71,12 @@ public:
     bool logCommandWithOutput(const char* command, const char* output, const char* source = "serial");
 
     /**
-     * @brief Stores one incoming ESP-NOW payload and relates it to peers table.
+     * @brief Stores one outgoing ESP-NOW payload with delivery status. type
+     * is stored as its raw btp::MessageType numeric value; payload is a
+     * human-readable preview (see payloadPreviewText in the .cpp), not the
+     * wire envelope.
      */
-    bool logIncomingEspNow(const uint8_t mac[6], const EspNowManager::message& incoming);
-
-    /**
-     * @brief Stores one outgoing ESP-NOW payload with delivery status.
-     */
-    bool logOutgoingEspNow(const uint8_t mac[6], const EspNowManager::message& outgoing, bool delivered);
+    bool logOutgoingEspNow(const uint8_t mac[6], btp::MessageType type, const uint8_t* payload, size_t payloadSize, bool delivered);
 
     /**
      * @brief Stores one boot event timestamp.

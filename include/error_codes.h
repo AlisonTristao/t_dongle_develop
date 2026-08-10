@@ -44,6 +44,8 @@ enum class Code : uint16_t {
     SEND_DELIVERY_FAILED = 1209,
     BROADCAST_QUEUE_FAILED = 1210,
     SEND_PARTIAL_DELIVERY = 1211,
+    PEER_BOOT_UNKNOWN = 1212,
+    COMMAND_ENCODE_FAILED = 1213,
 
     // Database
     DATABASE_NOT_READY = 1301,
@@ -131,6 +133,10 @@ inline const char* name(Code code) {
         return "BROADCAST_QUEUE_FAILED";
     case Code::SEND_PARTIAL_DELIVERY:
         return "SEND_PARTIAL_DELIVERY";
+    case Code::PEER_BOOT_UNKNOWN:
+        return "PEER_BOOT_UNKNOWN";
+    case Code::COMMAND_ENCODE_FAILED:
+        return "COMMAND_ENCODE_FAILED";
     case Code::DATABASE_NOT_READY:
         return "DATABASE_NOT_READY";
     case Code::DATABASE_INIT_FAILED:
