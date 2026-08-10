@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <SerialSession.h>
+#include <ShellSerial.h>
 #include <btp/codec.hpp>
 
 #include <cstddef>
@@ -25,6 +26,14 @@
  * it calls back into the shell through the RunShellLineFn injected at
  * begin(), exactly the same callback-injection pattern topico 12 used for
  * BtpTransport::SendFn vs. EspNowManager.
+ *
+ * Topico 19 adds a second, private ShellSerial instance here (the "BTP
+ * terminal shell"), fed by TERMINAL_IN and drained into TERMINAL_OUT
+ * (SerialMux.cpp's g_terminalShell/g_terminalPty) -- see PASSO 1/2 in this
+ * file's RESULTADO in bally_protocol/topicos/19_terminal_protocolado.txt.
+ * Including <ShellSerial.h> here does not reopen the cycle above: ShellSerial
+ * is a leaf lib (Arduino.h + <functional> only, no ShellConfig/
+ * ShellCommandSupport dependency of its own).
  */
 namespace SerialMux {
 
@@ -39,7 +48,25 @@ using RunShellLineFn = void (*)(const char* commandLine, const char* source,
 // HELLO_RESULT (BTP has no separate concept of "dongle UUID" yet outside
 // this field -- topico 16 may formalize one). Caller derives it (e.g. from
 // the MAC) and owns its storage only for the duration of this call.
-void begin(Stream& io, RunShellLineFn runShellLine, const std::uint8_t selfUuid[16]) noexcept;
+// terminalPrompt is copied (not aliased) into the private BTP terminal
+// ShellSerial's prompt text -- callers may pass a temporary's c_str() (e.g.
+// ShellOutput::commandPrompt().c_str()); the pointer only needs to remain
+// valid for the duration of this call.
+void begin(Stream& io, RunShellLineFn runShellLine, const std::uint8_t selfUuid[16],
+          const char* terminalPrompt) noexcept;
+
+// Tab completion for the BTP terminal session (topico 19, PASSO 1/2): the
+// caller (AppRuntime) passes the same provider it gives serialShell_
+// (TinyShell::complete_line) so "dongle -bt<TAB>" behaves identically
+// whether typed on the real console or through TraceView's terminal widget.
+void setTerminalCompletionProvider(ShellSerial::CompletionProvider provider) noexcept;
+
+// Seeds the BTP terminal shell's arrow-up/down history. AppRuntime calls
+// this alongside serialShell_.addLog() when replaying persisted history
+// (restoreShellHistoryFromDatabase) so both shells recall the same past
+// commands -- the two ShellSerial instances otherwise keep independent
+// history storage (see topico 19 RESULTADO).
+void addTerminalHistory(const char* line) noexcept;
 
 // True while a plain human console (ShellSerial) owns the port: PASSO 11
 // callers use this to decide whether a direct Serial print is still allowed.

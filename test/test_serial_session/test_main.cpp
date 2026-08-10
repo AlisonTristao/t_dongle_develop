@@ -2,6 +2,7 @@
 
 #include <BtpTransport.h>
 #include <SerialSession.h>
+#include <TerminalPtyBuffer.h>
 #include <btp/codec.hpp>
 #include <btp/stream.hpp>
 
@@ -488,6 +489,114 @@ void test_stress_interleaved_telemetry_and_terminal_never_cross_classes() {
     TEST_ASSERT_EQUAL(kIterations / 2, telemetryOutcomes);
 }
 
+// ---- topico 19: TerminalPtyBuffer (portable RX/TX FIFO pair) -------------
+
+void test_terminal_pty_buffer_input_round_trips_in_order() {
+    SerialSession::TerminalPtyBuffer pty;
+    const std::vector<std::uint8_t> keystrokes = {'l', 's', ' ', '-', 'l', '\r'};
+
+    TEST_ASSERT_EQUAL(keystrokes.size(), pty.feedInput(keystrokes.data(), keystrokes.size()));
+    TEST_ASSERT_EQUAL(keystrokes.size(), pty.availableInput());
+
+    for (const std::uint8_t expected : keystrokes) {
+        TEST_ASSERT_EQUAL(static_cast<int>(expected), pty.peekInput());
+        TEST_ASSERT_EQUAL(static_cast<int>(expected), pty.readInput());
+    }
+    TEST_ASSERT_EQUAL(0U, pty.availableInput());
+    TEST_ASSERT_EQUAL(-1, pty.readInput());
+}
+
+void test_terminal_pty_buffer_output_chunks_respect_caller_cap() {
+    SerialSession::TerminalPtyBuffer pty;
+    std::vector<std::uint8_t> written(1500U);
+    for (std::size_t i = 0U; i < written.size(); ++i) {
+        written[i] = static_cast<std::uint8_t>(i & 0xFFU);
+    }
+
+    TEST_ASSERT_EQUAL(written.size(), pty.writeOutput(written.data(), written.size()));
+    TEST_ASSERT_TRUE(pty.hasOutput());
+
+    // Mirrors SerialMux::flushTerminalPtyOutput() chunking at
+    // kOutboundPayloadCap (700): every chunk respects the caller's cap and
+    // the concatenation of all chunks reproduces the original bytes with no
+    // loss, duplication or reordering.
+    constexpr std::size_t kChunkCap = 700U;
+    std::vector<std::uint8_t> reassembled;
+    std::uint8_t chunk[kChunkCap];
+    std::size_t chunkSize = 0U;
+    while (pty.hasOutput() && (chunkSize = pty.takeOutput(chunk, sizeof(chunk))) > 0U) {
+        TEST_ASSERT_TRUE(chunkSize <= kChunkCap);
+        reassembled.insert(reassembled.end(), chunk, chunk + chunkSize);
+    }
+
+    TEST_ASSERT_FALSE(pty.hasOutput());
+    TEST_ASSERT_TRUE(reassembled == written);
+}
+
+void test_terminal_pty_buffer_input_and_output_are_independent_fifos() {
+    // Interleaves feeding input (as if TERMINAL_IN frames kept arriving)
+    // with partially draining output (as if a tick()'s TERMINAL_OUT queue
+    // were momentarily full/slow) and checks neither direction reorders or
+    // drops anything -- CRITERIO 1, "texto digitado nao e perdido ou
+    // deslocado por mensagens assincronas".
+    SerialSession::TerminalPtyBuffer pty;
+
+    const std::vector<std::uint8_t> firstKeystroke = {'a'};
+    const std::vector<std::uint8_t> echoOfFirst = {'a'};
+    const std::vector<std::uint8_t> secondKeystroke = {'b', 'c'};
+    const std::vector<std::uint8_t> echoOfSecond = {'b', 'c'};
+
+    TEST_ASSERT_EQUAL(1U, pty.feedInput(firstKeystroke.data(), firstKeystroke.size()));
+    TEST_ASSERT_EQUAL(1U, pty.writeOutput(echoOfFirst.data(), echoOfFirst.size()));
+
+    TEST_ASSERT_EQUAL(static_cast<int>('a'), pty.readInput());
+    TEST_ASSERT_EQUAL(0U, pty.availableInput());
+
+    TEST_ASSERT_EQUAL(2U, pty.feedInput(secondKeystroke.data(), secondKeystroke.size()));
+    TEST_ASSERT_EQUAL(2U, pty.writeOutput(echoOfSecond.data(), echoOfSecond.size()));
+
+    TEST_ASSERT_EQUAL(static_cast<int>('b'), pty.readInput());
+    TEST_ASSERT_EQUAL(static_cast<int>('c'), pty.readInput());
+    TEST_ASSERT_EQUAL(-1, pty.readInput());
+
+    std::uint8_t out[8];
+    const std::size_t outSize = pty.takeOutput(out, sizeof(out));
+    TEST_ASSERT_EQUAL(3U, outSize); // "a" + "bc", still in original order
+    TEST_ASSERT_EQUAL('a', out[0]);
+    TEST_ASSERT_EQUAL('b', out[1]);
+    TEST_ASSERT_EQUAL('c', out[2]);
+}
+
+void test_terminal_pty_buffer_reset_clears_both_directions() {
+    SerialSession::TerminalPtyBuffer pty;
+    const std::vector<std::uint8_t> bytes = {'x', 'y', 'z'};
+    pty.feedInput(bytes.data(), bytes.size());
+    pty.writeOutput(bytes.data(), bytes.size());
+    TEST_ASSERT_TRUE(pty.availableInput() > 0U);
+    TEST_ASSERT_TRUE(pty.hasOutput());
+
+    pty.reset();
+
+    TEST_ASSERT_EQUAL(0U, pty.availableInput());
+    TEST_ASSERT_EQUAL(-1, pty.peekInput());
+    TEST_ASSERT_FALSE(pty.hasOutput());
+    std::uint8_t scratch[4];
+    TEST_ASSERT_EQUAL(0U, pty.takeOutput(scratch, sizeof(scratch)));
+}
+
+void test_terminal_pty_buffer_input_overflow_is_bounded_not_corrupting() {
+    // Defensive-only: normal traffic (ShellSerial::MAX_INPUT_LENGTH=512,
+    // kOutboundPayloadCap=700) never gets close to kTerminalPtyRxCapacity
+    // (1024). A pathological oversized push just gets truncated, not
+    // silently overrunning into other state.
+    SerialSession::TerminalPtyBuffer pty;
+    std::vector<std::uint8_t> huge(SerialSession::kTerminalPtyRxCapacity + 100U, 'Z');
+
+    const std::size_t accepted = pty.feedInput(huge.data(), huge.size());
+    TEST_ASSERT_EQUAL(SerialSession::kTerminalPtyRxCapacity, accepted);
+    TEST_ASSERT_EQUAL(SerialSession::kTerminalPtyRxCapacity, pty.availableInput());
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_parse_hello_matches_canonical_vector);
@@ -503,5 +612,10 @@ int main(int, char**) {
     RUN_TEST(test_recovers_after_truncated_frame_followed_by_valid_one);
     RUN_TEST(test_consecutive_delimiters_produce_no_empty_frame);
     RUN_TEST(test_stress_interleaved_telemetry_and_terminal_never_cross_classes);
+    RUN_TEST(test_terminal_pty_buffer_input_round_trips_in_order);
+    RUN_TEST(test_terminal_pty_buffer_output_chunks_respect_caller_cap);
+    RUN_TEST(test_terminal_pty_buffer_input_and_output_are_independent_fifos);
+    RUN_TEST(test_terminal_pty_buffer_reset_clears_both_directions);
+    RUN_TEST(test_terminal_pty_buffer_input_overflow_is_bounded_not_corrupting);
     return UNITY_END();
 }

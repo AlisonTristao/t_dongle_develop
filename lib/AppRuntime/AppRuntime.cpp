@@ -71,6 +71,10 @@ void AppRuntime::restoreShellHistoryFromDatabase() {
         line.trim();
         if (!line.isEmpty()) {
             serialShell_.addLog(line);
+            // Topico 19: the BTP terminal channel has its own ShellSerial
+            // instance (SerialMux.cpp), so persisted history has to be
+            // replayed into it explicitly too.
+            SerialMux::addTerminalHistory(line.c_str());
         }
 
         if (newline < 0) {
@@ -239,7 +243,7 @@ void AppRuntime::begin() {
     }
     SerialMux::begin(Serial, [](const char* cmd, const char* source, const char* userId, std::string* out) {
         ShellConfig::runLine(std::string(cmd), source, out, userId);
-    }, selfUuid);
+    }, selfUuid, ShellOutput::commandPrompt().c_str());
 
     EspNowConfig::attachCallbacks(espNowManager_, Serial, &databaseStore_, &lcdDashboard_);
 
@@ -280,7 +284,8 @@ void AppRuntime::begin() {
         return;
     }
 
-    serialShell_.setCompletionProvider([this](const String& input, String* outSuggestions, size_t maxSuggestions) -> size_t {
+    const ShellSerial::CompletionProvider completionProvider =
+        [this](const String& input, String* outSuggestions, size_t maxSuggestions) -> size_t {
         if (outSuggestions == nullptr || maxSuggestions == 0) {
             return 0;
         }
@@ -296,7 +301,11 @@ void AppRuntime::begin() {
         }
 
         return written;
-    });
+    };
+    serialShell_.setCompletionProvider(completionProvider);
+    // Same TinyShell::complete_line-backed Tab completion for the BTP
+    // terminal session (topico 19) as the real console gets.
+    SerialMux::setTerminalCompletionProvider(completionProvider);
 
     restoreShellHistoryFromDatabase();
 
