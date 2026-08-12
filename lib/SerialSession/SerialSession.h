@@ -152,7 +152,7 @@ std::size_t buildStatus(const StatusCounters& counters, std::uint8_t* output,
                         std::size_t outputCapacity) noexcept;
 
 // COMMANDS_AND_ACTIONS.md section 8.1 (topico 17, status_version=2): one
-// fixed-size 24-byte record per (source_id, topic_id) this dongle currently
+// fixed-size record per (source_id, topic_id) this dongle currently
 // tracks a subscription state for. Kept as a plain wire-shaped struct here
 // (not SubscriptionRegistry::TopicStatusEntry) so this module stays free of
 // a SubscriptionRegistry dependency, matching the ManifestCache precedent
@@ -166,12 +166,25 @@ struct TopicStatusRecord {
     std::uint64_t samplesDroppedTotal = 0U;
 };
 
-constexpr std::size_t kTopicStatusRecordSize = 24U;
+// SPEC CONFLICT, resolved here in favour of the field table (documented, not
+// silently patched -- bally_protocol is frozen and was not edited):
+// COMMANDS_AND_ACTIONS.md section 8.1 says "24 x T" and "24 octetos", but the
+// field list it gives right below is source_id(uint32=4) + topic_id(uint16=2)
+// + subscriber_count(uint16=2) + effective_rate_millihz(uint32=4) +
+// bytes_total(uint64=8) + samples_dropped_total(uint64=8) = 28 octets. A
+// 24-octet record cannot hold those six fields at their stated wire types, so
+// the "24" is an arithmetic slip in the prose while the per-field types are
+// unambiguous; every implementer that writes all six fields at the declared
+// widths necessarily lands on 28. This is the single place the stride is
+// defined, so realigning the whole repo to a corrected spec is a one-line
+// change here.
+constexpr std::size_t kTopicStatusRecordSize = 28U;
 
 // Builds a status_version=2 payload: the same 92-byte v1 prefix (with
-// status_version patched to 2) followed by topicCount 24-byte
-// TopicStatusRecord entries. Returns 0 on capacity failure (caller falls
-// back to buildStatus()'s v1-only payload rather than sending nothing).
+// status_version patched to 2), a uint16_le topic_status_count, then
+// topicCount kTopicStatusRecordSize-byte TopicStatusRecord entries. Returns 0
+// on capacity failure (caller falls back to buildStatus()'s v1-only payload
+// rather than sending nothing).
 std::size_t buildStatusV2(const StatusCounters& counters, const TopicStatusRecord* topics, std::size_t topicCount,
                           std::uint8_t* output, std::size_t outputCapacity) noexcept;
 

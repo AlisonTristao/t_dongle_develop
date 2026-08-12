@@ -243,6 +243,13 @@ std::size_t buildStatus(const StatusCounters& counters, std::uint8_t* output,
     return kStatusPayloadSize;
 }
 
+// Guards the stride against the field writes below drifting apart again (the
+// original topico 17 draft wrote 28 bytes per record while advancing 24,
+// overlapping every record after the first and overrunning the caller's
+// buffer by 4 bytes on a full snapshot). 4 + 2 + 2 + 4 + 8 + 8 = 28.
+static_assert(kTopicStatusRecordSize == 4U + 2U + 2U + 4U + 8U + 8U,
+              "topic_status stride must match the sum of the section 8.1 field widths");
+
 std::size_t buildStatusV2(const StatusCounters& counters, const TopicStatusRecord* topics, std::size_t topicCount,
                           std::uint8_t* output, std::size_t outputCapacity) noexcept {
     const std::size_t total = kStatusPayloadSize + 2U + topicCount * kTopicStatusRecordSize;

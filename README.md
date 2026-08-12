@@ -80,6 +80,12 @@ Serviços/domínio
                      enumeração target=0, incluindo a auto-descrição do dongle como
                      role=DONGLE) e mantém a revisão agregada do catálogo (HELLO do dongle);
                      puro C++, sem Arduino
+  SubscriptionRegistry -> agregação de assinaturas por (source_id, topic_id) (tópico 17):
+                     junta os pedidos de todos os clientes seriais num único SUBSCRIBE
+                     upstream na taxa/lease união, decide quando reenviar (mudança de taxa
+                     ou renovação de lease) e quando enviar UNSUBSCRIBE (último consumidor),
+                     e contabiliza bytes/amostras descartadas por tópico para o STATUS v2;
+                     puro C++, sem Arduino, testável em env:native
   DatabaseStore   -> schema SQLite, migrações, leituras/gravações
   DonglePeripherals -> LED, LCD (driver), SD
   LcdDashboard    -> dashboard em grade sobre DonglePeripherals
@@ -137,6 +143,10 @@ graph TD
     EspNowConfig --> SerialMux
     SerialMux --> SerialSession
     SerialMux --> BtpTransport
+    SerialMux --> ManifestCache
+    SerialMux --> SubscriptionRegistry
+    EspNowConfig --> ManifestCache
+    EspNowConfig --> SubscriptionRegistry
     SerialSession --> BtpTransport
 ```
 
@@ -431,15 +441,52 @@ TraceView), seguindo `bally_protocol/docs/TRANSPORT_SERIAL.md`:
   original (nunca reescreve `source_id`/`timestamp_us`). `COMMAND_REQUEST`/`TERMINAL_IN`
   vindos do cliente rodam via `ShellConfig::runLine` com identidade `"serial"` (mesmo
   perímetro de confiança do console físico) e respondem `COMMAND_RESULT`/`TERMINAL_OUT`.
-  `STATUS` (contadores de `frames_rx/tx`, CRC, decode, etc.) é publicado a cada 2s.
+  `STATUS` (contadores de `frames_rx/tx`, CRC, decode, etc.) é publicado a cada 2s — desde o
+  tópico 17 com `status_version=2` sempre que houver pelo menos um tópico rastreado (ver 7.7).
 - **Saída**: `SESSION_CLOSE` do cliente ou o watchdog (`session_timeout_ms` negociado, sem
   frame BTP válido) fecham a sessão: o dongle descarta o que ainda não foi enviado nas filas,
   escreve exatamente `BTP/1 CONSOLE\r\n` e devolve a porta para `ShellSerial`.
 - **Fora de escopo deste tópico** (ver RESULTADO em
   `bally_protocol/topicos/13_dongle_serial_mux_sessao.txt`): fragmentação/reassembly de
   mensagens lógicas maiores que um frame serial (4096 octetos já é folgado para os payloads
-  atuais), `MANIFEST`/`SUBSCRIBE` (tópicos 16/17) e o protocolo interativo completo de
-  terminal (tópico 19) — `TERMINAL_IN`/`OUT` aqui é uma linha de shell por mensagem.
+  atuais). `MANIFEST` (tópico 16), `SUBSCRIBE`/`UNSUBSCRIBE` (tópico 17, ver 7.7) e o
+  protocolo interativo completo de terminal (tópico 19) foram implementados depois, nos
+  tópicos indicados.
+
+### 7.7 Assinaturas e controle de taxa (`SubscriptionRegistry`, tópico 17)
+
+O dongle é um agregador, não um repassador: ele nunca encaminha o `SUBSCRIBE` cru de um
+cliente para o robô (`bally_protocol/docs/COMMANDS_AND_ACTIONS.md` seção 7).
+
+- **Agregação**: `SubscriptionRegistry` mantém uma linha por `(source_id, topic_id)` com o
+  conjunto de sessões seriais interessadas (`clientId` = `source_id` do `HELLO` daquela
+  sessão). O que vai ao robô é sempre **um** `SUBSCRIBE` por tópico, com a **união** dos
+  pedidos vivos: a maior `requested_rate_millihz` e o maior `requested_lease_ms`.
+- **Resposta ao cliente**: o `SUBSCRIBE_RESULT` é respondido de imediato pelo `SerialMux`, a
+  partir do `max_rate_millihz` já cacheado pelo `ManifestCache` — a taxa efetiva devolvida
+  nunca excede nem a pedida nem a máxima do schema, e o cliente não espera um round-trip
+  ESP-NOW. A taxa que o **robô** de fato concedeu chega depois, no `SUBSCRIBE_RESULT` dele, e
+  é publicada no `STATUS` v2 (`effective_rate_millihz`).
+- **Quando o robô é reavisado**: tópico recém-ativado; taxa da união mudou (**inclusive para
+  baixo**, quando o cliente mais rápido sai e outro permanece); ou o lease concedido passou da
+  metade (renovação, varrida a cada `tick()`). Um pedido repetido que não muda a união não
+  gera tráfego ESP-NOW nenhum.
+- **`UNSUBSCRIBE` upstream** é enviado **somente** quando o último consumidor do tópico some —
+  por `UNSUBSCRIBE` do cliente, por expiração de lease, ou por fim de sessão (fechamento
+  explícito, `HELLO` rejeitado ou timeout do watchdog, que removem todas as assinaturas
+  daquele cliente).
+- **Contadores e `STATUS` v2**: `SerialMux::forwardRelay` só retransmite `TELEMETRY` de um
+  tópico assinado e contabiliza, por `(source_id, topic_id)`, bytes de payload lógico
+  encaminhados e amostras descartadas. Esses valores viram registros `topic_status` no
+  `STATUS` com `status_version=2` (seção 8.1) — a desambiguação por `source_id` é obrigatória
+  porque este dongle relata mais de uma fonte. O bloco v1 de 92 octetos continua idêntico e no
+  mesmo offset. Nem o `timestamp_us` nem o schema da telemetria são tocados em nenhum ponto
+  desse caminho.
+- **Conflito conhecido na spec**: a seção 8.1 diz "24 octetos" por registro `topic_status`, mas
+  a lista de campos logo abaixo (`uint32 + uint16 + uint16 + uint32 + uint64 + uint64`) soma
+  **28**. Este firmware serializa 28 (os tipos por campo são inequívocos; o "24" é um erro de
+  aritmética no texto) e concentra o valor em `SerialSession::kTopicStatusRecordSize`, com
+  `static_assert`, para realinhar em uma linha caso a spec seja corrigida.
 
 ## 8. LCD Dashboard (`LcdDashboard`)
 
@@ -511,6 +558,8 @@ lib/
   EspNowConfig/           # callbacks ESP-NOW, filas priorizadas por tipo, heartbeat, exec remota
   SerialSession/          # estado console/handshake BTP v1 da sessão serial (puro C++)
   SerialMux/              # unico escritor da serial no modo protocolado: COBS + filas FreeRTOS
+  ManifestCache/          # cache/agregação de MANIFEST_DATA por source_id (puro C++)
+  SubscriptionRegistry/   # agregação de assinaturas e contadores por tópico (puro C++)
   DatabaseStore/                 # schema SQLite e leituras/gravações
   DonglePeripherals/ LcdDashboard/  # LED/LCD/SD e dashboard em grade
   SudoManager/                   # elevação de permissão por identidade
@@ -525,6 +574,7 @@ test/
   test_tablelinker/      # demo antiga do TinyShell, hardware-only
   test_protocol_router/  # BTP vs. vetores canônicos, roda em env:native
   test_serial_session/   # handshake/COBS/estresse da sessão serial, roda em env:native
+  test_subscription_registry/  # agregação de assinaturas + STATUS v2, roda em env:native
 platformio.ini
 CONTRIBUTING.md
 ```
@@ -542,8 +592,9 @@ CONTRIBUTING.md
   forma) — o antigo alias de broadcast `000` foi removido por isso
 - RTC depende de ajuste manual no boot (sem RTC externo dedicado)
 - fila RX pode perder pacotes sob alta carga (contador de dropped exposto no tile `ERR`)
-- `CONTROL` roteado do lado ESP-NOW (HELLO/MANIFEST/SUBSCRIBE) ainda não tem consumidor
-  nesta versão (fica para os tópicos 16/17) — é drenado e descartado, só contabilizado.
+- `CONTROL` roteado do lado ESP-NOW tem consumidor para `MANIFEST_DATA` (tópico 16) e
+  `SUBSCRIBE_RESULT` (tópico 17); `UNSUBSCRIBE_RESULT` e qualquer outro `object_id` (um
+  `HELLO` perdido, um id reservado) continuam drenados e descartados, só contabilizados.
   `TELEMETRY`/`LOG` do ESP-NOW já têm consumidor real desde o tópico 13: são retransmitidos
   para uma sessão serial protocolada (`SerialMux::forwardRelay`); sem sessão ativa, o efeito
   observável continua sendo "drenado e descartado, só contabilizado" como antes
@@ -553,6 +604,18 @@ CONTRIBUTING.md
   TERMINAL_OUT atuais, mas um manifesto grande (tópico 16) vai precisar dessa reassembly
 - `TERMINAL_IN`/`TERMINAL_OUT` na sessão serial é uma linha de shell por mensagem (sem
   dedup de `COMMAND_REQUEST`, sem pty real) — o protocolo interativo completo é tópico 19
+- assinaturas (tópico 17) são limitadas a `SubscriptionRegistry::kMaxTopics = 8` pares
+  `(source_id, topic_id)` e `kMaxClientsPerTopic = 4` sessões por tópico; estouro responde
+  `REJECTED`/`CAPACITY_EXHAUSTED` ao cliente, nunca descarta silenciosamente
+- o `SUBSCRIBE` upstream só alcança um robô do qual já recebemos alguma mensagem BTP (mesma
+  limitação de `espnow -send_to` acima); e se o robô nunca respondeu `SUBSCRIBE_RESULT`, o
+  dongle não tem `subscription_id` para montar o `UNSUBSCRIBE` — nesse caso a assinatura do
+  robô morre pelo lease dele, não por comando
+- a taxa efetiva no `SUBSCRIBE_RESULT` respondido ao cliente é a do clamp local (schema
+  cacheado); a taxa que o robô realmente concedeu só aparece no `topic_status` do `STATUS` v2
+- `SerialSession::kTopicStatusRecordSize` vale 28, não os "24 octetos" que a seção 8.1 do
+  `COMMANDS_AND_ACTIONS.md` afirma — a soma dos campos declarados na própria seção dá 28 (ver
+  7.7); se a spec for corrigida para outro layout, é essa constante que muda
 - banco em arquivo local no SD (sujeito a falhas de cartão/contato)
 - senha do `sudo` é uma constante compilada — trocar exige reflash; qualquer peer
   cadastrado que souber a senha tem controle total do dongle (ver seção 7.5)

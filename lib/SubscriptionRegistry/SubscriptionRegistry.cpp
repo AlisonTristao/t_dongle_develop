@@ -19,8 +19,11 @@ struct TopicRow {
     ClientSub clients[kMaxClientsPerTopic];
 
     // Upstream (dongle -> robot) state.
+    bool upstreamActive = false;                // an upstream SUBSCRIBE is currently asserted for this row
     std::uint32_t pendingRequestSequence = 0U;  // 0 = none outstanding
     std::uint32_t upstreamRequestedRateMillihz = 0U;
+    std::uint32_t upstreamLeaseMs = 0U;         // lease last asked of the robot
+    std::uint32_t upstreamRenewAtMs = 0U;       // re-send the SUBSCRIBE once nowMs reaches this
     std::uint32_t upstreamSubscriptionId = 0U;  // robot-assigned id, needed to build UNSUBSCRIBE
     std::uint32_t effectiveRateMillihz = 0U;  // last grant (or 0 if never granted / cleared)
 
@@ -83,10 +86,75 @@ std::uint32_t unionRateMillihz(const TopicRow& row) noexcept {
     return maxRate;
 }
 
+std::uint32_t unionLeaseMs(const TopicRow& row) noexcept {
+    std::uint32_t maxLease = 0U;
+    for (std::size_t i = 0U; i < kMaxClientsPerTopic; ++i) {
+        if (row.clients[i].used && row.clients[i].requestedLeaseMs > maxLease) {
+            maxLease = row.clients[i].requestedLeaseMs;
+        }
+    }
+    return maxLease;
+}
+
 std::uint32_t clampLease(std::uint32_t requestedLeaseMs) noexcept {
     if (requestedLeaseMs < kMinLeaseMs) return kMinLeaseMs;
     if (requestedLeaseMs > kMaxLeaseMs) return kMaxLeaseMs;
     return requestedLeaseMs;
+}
+
+// The single decision point for "what, if anything, must this dongle now tell
+// the robot about this topic". Every desktop-facing entry point below funnels
+// through here after mutating a row, so the aggregation rules exist once:
+//
+//   * no consumers left  -> Unsubscribe, but only if we had actually asserted
+//     a SUBSCRIBE upstream (PASSO 5: "remover assinatura somente quando nao
+//     houver outro consumidor" -- a row that still has one live client never
+//     produces an Unsubscribe, no matter how many others just left);
+//   * consumers left     -> a single aggregated Subscribe carrying the union
+//     (highest) rate and lease across them, emitted when the row is newly
+//     active, when that union changed in EITHER direction (a departing fast
+//     client must lower the robot's rate, not leave it pinned high), or when
+//     the granted lease is half spent and needs renewing;
+//   * otherwise          -> None, so a plain re-assertion of an unchanged
+//     union costs no ESP-NOW traffic at all.
+//
+// Mutates the row's upstream bookkeeping to match whatever it returns, so the
+// caller only has to send the frame.
+UpstreamAction evaluateUpstream(TopicRow& row, std::uint32_t nowMs) noexcept {
+    UpstreamAction action{};
+    action.sourceId = row.sourceId;
+    action.topicId = row.topicId;
+
+    if (refcount(row) == 0U) {
+        if (!row.upstreamActive) return action;  // kind stays None: nothing was ever asserted
+        action.kind = UpstreamKind::Unsubscribe;
+        action.upstreamSubscriptionId = row.upstreamSubscriptionId;
+        row.upstreamActive = false;
+        row.upstreamRequestedRateMillihz = 0U;
+        row.upstreamLeaseMs = 0U;
+        row.upstreamRenewAtMs = 0U;
+        row.effectiveRateMillihz = 0U;
+        row.upstreamSubscriptionId = 0U;
+        return action;
+    }
+
+    const std::uint32_t rate = unionRateMillihz(row);
+    const std::uint32_t lease = unionLeaseMs(row);
+    const bool changed = !row.upstreamActive || rate != row.upstreamRequestedRateMillihz ||
+                         lease != row.upstreamLeaseMs;
+    // Unsigned wrap-safe comparison: millis() rolls over after ~49 days, so
+    // compare the elapsed difference rather than the absolute instants.
+    const bool dueForRenewal = row.upstreamActive && (nowMs - row.upstreamRenewAtMs) < 0x80000000U;
+    if (!changed && !dueForRenewal) return action;  // kind stays None
+
+    action.kind = UpstreamKind::Subscribe;
+    action.rateMillihz = rate;
+    action.leaseMs = lease;
+    row.upstreamActive = true;
+    row.upstreamRequestedRateMillihz = rate;
+    row.upstreamLeaseMs = lease;
+    row.upstreamRenewAtMs = nowMs + (lease / kUpstreamRenewDivisor);
+    return action;
 }
 
 }  // namespace
@@ -112,15 +180,14 @@ DesktopSubscribeOutcome onDesktopSubscribe(std::uint32_t clientId, std::uint32_t
             client.leaseDeadlineMs = leaseDeadlineMs;  // renew
             outcome.accepted = true;
             outcome.subscriptionId = client.subscriptionId;
-            // Union rate cannot have changed (this client's own contribution
-            // is unchanged and nobody else was touched), so no upstream
-            // action is needed for a pure renewal.
+            // The union is unchanged, so evaluateUpstream only emits anything
+            // here when the robot's own lease is half spent -- i.e. a desktop
+            // renewal is what propagates upstream as a renewal, but not one
+            // ESP-NOW frame per retry.
+            outcome.upstream = evaluateUpstream(row, nowMs);
             return outcome;
         }
     }
-
-    const std::uint32_t rateBeforeUnion = unionRateMillihz(row);
-    const bool wasActive = refcount(row) > 0U;
 
     // Same client re-subscribing to the same topic with a *different*
     // rate/lease replaces its row entry atomically (COMMANDS_AND_ACTIONS.md
@@ -153,17 +220,12 @@ DesktopSubscribeOutcome onDesktopSubscribe(std::uint32_t clientId, std::uint32_t
 
     outcome.accepted = true;
     outcome.subscriptionId = client.subscriptionId;
-
-    const std::uint32_t rateAfterUnion = unionRateMillihz(row);
-    if (!wasActive || rateAfterUnion > rateBeforeUnion) {
-        outcome.needsUpstreamSubscribe = true;
-        outcome.upstream = UpstreamAction{sourceId, topicId, rateAfterUnion, clampedLeaseMs};
-        row.upstreamRequestedRateMillihz = rateAfterUnion;
-    }
+    outcome.upstream = evaluateUpstream(row, nowMs);
     return outcome;
 }
 
-DesktopUnsubscribeOutcome onDesktopUnsubscribe(std::uint32_t clientId, std::uint32_t subscriptionId) noexcept {
+DesktopUnsubscribeOutcome onDesktopUnsubscribe(std::uint32_t clientId, std::uint32_t subscriptionId,
+                                               std::uint32_t nowMs) noexcept {
     DesktopUnsubscribeOutcome outcome{};
 
     for (std::size_t r = 0U; r < kMaxTopics; ++r) {
@@ -174,13 +236,7 @@ DesktopUnsubscribeOutcome onDesktopUnsubscribe(std::uint32_t clientId, std::uint
             if (client.used && client.clientId == clientId && client.subscriptionId == subscriptionId) {
                 client = ClientSub{};
                 outcome.found = true;
-                if (refcount(row) == 0U) {
-                    outcome.needsUpstreamUnsubscribe = true;
-                    outcome.upstream = UpstreamAction{row.sourceId, row.topicId, 0U, 0U, row.upstreamSubscriptionId};
-                    row.upstreamRequestedRateMillihz = 0U;
-                    row.effectiveRateMillihz = 0U;
-                    row.upstreamSubscriptionId = 0U;
-                }
+                outcome.upstream = evaluateUpstream(row, nowMs);
                 return outcome;
             }
         }
@@ -191,9 +247,10 @@ DesktopUnsubscribeOutcome onDesktopUnsubscribe(std::uint32_t clientId, std::uint
     return outcome;
 }
 
-std::size_t onClientDisconnected(std::uint32_t clientId, UpstreamAction* out, std::size_t maxOut) noexcept {
+std::size_t onClientDisconnected(std::uint32_t clientId, std::uint32_t nowMs, UpstreamAction* out,
+                                 std::size_t maxOut) noexcept {
     std::size_t written = 0U;
-    for (std::size_t r = 0U; r < kMaxTopics && written < maxOut; ++r) {
+    for (std::size_t r = 0U; r < kMaxTopics; ++r) {
         TopicRow& row = g_rows[r];
         if (!row.used) continue;
 
@@ -204,42 +261,41 @@ std::size_t onClientDisconnected(std::uint32_t clientId, UpstreamAction* out, st
                 touched = true;
             }
         }
-        if (touched && refcount(row) == 0U) {
-            if (out != nullptr) {
-                out[written] = UpstreamAction{row.sourceId, row.topicId, 0U, 0U, row.upstreamSubscriptionId};
-            }
-            ++written;
-            row.upstreamRequestedRateMillihz = 0U;
-            row.effectiveRateMillihz = 0U;
-            row.upstreamSubscriptionId = 0U;
-        }
+        if (!touched) continue;
+
+        // Evaluated even when the output buffer is already full, so the row's
+        // upstream bookkeeping never drifts from reality just because the
+        // caller undersized `out`.
+        const UpstreamAction action = evaluateUpstream(row, nowMs);
+        if (action.kind == UpstreamKind::None) continue;
+        if (out != nullptr && written < maxOut) out[written] = action;
+        if (written < maxOut) ++written;
     }
     return written;
 }
 
-std::size_t expireLeases(std::uint32_t nowMs, UpstreamAction* out, std::size_t maxOut) noexcept {
+std::size_t sweep(std::uint32_t nowMs, UpstreamAction* out, std::size_t maxOut) noexcept {
     std::size_t written = 0U;
-    for (std::size_t r = 0U; r < kMaxTopics && written < maxOut; ++r) {
+    for (std::size_t r = 0U; r < kMaxTopics; ++r) {
         TopicRow& row = g_rows[r];
         if (!row.used) continue;
 
-        bool touched = false;
         for (std::size_t i = 0U; i < kMaxClientsPerTopic; ++i) {
             ClientSub& client = row.clients[i];
-            if (client.used && nowMs >= client.leaseDeadlineMs) {
+            // Wrap-safe "deadline reached": millis() rolls over after ~49
+            // days, so a plain nowMs >= deadline would expire every live
+            // subscription for one lease-length window after the rollover.
+            if (client.used && (nowMs - client.leaseDeadlineMs) < 0x80000000U) {
                 client = ClientSub{};
-                touched = true;
             }
         }
-        if (touched && refcount(row) == 0U) {
-            if (out != nullptr) {
-                out[written] = UpstreamAction{row.sourceId, row.topicId, 0U, 0U, row.upstreamSubscriptionId};
-            }
-            ++written;
-            row.upstreamRequestedRateMillihz = 0U;
-            row.effectiveRateMillihz = 0U;
-            row.upstreamSubscriptionId = 0U;
-        }
+
+        // Unconditional (not only when something expired): this is also where
+        // an otherwise-idle row gets its upstream lease renewed.
+        const UpstreamAction action = evaluateUpstream(row, nowMs);
+        if (action.kind == UpstreamKind::None) continue;
+        if (out != nullptr && written < maxOut) out[written] = action;
+        if (written < maxOut) ++written;
     }
     return written;
 }

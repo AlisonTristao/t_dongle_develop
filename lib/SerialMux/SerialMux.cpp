@@ -208,9 +208,10 @@ bool enqueueOwn(btp::MessageType type, std::uint16_t objectId, const std::uint8_
     return enqueueFrameBytes(SerialSession::classify(type, objectId), frameBytes, frameSize);
 }
 
-// Forward declaration: defined below (topico 17), used by finalizeToConsole
-// (PASSO 6) ahead of its own definition further down this file.
-void dispatchUpstreamUnsubscribes(const SubscriptionRegistry::UpstreamAction* actions, std::size_t count) noexcept;
+// Forward declarations: defined below (topico 17), used by finalizeToConsole
+// (PASSO 6) ahead of their own definitions further down this file.
+void dispatchUpstreamAction(const SubscriptionRegistry::UpstreamAction& action) noexcept;
+void dispatchUpstreamActions(const SubscriptionRegistry::UpstreamAction* actions, std::size_t count) noexcept;
 
 // Sends the session's last frame synchronously (bypassing the queues -- it
 // must go out before anything else and nothing lower-priority should delay
@@ -235,9 +236,9 @@ void finalizeToConsole(std::uint16_t objectId, const std::uint8_t* payload, std:
     // reached SUBSCRIBE, e.g. straight to HelloRejected on a first attempt).
     {
         SubscriptionRegistry::UpstreamAction actions[SubscriptionRegistry::kMaxTopics];
-        const std::size_t count =
-            SubscriptionRegistry::onClientDisconnected(g_session.peerSourceId(), actions, SubscriptionRegistry::kMaxTopics);
-        dispatchUpstreamUnsubscribes(actions, count);
+        const std::size_t count = SubscriptionRegistry::onClientDisconnected(
+            g_session.peerSourceId(), millis(), actions, SubscriptionRegistry::kMaxTopics);
+        dispatchUpstreamActions(actions, count);
     }
 
     resetQueues();
@@ -392,14 +393,32 @@ void handleManifestRequest(const btp::DecodedFrame& decoded) noexcept {
 // only reached in that state.
 std::uint32_t currentClientId() noexcept { return g_session.peerSourceId(); }
 
-// Every UpstreamAction produced by SubscriptionRegistry::onClientDisconnected/
-// expireLeases means "this topic's refcount just hit zero" -- always an
-// unsubscribe, never a subscribe (a fresh/renewed subscribe is dispatched
-// inline from handleSubscribeRequest below, not through this helper).
-void dispatchUpstreamUnsubscribes(const SubscriptionRegistry::UpstreamAction* actions, std::size_t count) noexcept {
-    if (g_requestUpstreamUnsubscribe == nullptr) return;
+// SubscriptionRegistry already decided *what* the robot must be told (topic
+// gone entirely vs. still wanted but at a different/renewed rate); this only
+// picks the matching injected sender. Losing one desktop subscriber is NOT
+// automatically an unsubscribe -- when other subscribers of that topic remain
+// but the departing one was the fastest, the registry emits a Subscribe with
+// the lowered union rate instead (topico 17 PASSO 5).
+void dispatchUpstreamAction(const SubscriptionRegistry::UpstreamAction& action) noexcept {
+    switch (action.kind) {
+        case SubscriptionRegistry::UpstreamKind::Subscribe:
+            if (g_requestUpstreamSubscribe != nullptr) {
+                g_requestUpstreamSubscribe(action.sourceId, action.topicId, action.rateMillihz, action.leaseMs);
+            }
+            break;
+        case SubscriptionRegistry::UpstreamKind::Unsubscribe:
+            if (g_requestUpstreamUnsubscribe != nullptr) {
+                g_requestUpstreamUnsubscribe(action.sourceId, action.topicId, action.upstreamSubscriptionId);
+            }
+            break;
+        case SubscriptionRegistry::UpstreamKind::None:
+            break;
+    }
+}
+
+void dispatchUpstreamActions(const SubscriptionRegistry::UpstreamAction* actions, std::size_t count) noexcept {
     for (std::size_t i = 0U; i < count; ++i) {
-        g_requestUpstreamUnsubscribe(actions[i].sourceId, actions[i].topicId, actions[i].upstreamSubscriptionId);
+        dispatchUpstreamAction(actions[i]);
     }
 }
 
@@ -473,10 +492,7 @@ void handleSubscribeRequest(const btp::DecodedFrame& decoded) noexcept {
                     ? SubscriptionRegistry::kMinLeaseMs
                     : (requestedLeaseMs > SubscriptionRegistry::kMaxLeaseMs) ? SubscriptionRegistry::kMaxLeaseMs
                                                                               : requestedLeaseMs;
-                if (outcome.needsUpstreamSubscribe && g_requestUpstreamSubscribe != nullptr) {
-                    g_requestUpstreamSubscribe(outcome.upstream.sourceId, outcome.upstream.topicId,
-                                              outcome.upstream.rateMillihz, outcome.upstream.leaseMs);
-                }
+                dispatchUpstreamAction(outcome.upstream);
             }
         }
     }
@@ -506,11 +522,8 @@ void handleUnsubscribeRequest(const btp::DecodedFrame& decoded) noexcept {
 
     const std::uint32_t subscriptionId = readU32Le(decoded.payload.data + 8U);
     const SubscriptionRegistry::DesktopUnsubscribeOutcome outcome =
-        SubscriptionRegistry::onDesktopUnsubscribe(currentClientId(), subscriptionId);
-    if (outcome.needsUpstreamUnsubscribe && g_requestUpstreamUnsubscribe != nullptr) {
-        g_requestUpstreamUnsubscribe(outcome.upstream.sourceId, outcome.upstream.topicId,
-                                    outcome.upstream.upstreamSubscriptionId);
-    }
+        SubscriptionRegistry::onDesktopUnsubscribe(currentClientId(), subscriptionId, millis());
+    dispatchUpstreamAction(outcome.upstream);
 
     std::uint8_t responsePayload[16];
     writeU32(responsePayload, decoded.header.source_id);
@@ -850,8 +863,8 @@ void tick(std::uint32_t nowMs) noexcept {
         {
             SubscriptionRegistry::UpstreamAction actions[SubscriptionRegistry::kMaxTopics];
             const std::size_t count = SubscriptionRegistry::onClientDisconnected(
-                g_session.peerSourceId(), actions, SubscriptionRegistry::kMaxTopics);
-            dispatchUpstreamUnsubscribes(actions, count);
+                g_session.peerSourceId(), nowMs, actions, SubscriptionRegistry::kMaxTopics);
+            dispatchUpstreamActions(actions, count);
         }
         resetQueues();
         writeConsoleText(consoleLine);
@@ -867,12 +880,15 @@ void tick(std::uint32_t nowMs) noexcept {
         // Lease sweep (topico 17): a client that stopped renewing a
         // SUBSCRIBE (without ever sending UNSUBSCRIBE or disconnecting) has
         // its grant time out here, independent of the session's own
-        // session_timeout_ms watchdog.
+        // session_timeout_ms watchdog. The same sweep also re-sends the
+        // upstream SUBSCRIBE of any topic whose robot-side lease is half
+        // spent, so the robot never stops publishing a topic a desktop
+        // client is still actively holding.
         {
             SubscriptionRegistry::UpstreamAction actions[SubscriptionRegistry::kMaxTopics];
             const std::size_t count =
-                SubscriptionRegistry::expireLeases(nowMs, actions, SubscriptionRegistry::kMaxTopics);
-            dispatchUpstreamUnsubscribes(actions, count);
+                SubscriptionRegistry::sweep(nowMs, actions, SubscriptionRegistry::kMaxTopics);
+            dispatchUpstreamActions(actions, count);
         }
 
         drainTx();

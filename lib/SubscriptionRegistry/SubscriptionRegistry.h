@@ -51,11 +51,27 @@ constexpr std::size_t kMaxClientsPerTopic = 4U;
 constexpr std::uint32_t kMinLeaseMs = 1000U;
 constexpr std::uint32_t kMaxLeaseMs = 300000U;  // 5 minutes, mirrors bally_software's ceiling
 
+// The upstream SUBSCRIBE is re-sent once this fraction of the granted lease
+// has elapsed, so the robot's own lease never expires under a desktop client
+// that is still renewing (COMMANDS_AND_ACTIONS.md section 7: "a assinatura
+// expira apos o lease se nao for renovada por novo SUBSCRIBE"). Halfway gives
+// one free retry before the robot would drop the topic, without turning every
+// desktop renewal into an ESP-NOW frame (topico 17 PASSO 7: rate limiting
+// must not flood).
+constexpr std::uint32_t kUpstreamRenewDivisor = 2U;
+
+enum class UpstreamKind : std::uint8_t {
+    None = 0,     // nothing to send; the robot's current state is already correct
+    Subscribe,    // (re)assert this topic at `rateMillihz`/`leaseMs`: new topic, rate change (up OR down), or lease renewal
+    Unsubscribe,  // last consumer of this topic is gone; release `upstreamSubscriptionId`
+};
+
 // What the caller must do upstream (over ESP-NOW, toward the robot) as a
 // consequence of a desktop-facing call below. `sourceId`/`topicId` name the
 // target; for a Subscribe action, `rateMillihz`/`leaseMs` are the union
 // (highest) request across every remaining client of that row.
 struct UpstreamAction {
+    UpstreamKind kind = UpstreamKind::None;
     std::uint32_t sourceId = 0U;
     std::uint32_t topicId = 0U;
     std::uint32_t rateMillihz = 0U;             // Subscribe only
@@ -70,8 +86,7 @@ struct DesktopSubscribeOutcome {
     // this module cannot detect; the caller checks ManifestCache first).
     bool accepted = false;
     std::uint32_t subscriptionId = 0U;  // dongle-local id, handed back to the desktop client
-    bool needsUpstreamSubscribe = false;
-    UpstreamAction upstream{};
+    UpstreamAction upstream{};          // kind == None when the robot already has the right orders
 };
 
 // clientId identifies the desktop session (see class comment). Repeating the
@@ -88,20 +103,28 @@ struct DesktopUnsubscribeOutcome {
     // ausente retorna SUCCESS/NONE" -- `found` is informational only, never
     // turned into an error by the caller.
     bool found = false;
-    bool needsUpstreamUnsubscribe = false;
+    // Unsubscribe only when the row lost its last consumer; Subscribe (with a
+    // lower rateMillihz) when other consumers remain but the departing one was
+    // the fastest -- topico 17 PASSO 5 is "remover somente quando nao houver
+    // outro consumidor", not "stop adjusting the rate".
     UpstreamAction upstream{};
 };
 
-DesktopUnsubscribeOutcome onDesktopUnsubscribe(std::uint32_t clientId, std::uint32_t subscriptionId) noexcept;
+DesktopUnsubscribeOutcome onDesktopUnsubscribe(std::uint32_t clientId, std::uint32_t subscriptionId,
+                                               std::uint32_t nowMs) noexcept;
 
 // PASSO 6 (session disconnect): clears every desktop subscription clientId
-// owns across all rows. Writes up to maxOut UpstreamAction entries (topics
-// whose refcount just hit zero) into out; returns how many were written.
-std::size_t onClientDisconnected(std::uint32_t clientId, UpstreamAction* out, std::size_t maxOut) noexcept;
+// owns across all rows. Writes up to maxOut UpstreamAction entries into out
+// (Unsubscribe for rows that lost their last consumer, Subscribe for rows
+// whose union rate merely dropped); returns how many were written.
+std::size_t onClientDisconnected(std::uint32_t clientId, std::uint32_t nowMs, UpstreamAction* out,
+                                 std::size_t maxOut) noexcept;
 
-// Sweeps every row for client leases past nowMs; same output contract as
+// Per-tick maintenance: drops client subscriptions whose lease expired at
+// nowMs, and re-asserts (renews) the upstream SUBSCRIBE of any row past
+// kUpstreamRenewDivisor of its granted lease. Same output contract as
 // onClientDisconnected. Call once per SerialMux tick.
-std::size_t expireLeases(std::uint32_t nowMs, UpstreamAction* out, std::size_t maxOut) noexcept;
+std::size_t sweep(std::uint32_t nowMs, UpstreamAction* out, std::size_t maxOut) noexcept;
 
 // Called immediately after sending an upstream SUBSCRIBE/UNSUBSCRIBE, so the
 // eventual *_RESULT (correlated only by reply_to_sequence) can be matched
