@@ -1,4 +1,4 @@
-# T-Dongle S3 Firmware (t_dongle_develop)
+# Bally_dongle - T-Dongle S3 Firmware
 
 Firmware para ESP32-S3 (LILYGO T-Dongle-S3) que transforma o dongle em um terminal
 embarcado de operação/diagnóstico para uma malha de robôs via ESP-NOW:
@@ -18,8 +18,8 @@ para alterar/estender o firmware.
 - Framework Arduino via PlatformIO
 - ESP32-S3 (`esp32-s3-devkitc-1`), C++17
 - [TinyShell](https://github.com/AlisonTristao/TinyShell) — dispatch de módulos/comandos
-- [bally_protocol](C:\git\bally_protocol) (`symlink://../bally_protocol`) — codec/fragmentação
-  do Bally Telemetry Protocol v1, compartilhado com `bally_software`/`TraceView`
+- [BTP](https://github.com/AlisonTristao/BTP) (`lib_deps` fixado em `v1.0.1-beta`) — codec/fragmentação
+  do Binary Telemetry Protocol v1, compartilhado com `Bally_OS`/`TraceView`
 - SQLite (`Sqlite3Esp32`) sobre SD_MMC
 - Adafruit GFX + ST7735 (LCD 160x80)
 
@@ -98,7 +98,7 @@ Serviços/domínio
 Plataforma
   ShellSerial (input não bloqueante) / ShellOutput (formatação) / StartupConfig (boot)
   Arduino/ESP-IDF: WiFi, esp_now, FreeRTOS, SD_MMC, time
-  bally_protocol (lib externa, symlink://../bally_protocol): codec/fragmentação BTP v1
+  BTP (lib externa via git, lib_deps fixado em v1.0.1-beta): codec/fragmentação BTP v1
 ```
 
 Grafo de dependências entre as libs (setas = "depende de"; auditado nesta revisão —
@@ -158,7 +158,7 @@ via `EspNowConfig --> ShellConfig --> EspNowCommands`. A saída: `BtpTransport::
 `sendLogicalWithStatus` recebem um callback de envio (`SendFn`/`SendWithStatusFn`) em vez do
 `EspNowManager&` direto; cada chamador (`EspNowConfig.cpp`, `EspNowCommands.cpp`) define um
 adaptador de uma linha que chama o `EspNowManager` real. `ProtocolRouter` não depende de
-nada do projeto além de `bally_protocol`. Como nenhum dos dois toca Arduino/FreeRTOS, ambos
+nada do projeto além de `BTP`. Como nenhum dos dois toca Arduino/FreeRTOS, ambos
 compilam e têm testes rodando sob `env:native` (`test/test_protocol_router`).
 
 `SerialMux` (tópico 13) é alcançado tanto por `EspNowConfig` (para retransmitir
@@ -326,10 +326,11 @@ Cada comando rodado via `ShellConfig::runLine()` pode virar uma linha em `comman
 
 ## 7. ESP-NOW: BTP, peers, heartbeat, execução remota e permissão
 
-### 7.1 Envelope BTP v1 (`bally_protocol/include/btp/codec.hpp`)
+### 7.1 Envelope BTP v1 (`BTP/include/btp/codec.hpp`)
 
-Todo datagrama trocado com um peer é um frame BTP v1 (fonte canônica em
-`C:\git\bally_protocol`, integrada aqui via `lib_deps = symlink://../bally_protocol`):
+Todo datagrama trocado com um peer é um frame BTP v1 (fonte canônica no
+repositório [BTP](https://github.com/AlisonTristao/BTP), integrada aqui via
+`lib_deps = https://github.com/AlisonTristao/BTP.git#v1.0.1-beta`):
 `btp::Header` (`type`, `flags`, `source_id`, `boot_id`, `sequence`, `timestamp_us`,
 `object_id`, `fragment_index`, `fragment_count`) + payload + CRC-32. `EspNowManager` só
 transporta bytes crus; `ProtocolRouter` decodifica, valida o CRC e faz reassembly
@@ -344,13 +345,13 @@ consumidor ainda (tópicos 16/19) e são apenas drenados/descartados, liberando 
 
 `HELLO`/`MANIFEST` **não são `MessageType` novos**: no wire format já congelado eles são
 `object_id`s dentro de `CONTROL` (`0x0001`=`HELLO`, `0x0004`=`MANIFEST_DATA`, ver
-`bally_protocol/docs/COMMANDS_AND_ACTIONS.md` seção 3.2) — não havia motivo pra inventar
+`BTP/docs/COMMANDS_AND_ACTIONS.md` seção 3.2) — não havia motivo pra inventar
 valores de enum novos no codec canônico só pra este tópico.
 
 ### 7.2 Identidade deste dongle (`BtpTransport`)
 
 No boot, `AppRuntime::begin()` chama `BtpTransport::configureIdentity(source_id, boot_id)`:
-`source_id` é derivado do próprio MAC Wi-Fi (mesma fórmula usada em `bally_software`, sem
+`source_id` é derivado do próprio MAC Wi-Fi (mesma fórmula usada em `Bally_OS`, sem
 handshake); `boot_id` é um valor aleatório não nulo por boot (`esp_random()`) — não há
 HELLO/MANIFEST ainda (tópico 16) pra anunciar/persistir isso, e nada aqui depende de
 sobreviver a um reboot.
@@ -371,7 +372,7 @@ atualiza o tile `LINK` do dashboard.
 ### 7.4 Execução remota de comando (`COMMAND`/`COMMAND_REQUEST`)
 
 `espnow -send_to`/`espnow -send_all` enviam um `COMMAND_REQUEST` (ação "shell",
-`action_id=1`/`action_version=1`, mesma convenção usada em `bally_software`). Ao receber:
+`action_id=1`/`action_version=1`, mesma convenção usada em `Bally_OS`). Ao receber:
 
 1. `EspNowConfig` só segue adiante se o MAC de origem **já está cadastrado no registry de
    peers** — MAC desconhecido é ignorado (a mensagem ainda é roteada/loga normalmente, só
@@ -416,7 +417,7 @@ do dongle.
 ### 7.6 Sessão BTP v1 na serial USB (`SerialSession`/`SerialMux`, tópico 13)
 
 A mesma porta USB do console humano também serve BTP v1 para um cliente automático (ex.:
-TraceView), seguindo `bally_protocol/docs/TRANSPORT_SERIAL.md`:
+TraceView), seguindo `BTP/docs/TRANSPORT_SERIAL.md`:
 
 - **Entrada**: a porta começa em modo console (`ShellSerial`). Uma linha completa
   `BTP/1 ENTER <16 hex>\r\n` é reconhecida como controle reservado (não é um comando
@@ -447,7 +448,7 @@ TraceView), seguindo `bally_protocol/docs/TRANSPORT_SERIAL.md`:
   frame BTP válido) fecham a sessão: o dongle descarta o que ainda não foi enviado nas filas,
   escreve exatamente `BTP/1 CONSOLE\r\n` e devolve a porta para `ShellSerial`.
 - **Fora de escopo deste tópico** (ver RESULTADO em
-  `bally_protocol/topicos/13_dongle_serial_mux_sessao.txt`): fragmentação/reassembly de
+  `BTP/topicos/13_dongle_serial_mux_sessao.txt`): fragmentação/reassembly de
   mensagens lógicas maiores que um frame serial (4096 octetos já é folgado para os payloads
   atuais). `MANIFEST` (tópico 16), `SUBSCRIBE`/`UNSUBSCRIBE` (tópico 17, ver 7.7) e o
   protocolo interativo completo de terminal (tópico 19) foram implementados depois, nos
@@ -456,7 +457,7 @@ TraceView), seguindo `bally_protocol/docs/TRANSPORT_SERIAL.md`:
 ### 7.7 Assinaturas e controle de taxa (`SubscriptionRegistry`, tópico 17)
 
 O dongle é um agregador, não um repassador: ele nunca encaminha o `SUBSCRIBE` cru de um
-cliente para o robô (`bally_protocol/docs/COMMANDS_AND_ACTIONS.md` seção 7).
+cliente para o robô (`BTP/docs/COMMANDS_AND_ACTIONS.md` seção 7).
 
 - **Agregação**: `SubscriptionRegistry` mantém uma linha por `(source_id, topic_id)` com o
   conjunto de sessões seriais interessadas (`clientId` = `source_id` do `HELLO` daquela
@@ -529,9 +530,9 @@ platformio run -e tdongle-s3 -t monitor
 `Sqlite3Esp32` (upstream gera esse warning, não é nosso código).
 
 Há também um ambiente host-only, `env:native`, que roda `ProtocolRouter`/`BtpTransport`/
-`SerialSession` contra os vetores canônicos de `C:\git\bally_protocol\test-vectors\v1` sem
-precisar de hardware (mesmo padrão de `bally_software`, exige `bally_protocol` como diretório
-irmão). `test_serial_session` cobre o handshake HELLO/HELLO_RESULT, SESSION_CLOSE, o
+`SerialSession` contra os vetores canônicos de `BTP/test-vectors/v1` sem
+precisar de hardware (mesmo padrão de `Bally_OS`, resolvido via `lib_deps`
+em vez de diretório irmão). `test_serial_session` cobre o handshake HELLO/HELLO_RESULT, SESSION_CLOSE, o
 round-trip COBS de um payload com `0x00`/CR/LF, recuperação após ruído/frame truncado e um
 teste de estresse com TELEMETRY e TERMINAL_IN intercalados (tópico 13, PASSOS 6/12 e os
 CRITERIOS DE ACEITE 1-3):
