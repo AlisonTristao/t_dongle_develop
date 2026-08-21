@@ -16,6 +16,7 @@
 #include "SerialMux.h"
 #include "ShellOutput.h"
 #include "BtpTransport.h"
+#include "UsbHidMux.h"
 
 namespace {
 
@@ -250,6 +251,11 @@ void AppRuntime::begin() {
     }, selfUuid, ShellOutput::commandPrompt().c_str(), EspNowConfig::requestUpstreamSubscribe,
     EspNowConfig::requestUpstreamUnsubscribe);
 
+    // UsbHidMux (topico 20, hardware bring-up spike): the dongle's second
+    // USB interface, active alongside the CDC/SerialMux link above on the
+    // same composite device. No BTP framing yet -- see UsbHidMux.h.
+    UsbHidMux::begin();
+
     EspNowConfig::attachCallbacks(espNowManager_, Serial, &databaseStore_, &lcdDashboard_);
 
     const bool asyncRxEnabled = EspNowConfig::enableAsyncRx(RX_ASYNC_QUEUE_DEPTH);
@@ -336,6 +342,10 @@ void AppRuntime::tick() {
     // queue draining while a BTP v1 session is negotiating/protocolled; a
     // fast no-op otherwise (ShellSerial owns the port instead, above).
     SerialMux::tick(millis());
+
+    // UsbHidMux (topico 20, hardware bring-up spike): drains the HID vendor
+    // interface's echo loop; a fast no-op when nothing was received.
+    UsbHidMux::tick();
 
     if (asyncOutputOccurred) {
         lastAsyncOutputTime = millis();
