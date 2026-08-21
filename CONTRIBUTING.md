@@ -19,15 +19,25 @@ comandos existentes.
 - **Sem validação de cenário impossível.** Confie nos limites internos (ex.: `context()`
   já garantido não-nulo depois do `bind()`); valide só fronteira real (entrada do usuário
   via shell, payload ESP-NOW recebido).
-- **Texto voltado ao usuário em português** (mensagens de `printLine`, `help -e`, nomes de
-  comando); **comentários de código e identificadores em inglês**. É a convenção já em uso
-  em todo o projeto — mantenha para não misturar os dois em um mesmo arquivo.
+- **Texto voltado ao usuário em português, sem acento** (mensagens de `printLine`,
+  `failWithCode`/`warnWithCode`, `help -e`); **texto de `create_module`/`shell->add` (o
+  help nativo do TinyShell) e comentários/identificadores em inglês**. É a convenção já em
+  uso em todo o projeto — mantenha para não misturar os dois em um mesmo arquivo.
+  `scripts/check_user_text.py` audita isso automaticamente (roda sozinho em
+  `platformio test -e native`, ver seção abaixo) — string em inglês esquecida num
+  `printLine`/`failWithCode`, string em português no lugar errado (`create_module`/`add`)
+  ou acento onde não devia quebram o check. É um heurístico por palavra-chave, não um
+  parser de linguagem: falso positivo pontual (ex.: palavra nova fora da lista) é esperado
+  às vezes — ajuste as listas `ENGLISH_MARKERS`/`PORTUGUESE_MARKERS` no script quando isso
+  acontecer, não contorne o comando novo.
 - **Build limpo é obrigatório antes de considerar uma mudança pronta**:
   ```bash
   platformio run -e tdongle-s3
+  platformio test -e native
   ```
   Zero erros e zero warnings novos (os warnings pré-existentes do `Sqlite3Esp32` upstream,
-  filtrados por `scripts/pio_warnings.py`, não contam).
+  filtrados por `scripts/pio_warnings.py`, não contam). O segundo comando também roda
+  `check_user_text.py` (seção 1) e os testes host-native (ver README.md § 10).
 
 ## 2. Padrão de "módulo de comando"
 

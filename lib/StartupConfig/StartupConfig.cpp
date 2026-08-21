@@ -1,12 +1,5 @@
 #include "StartupConfig.h"
 
-#include <sys/time.h>
-
-#include <cctype>
-#include <cstring>
-#include <cstdio>
-#include <ctime>
-
 #include "ShellOutput.h"
 
 namespace {
@@ -95,88 +88,6 @@ void drainSerialInput() {
     }
 }
 
-bool readLineWithEcho(Stream& io, String& outLine, uint32_t timeoutMs) {
-    outLine = "";
-    const uint32_t start = millis();
-
-    while ((millis() - start) < timeoutMs) {
-        while (Serial.available()) {
-            const int value = Serial.read();
-            if (value < 0) {
-                break;
-            }
-
-            const char c = static_cast<char>(value);
-
-            if (c == '\r' || c == '\n') {
-                io.println();
-
-                // Consume optional paired line ending to avoid leaking a leftover '\n'/'\r'.
-                while (Serial.available()) {
-                    const int next = Serial.peek();
-                    if (next == '\r' || next == '\n') {
-                        Serial.read();
-                    } else {
-                        break;
-                    }
-                }
-
-                return true;
-            }
-
-            if (c == '\b' || c == 127) {
-                if (!outLine.isEmpty()) {
-                    outLine.remove(outLine.length() - 1);
-                    io.print("\b \b");
-                }
-                continue;
-            }
-
-            if (std::isprint(static_cast<unsigned char>(c)) != 0) {
-                outLine += c;
-                io.print(c);
-            }
-        }
-
-        delay(10);
-    }
-
-    return false;
-}
-
-bool parseDateTime(const String& text, time_t& outEpoch) {
-    int year = 0;
-    int month = 0;
-    int day = 0;
-    int hour = 0;
-    int minute = 0;
-    int second = 0;
-
-    if (std::sscanf(text.c_str(), "%d-%d-%d %d:%d:%d", &year, &month, &day, &hour, &minute, &second) != 6) {
-        return false;
-    }
-
-    if (year < 2024 || month < 1 || month > 12 || day < 1 || day > 31 || hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) {
-        return false;
-    }
-
-    struct tm tmValue = {};
-    tmValue.tm_year = year - 1900;
-    tmValue.tm_mon = month - 1;
-    tmValue.tm_mday = day;
-    tmValue.tm_hour = hour;
-    tmValue.tm_min = minute;
-    tmValue.tm_sec = second;
-
-    const time_t epoch = mktime(&tmValue);
-    if (epoch <= 0) {
-        return false;
-    }
-
-    outEpoch = epoch;
-    return true;
-}
-
 } // namespace
 
 namespace StartupConfig{
@@ -229,113 +140,16 @@ void waitForSerialAndAnimateLed(DonglePeripherals& peripherals) {
 
     drainSerialInput();
 
-    ShellOutput::printTagged(Serial, "startup", "monitor conectado. pressione ENTER para iniciar");
-    ShellOutput::printTagged(Serial, "startup", "(sem entrada: segue sozinho em alguns segundos)");
-    Serial.print(ShellOutput::commandPrefix());
-
-    // PASSO 3 (topico 13): this used to be an unbounded while(!enterConfirmed)
-    // loop -- a real block for any automatic client (e.g. TraceView) that
-    // opens the port but does not know to press Enter, since it never reads
-    // past this point in AppRuntime::begin(). Bounded here so the boot
-    // sequence always reaches the interactive shell (and from there, BTP v1
-    // negotiation) in finite time; a human typing normally still exits the
-    // loop immediately on their own Enter, unchanged from before.
-    constexpr uint32_t kAutoConfirmMs = 6000;
-
-    bool enterConfirmed = false;
-    uint32_t lastPromptMs = millis();
-    const uint32_t waitStartMs = millis();
-    while (!enterConfirmed) {
-        if (Serial.available()) {
-            const int value = Serial.read();
-            if (value >= 0) {
-                const char c = static_cast<char>(value);
-                if (c == '\r' || c == '\n') {
-                    ShellOutput::writeRawLine(Serial, "");
-
-                    while (Serial.available()) {
-                        const int next = Serial.peek();
-                        if (next == '\r' || next == '\n') {
-                            Serial.read();
-                        } else {
-                            break;
-                        }
-                    }
-
-                    enterConfirmed = true;
-                    continue;
-                }
-
-                if (std::isprint(static_cast<unsigned char>(c)) != 0) {
-                    Serial.print(c);
-                }
-            }
-        }
-
-        if ((millis() - waitStartMs) >= kAutoConfirmMs) {
-            ShellOutput::writeRawLine(Serial, "");
-            enterConfirmed = true;
-            continue;
-        }
-
-        if ((millis() - lastPromptMs) >= 2000) {
-            Serial.print("\r");
-            Serial.print(ShellOutput::commandPrefix());
-            lastPromptMs = millis();
-        }
-
-        delay(10);
-    }
-
-    ShellOutput::writeRawLine(Serial, "");
+    // No interactive ENTER/clock prompt here anymore -- the BTP client
+    // (e.g. TraceView) queries and, if needed, corrects the clock itself via
+    // the "dongle clock" / "dongle set_clock" shell commands once connected,
+    // so boot goes straight from "port open" to the shell being ready.
     ShellOutput::printTagged(Serial, "startup", "iniciando...");
 
     showSerialStatusOnLcd(peripherals, true);
 
     peripherals.ledOff();
     delay(80);
-}
-
-void promptAndSetDateTime(Stream& io, uint32_t timeoutMs) {
-    drainSerialInput();
-
-    ShellOutput::printTagged(io, "clock", "informe data/hora: YYYY-MM-DD HH:MM:SS");
-    ShellOutput::printTagged(io, "clock", "ENTER vazio para pular (timeout 30s)");
-    io.print(ShellOutput::commandPrefix());
-
-    String line;
-
-    const bool submitted = readLineWithEcho(io, line, timeoutMs);
-    if (!submitted) {
-        ShellOutput::printTagged(io, "clock", "timeout sem confirmacao, mantendo horario atual");
-        return;
-    }
-
-    line.trim();
-    if (line.isEmpty()) {
-        ShellOutput::printTagged(io, "clock", "horario mantido");
-        return;
-    }
-
-    time_t epoch = 0;
-    if (!parseDateTime(line, epoch)) {
-        ShellOutput::printTagged(io, "clock", "formato invalido, mantendo horario atual");
-        return;
-    }
-
-    timeval tv = {};
-    tv.tv_sec = epoch;
-    tv.tv_usec = 0;
-    settimeofday(&tv, nullptr);
-
-    char out[48] = {0};
-    std::tm* now = std::localtime(&epoch);
-    if (now != nullptr) {
-        std::strftime(out, sizeof(out), "%Y-%m-%d %H:%M:%S", now);
-        ShellOutput::printTagged(io, "clock", String("horario ajustado para ") + out);
-    } else {
-        ShellOutput::printTagged(io, "clock", "horario ajustado");
-    }
 }
 
 } // namespace StartupConfig

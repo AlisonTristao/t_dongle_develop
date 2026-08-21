@@ -541,6 +541,11 @@ CRITERIOS DE ACEITE 1-3):
 platformio test -e native
 ```
 
+Esse comando também roda `scripts/check_user_text.py` (`extra_scripts` de `env:native`) antes
+dos testes: audita `lib/**/*.cpp` procurando string de `printLine`/`failWithCode`/
+`warnWithCode` esquecida em inglês (ou com acento) e string de `create_module`/`shell->add`
+traduzida pro português por engano — ver CONTRIBUTING.md § 1.
+
 ## 11. Estrutura do repositório
 
 ```text
@@ -571,6 +576,7 @@ src/
 scripts/
   pio_warnings.py
   native_static.py      # so para env:native (evita runtime MinGW solto no PATH)
+  check_user_text.py    # so para env:native (audita convencao pt-br/ingles, ver CONTRIBUTING.md #1)
 test/
   test_tablelinker/      # demo antiga do TinyShell, hardware-only
   test_protocol_router/  # BTP vs. vetores canônicos, roda em env:native

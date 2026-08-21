@@ -11,14 +11,10 @@ namespace StartupConfig{
  * Visual behavior:
  * - RGB LED carousel while disconnected.
  * - LCD status text for disconnected/connected states.
+ *
+ * No interactive prompt follows: the clock is queried/corrected by the BTP
+ * client via the "dongle clock" / "dongle set_clock" shell commands.
  */
 void waitForSerialAndAnimateLed(DonglePeripherals& peripherals);
-
-/**
- * @brief Prompts date/time and applies it to ESP RTC clock.
- * @param io Stream used for prompt and feedback output.
- * @param timeoutMs Max wait for user input.
- */
-void promptAndSetDateTime(Stream& io, uint32_t timeoutMs = 30000);
 
 } // namespace StartupConfig

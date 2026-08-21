@@ -217,7 +217,6 @@ void AppRuntime::begin() {
     donglePeripherals_.beginSd(false);
 
     ShellOutput::printTagged(Serial, "startup", String("mac=") + WiFi.macAddress());
-    StartupConfig::promptAndSetDateTime(Serial);
 
     // BTP identity: source_id derived from this dongle's own MAC (same
     // formula every firmware in the ecosystem uses, so it needs no
