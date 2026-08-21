@@ -17,6 +17,7 @@
 #include "ShellOutput.h"
 #include "BtpTransport.h"
 #include "UsbHidMux.h"
+#include <USB.h>
 
 namespace {
 
@@ -204,6 +205,12 @@ void AppRuntime::handleShellInput() {
 }
 
 void AppRuntime::begin() {
+    // Must run before the USB stack comes up (ARDUINO_USB_CDC_ON_BOOT=1
+    // starts it as soon as Serial is touched below) -- tinyusb reads these
+    // strings when building the descriptor for host enumeration.
+    USB.productName("Bally Dongle");
+    USB.manufacturerName("Bally");
+
     BoardConfig::initBoardPins(false);
 
     #ifdef BAUDRATE

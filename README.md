@@ -185,10 +185,11 @@ a regra de quando um módulo novo deve entrar em `Context` ou pode ser incluído
 
 1. `BoardConfig::initBoardPins(false)` — pinos em estado seguro (LCD apagado)
 2. inicia `ShellSerial` na baudrate de `platformio.ini` (`BAUDRATE`)
-3. aguarda monitor serial conectar, animando o LED (`StartupConfig`) — o prompt de "pressione
-   ENTER" agora tem teto de 6s (`kAutoConfirmMs`, tópico 13 PASSO 3): um cliente automático
-   que nunca aperta Enter ainda assim chega ao shell interativo em tempo finito
-4. inicia SD, imprime MAC Wi-Fi, pede/ajusta data-hora do RTC local
+3. aguarda monitor serial conectar, animando o LED (`StartupConfig`) — assim que a porta fica
+   estável aberta por `kStableOpenMs` (1200ms), segue direto pro shell, sem prompt bloqueante
+   de "pressione ENTER" nem de data/hora (removidos): um cliente automático (ex.: TraceView)
+   chega ao shell interativo/negociação BTP em tempo finito sem precisar digitar nada
+4. inicia SD, imprime MAC Wi-Fi
 5. deriva a identidade BTP deste boot (`BtpTransport::configureIdentity`) e chama
    `SerialMux::begin(...)`, ligando-o ao `ShellConfig::runLine` via callback
 6. conecta callbacks ESP-NOW e habilita a fila RX assíncrona (`EspNowConfig`)
@@ -597,7 +598,8 @@ CONTRIBUTING.md
 - `espnow -send_to`/`-send_all` só conseguem endereçar um peer do qual já recebemos alguma
   mensagem BTP (não há handshake HELLO ainda, tópico 16, pra descobrir `boot_id` de outra
   forma) — o antigo alias de broadcast `000` foi removido por isso
-- RTC depende de ajuste manual no boot (sem RTC externo dedicado)
+- RTC depende de ajuste manual via `dongle -set_clock` (sem RTC externo dedicado; não há mais
+  prompt de data/hora no boot — ver seção 4)
 - fila RX pode perder pacotes sob alta carga (contador de dropped exposto no tile `ERR`)
 - `CONTROL` roteado do lado ESP-NOW tem consumidor para `MANIFEST_DATA` (tópico 16) e
   `SUBSCRIBE_RESULT` (tópico 17); `UNSUBSCRIBE_RESULT` e qualquer outro `object_id` (um
