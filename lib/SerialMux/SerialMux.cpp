@@ -3,6 +3,9 @@
 #include "TerminalPtyStream.h"
 
 #include <BtpTransport.h>
+#include <DonglePublisher.h>
+#include <HubRegistry.h>
+#include <HubRelay.h>
 #include <ManifestCache.h>
 #include <ShellOutput.h>
 #include <SubscriptionRegistry.h>
@@ -20,18 +23,44 @@ namespace {
 
 // This dongle's own outbound payload ceiling for the serial link. Every
 // frame this firmware originates (HELLO_RESULT, STATUS, COMMAND_RESULT,
-// TERMINAL_OUT) fits comfortably under it; longer command/terminal output is
-// truncated the same way EspNowConfig already truncates COMMAND_RESULT
-// messages (see BtpTransport::btp_command::kMaxResultMessageSize). Chosen far
-// below the wire's real ceiling (btp::kSerialMaxPayloadSize = 4056) to keep
-// the priority queues cheap in RAM; topico 13 does not need Serial-side
-// logical fragmentation (see SerialSession.h) so this is also this session's
-// hard per-message limit, not just a soft default.
-constexpr std::size_t kOutboundPayloadCap = 700U;
+// TERMINAL_OUT, MANIFEST_DATA, TELEMETRY) must fit under it; longer
+// command/terminal output is truncated the same way EspNowConfig already
+// truncates COMMAND_RESULT messages (see
+// BtpTransport::btp_command::kMaxResultMessageSize). Still far below the
+// wire's real ceiling (btp::kSerialMaxPayloadSize = 4056); topico 13 does not
+// implement Serial-side logical fragmentation (see SerialSession.h) so this is
+// also this session's hard per-message limit, not just a soft default. It must
+// stay equal to SerialSession::LocalLimits::maxLogicalPayload, which is what
+// HELLO_RESULT actually promises the desktop.
+//
+// Raised 700 -> 1600 by topico 27. The dongle's own MANIFEST_DATA is no longer
+// an empty descriptor: DonglePublisher's three topic records total 1364
+// octets, plus 58 for the fixed prefix and 18 for the source name = 1440. At
+// 700 the response would have been silently truncated to whole records that
+// fit (ManifestCache::appendRecordsTruncated), i.e. the client would simply
+// never see hub.usb/hub.peers. There is no cheaper fix available here: a
+// record's fixed cost is 38 octets (mostly the mandatory scale/offset
+// float64 pair, commands.md section 3.3), so twelve individually named
+// counters cannot be described in less.
+//
+// The cost is real and worth stating: QueuedFrame grows with this constant and
+// there are 32 of them across the four queues, so the queues go from ~24 KB to
+// ~52 KB of heap. That is in line with what this firmware already spends on
+// the ESP-NOW RX/routed queues (~75 KB) and is the reason the two large
+// per-call frame buffers below became file-scope statics instead of growing
+// the main loop's stack by 3 KB.
+constexpr std::size_t kOutboundPayloadCap = 1600U;
 constexpr std::size_t kMaxFrameBytes = btp::kV1HeaderSize + btp::kV1CrcSize + kOutboundPayloadCap;
 constexpr std::size_t kMaxCobsBytes = kMaxFrameBytes + kMaxFrameBytes / 254U + 4U;
 
 constexpr std::size_t kPriorityClassCount = static_cast<std::size_t>(SerialSession::PriorityClass::kCount);
+
+// hub.usb publishes one dropped counter per priority class as a fixed array,
+// and DonglePublisher cannot include SerialSession.h without pointing a
+// dependency edge back at this library (CONTRIBUTING.md section 3), so it
+// hardcodes the width. This is the one place that sees both.
+static_assert(DonglePublisher::kUsbDropClassCount == kPriorityClassCount,
+              "hub.usb's dropped_by_class array must match PriorityClass::kCount");
 
 constexpr UBaseType_t kQueueDepth[kPriorityClassCount] = {
     /*kSession=*/4U,
@@ -49,8 +78,7 @@ struct QueuedFrame {
 
 Stream* g_io = nullptr;
 RunShellLineFn g_runShellLine = nullptr;
-RequestUpstreamSubscribeFn g_requestUpstreamSubscribe = nullptr;
-RequestUpstreamUnsubscribeFn g_requestUpstreamUnsubscribe = nullptr;
+RelayToRadioFn g_relayToRadio = nullptr;
 
 std::uint8_t g_encodedBuffer[btp::kSerialMaxCobsBlockSize];
 std::uint8_t g_decodedBuffer[btp::kSerialMaxFrameSize];
@@ -76,7 +104,7 @@ QueueHandle_t g_queues[kPriorityClassCount] = {nullptr, nullptr, nullptr, nullpt
 
 std::uint32_t g_lastStatusMs = 0U;
 
-// STATUS counters (bally_protocol/docs/COMMANDS_AND_ACTIONS.md section 8).
+// STATUS counters (BTP/docs/commands.md section 5).
 volatile std::uint64_t g_framesRx = 0U;
 volatile std::uint64_t g_framesTx = 0U;
 volatile std::uint64_t g_crcErrors = 0U;
@@ -180,7 +208,7 @@ bool enqueueFrameBytes(SerialSession::PriorityClass cls, const std::uint8_t* fra
         return true;
     }
 
-    // Backpressure per COMMANDS_AND_ACTIONS.md section 12: telemetry/log are
+    // Backpressure per model.md section 6: telemetry/log are
     // dropped first, freshest sample wins. Session/terminal never get this
     // treatment -- their bursts are small and shallow by construction, so a
     // full queue there just counts as a drop instead of evicting something
@@ -200,7 +228,11 @@ bool enqueueFrameBytes(SerialSession::PriorityClass cls, const std::uint8_t* fra
 
 bool enqueueOwn(btp::MessageType type, std::uint16_t objectId, const std::uint8_t* payload,
                 std::size_t payloadSize) noexcept {
-    std::uint8_t frameBytes[kMaxFrameBytes];
+    // static, not a local: kMaxFrameBytes is 1.6 KB since topico 27 and every
+    // caller runs on the main loop task (see writeFrameCobs' comment -- one
+    // writer, never a FreeRTOS task, never re-entrant), so this belongs in BSS
+    // rather than on a stack shared with TinyShell and std::string.
+    static std::uint8_t frameBytes[kMaxFrameBytes];
     std::size_t frameSize = 0U;
     if (!encodeOwnFrame(type, objectId, payload, payloadSize, frameBytes, sizeof(frameBytes), &frameSize)) {
         return false;
@@ -213,15 +245,67 @@ bool enqueueOwn(btp::MessageType type, std::uint16_t objectId, const std::uint8_
 void dispatchUpstreamAction(const SubscriptionRegistry::UpstreamAction& action) noexcept;
 void dispatchUpstreamActions(const SubscriptionRegistry::UpstreamAction* actions, std::size_t count) noexcept;
 
+// Topico 28, downstream half: one frame that arrived on the cable and is not
+// addressed to this dongle goes back out on the radio, unchanged.
+//
+// THE DESTINATION CANNOT BE DERIVED FROM THE FRAME. A BTP header has no
+// destination field, and TERMINAL_IN in particular has none in its payload
+// either, so the child's own source_id is resolved through HubRegistry --
+// the operator's `hub -bind` -- and only then through BtpTransport's peer
+// table to a MAC. An unbound child is refused, never guessed at: guessing
+// would send one robot's terminal keystrokes to another.
+//
+// WHAT MUST NOT HAPPEN HERE. Every other send path in this firmware
+// originates through BtpTransport::sendLogical, which reserves a fresh
+// sequence and stamps this dongle's own source_id/boot_id. Doing that to a
+// frame passing through would rewrite `source_id || boot_id || sequence`,
+// which IS the AEAD nonce (BTP/docs/encryption.md section 4), and the seal
+// would fail to open two repositories away from the line that broke it.
+// HubRelay::reencodeVerbatim copies the producer's header whole; the test
+// suite pins that (test/test_hub_relay).
+//
+// Re-fragmenting, for the record, would NOT break the seal -- the AAD is the
+// canonicalized logical header, so fragment_index/fragment_count/FRAGMENTED
+// are outside the tag exactly so a gateway can re-cut a message it cannot
+// read. The dongle still never re-fragments, and the reason is throughput
+// and retransmission (D4/D5): a 4056-octet serial message re-cut to the
+// radio's 210 would become 20 fragments with nothing behind them. The child
+// encodes on the EspNow profile from the origin instead.
+bool relayDown(const btp::DecodedFrame& decoded) noexcept {
+    if (g_relayToRadio == nullptr) {
+        return false;
+    }
+
+    std::uint32_t peerSourceId = 0U;
+    if (!HubRegistry::lookup(decoded.header.source_id, &peerSourceId)) {
+        return false;
+    }
+
+    std::uint8_t mac[6] = {0};
+    std::uint32_t peerBootId = 0U;
+    if (!BtpTransport::lookupPeerMacBySourceId(peerSourceId, mac, &peerBootId)) {
+        return false; // never heard a BTP frame from that robot; cannot address it
+    }
+
+    std::uint8_t frameBytes[btp::kEspNowMaxFrameSize];
+    std::size_t frameSize = 0U;
+    if (!HubRelay::reencodeVerbatim(decoded, btp::TransportProfile::EspNow, frameBytes,
+                                    sizeof(frameBytes), &frameSize)) {
+        return false; // oversized for the radio: the child encodes on the EspNow profile (D4)
+    }
+
+    return g_relayToRadio(mac, frameBytes, frameSize);
+}
+
 // Sends the session's last frame synchronously (bypassing the queues -- it
 // must go out before anything else and nothing lower-priority should delay
 // it), then discards every not-yet-sent queued item and hands the port back
-// to the console. Matches TRANSPORT_SERIAL.md section 6 exactly: "descartar
-// bloco serial parcial, reassemblies incompletos e itens ainda nao iniciados
-// nas filas de transmissao" before "mudar a propriedade da porta".
+// to the console. Matches session-and-terminal.md section 4 exactly: the
+// port owner "stops accepting new work", "discards incomplete reassemblies",
+// "and only then returns to the console".
 void finalizeToConsole(std::uint16_t objectId, const std::uint8_t* payload, std::size_t payloadSize,
                        const char* consoleLine) noexcept {
-    std::uint8_t frameBytes[kMaxFrameBytes];
+    static std::uint8_t frameBytes[kMaxFrameBytes];  // main-loop only, see enqueueOwn
     std::size_t frameSize = 0U;
     if (encodeOwnFrame(btp::MessageType::Control, objectId, payload, payloadSize, frameBytes,
                        sizeof(frameBytes), &frameSize)) {
@@ -244,7 +328,7 @@ void finalizeToConsole(std::uint16_t objectId, const std::uint8_t* payload, std:
     resetQueues();
     writeConsoleText(consoleLine);
     g_decoder.reset();
-    // TRANSPORT_SERIAL.md section 6: discard partial/pending work before
+    // session-and-terminal.md section 4: discard partial/pending work before
     // handing the port back -- a half-typed BTP terminal line is exactly
     // that, same as a partial serial block or an incomplete reassembly.
     g_terminalPty.reset();
@@ -281,7 +365,13 @@ void handleCommandRequest(const btp::DecodedFrame& decoded) noexcept {
     const ParseError parseError =
         parse_request(decoded.header, decoded.payload, BtpTransport::sourceId(), BtpTransport::bootId(), &request);
     if (parseError == ParseError::WrongTarget) {
-        return; // not addressed to this dongle's current boot; silently ignored per spec
+        // Topico 28: a COMMAND_REQUEST addressed to somebody else is not a
+        // mistake any more, it is the whole point of the hub -- this is the
+        // frame TraceView aimed at a robot. It used to be dropped here in
+        // silence, which is why commanding a robot through the cable was
+        // impossible before this topico.
+        relayDown(decoded);
+        return;
     }
     if (parseError != ParseError::Ok) {
         replyCommandResult(decoded.header, 0U, 0U, Status::Rejected, ErrorCode::MalformedPayload,
@@ -324,6 +414,22 @@ void handleTerminalIn(const btp::DecodedFrame& decoded) noexcept {
     if (decoded.payload.size == 0U) {
         return;
     }
+
+    // Topico 28: TERMINAL carries no target field of any kind, so the binding
+    // table is the only thing that can say whether these keystrokes are meant
+    // for the robot or for the dongle's own shell. A bound child is talking
+    // to its robot; an unbound one is talking to the hub, which is the
+    // pre-topico behavior and stays the default.
+    //
+    // The binding decides on its own, before relayDown() gets a chance to
+    // fail: a child bound to a robot the radio cannot currently reach must
+    // lose its keystrokes, never have them typed into the dongle's shell.
+    std::uint32_t boundPeerSourceId = 0U;
+    if (HubRegistry::lookup(decoded.header.source_id, &boundPeerSourceId)) {
+        relayDown(decoded);
+        return;
+    }
+
     g_terminalPty.feedInput(decoded.payload.data, decoded.payload.size);
 }
 
@@ -364,7 +470,7 @@ void handleManifestRequest(const btp::DecodedFrame& decoded) noexcept {
     const std::uint32_t targetBootId = readU32Le(decoded.payload.data + 4U);
     const std::uint32_t knownRevision = readU32Le(decoded.payload.data + 8U);
 
-    std::uint8_t payload[kOutboundPayloadCap];
+    static std::uint8_t payload[kOutboundPayloadCap];  // main-loop only, see enqueueOwn
 
     if (targetSourceId == 0U) {
         const std::size_t total = ManifestCache::enumerationCount();
@@ -393,27 +499,35 @@ void handleManifestRequest(const btp::DecodedFrame& decoded) noexcept {
 // only reached in that state.
 std::uint32_t currentClientId() noexcept { return g_session.peerSourceId(); }
 
-// SubscriptionRegistry already decided *what* the robot must be told (topic
-// gone entirely vs. still wanted but at a different/renewed rate); this only
-// picks the matching injected sender. Losing one desktop subscriber is NOT
-// automatically an unsubscribe -- when other subscribers of that topic remain
-// but the departing one was the fastest, the registry emits a Subscribe with
-// the lowered union rate instead (topico 17 PASSO 5).
+// SubscriptionRegistry already decided *what* the producer of a topic must
+// be told (topic gone entirely vs. still wanted but at a different/renewed
+// rate). Since topico 28 there is exactly one producer left that this dongle
+// can tell anything: itself.
 void dispatchUpstreamAction(const SubscriptionRegistry::UpstreamAction& action) noexcept {
-    switch (action.kind) {
-        case SubscriptionRegistry::UpstreamKind::Subscribe:
-            if (g_requestUpstreamSubscribe != nullptr) {
-                g_requestUpstreamSubscribe(action.sourceId, action.topicId, action.rateMillihz, action.leaseMs);
-            }
-            break;
-        case SubscriptionRegistry::UpstreamKind::Unsubscribe:
-            if (g_requestUpstreamUnsubscribe != nullptr) {
-                g_requestUpstreamUnsubscribe(action.sourceId, action.topicId, action.upstreamSubscriptionId);
-            }
-            break;
-        case SubscriptionRegistry::UpstreamKind::None:
-            break;
+    // Topico 27: a hub.* topic has no radio hop -- the "upstream" producer of
+    // hub.link is this very firmware. Routing the action to DonglePublisher
+    // is what lets the dongle's own topics reuse the whole existing
+    // subscription machinery (refcount across clients, union rate, lease
+    // sweep, session-end cleanup) with no second code path.
+    if (action.sourceId != 0U && action.sourceId == BtpTransport::sourceId()) {
+        if (action.kind == SubscriptionRegistry::UpstreamKind::Subscribe) {
+            DonglePublisher::onLocalSubscribe(static_cast<std::uint16_t>(action.topicId),
+                                              action.rateMillihz);
+        } else if (action.kind == SubscriptionRegistry::UpstreamKind::Unsubscribe) {
+            DonglePublisher::onLocalUnsubscribe(static_cast<std::uint16_t>(action.topicId));
+        }
+        return;
     }
+
+    // Topico 28: an action about a ROBOT's topic stops here. Subscriptions to
+    // a robot moved to channel B -- TraceView subscribes at the robot itself
+    // and the robot arbitrates per session -- so the dongle no longer merges
+    // its clients into one SUBSCRIBE of its own toward the radio. The
+    // registry's refcounting is still what it was; only its upstream half
+    // lost a consumer. What did NOT move is the local relay gate
+    // (forwardRelay/relayUp), which reads object_id -- in the clear even in a
+    // sealed frame -- and is what still makes closing a chart reduce traffic
+    // on the cable.
 }
 
 void dispatchUpstreamActions(const SubscriptionRegistry::UpstreamAction* actions, std::size_t count) noexcept {
@@ -426,7 +540,7 @@ std::uint32_t readU16LeAsU32(const std::uint8_t* data) noexcept {
     return static_cast<std::uint32_t>(readU32Le(data) & 0xFFFFU);
 }
 
-// Desktop -> dongle SUBSCRIBE (COMMANDS_AND_ACTIONS.md section 7, 20-byte
+// Desktop -> dongle SUBSCRIBE (commands.md section 4, 20-byte
 // payload). This dongle answers synchronously from its own local knowledge
 // (ManifestCache's already-cached schema max_rate_millihz) rather than
 // waiting on a round trip to the robot -- CRITERIO 2 ("pedido acima do
@@ -471,8 +585,8 @@ void handleSubscribeRequest(const btp::DecodedFrame& decoded) noexcept {
             status = kStatusRejected;
             errorCode = kErrorNotFound;
         } else {
-            // Same clamp rule the robot itself applies (COMMANDS_AND_ACTIONS.md
-            // section 7): effective never exceeds requested nor the schema max.
+            // Same clamp rule the robot itself applies (commands.md
+            // section 4): effective never exceeds requested nor the schema max.
             // A schema max of zero means "not periodic" (event-driven topic);
             // the request is still accepted, capped only by what was asked.
             std::uint32_t cappedRateMillihz = requestedRateMillihz;
@@ -511,10 +625,10 @@ void handleSubscribeRequest(const btp::DecodedFrame& decoded) noexcept {
               sizeof(responsePayload));
 }
 
-// Desktop -> dongle UNSUBSCRIBE (COMMANDS_AND_ACTIONS.md section 7, 12-byte
+// Desktop -> dongle UNSUBSCRIBE (commands.md section 4, 12-byte
 // payload). Always answers SUCCESS/NONE once the envelope parses -- removing
 // an already-absent subscription is defined as idempotent success, not an
-// error (section 7: "torna retries idempotentes").
+// error (section 4: "makes retries idempotent").
 void handleUnsubscribeRequest(const btp::DecodedFrame& decoded) noexcept {
     if (decoded.payload.size < 12U || decoded.payload.data == nullptr) {
         return;  // malformed; silently dropped like any other malformed CONTROL payload
@@ -542,7 +656,7 @@ void handleUnsubscribeRequest(const btp::DecodedFrame& decoded) noexcept {
 // result is no longer truncated to a single frame's worth, just split
 // across several kTerminal-priority frames.
 void flushTerminalPtyOutput() noexcept {
-    std::uint8_t chunk[kOutboundPayloadCap];
+    static std::uint8_t chunk[kOutboundPayloadCap];  // main-loop only, see enqueueOwn
     std::size_t chunkSize = 0U;
     while (g_terminalPty.hasOutput() &&
           (chunkSize = g_terminalPty.takeOutput(chunk, sizeof(chunk))) > 0U) {
@@ -706,7 +820,7 @@ void maybeSendStatusHeartbeat(std::uint32_t nowMs) noexcept {
     // whenever this dongle currently tracks at least one topic (subscribed
     // now or previously). Falls back to the plain v1 payload if the
     // snapshot is empty (nothing to add) or somehow does not fit --
-    // COMMANDS_AND_ACTIONS.md section 8.1 makes topic_status_count=0 valid,
+    // commands.md section 5.1 makes topic_status_count=0 valid,
     // but there is no reason to spend the extra 2 bytes when v1 already says
     // everything there is to say.
     SubscriptionRegistry::TopicStatusEntry snapshotEntries[SubscriptionRegistry::kMaxTopics];
@@ -736,6 +850,15 @@ void maybeSendStatusHeartbeat(std::uint32_t nowMs) noexcept {
     }
 }
 
+// Topico 27: the wire end of DonglePublisher. A hub.* sample is an ordinary
+// TELEMETRY frame originated by this dongle, so it goes through the same
+// enqueueOwn()/classify() path as every other frame this firmware sends --
+// landing in the kTelemetry queue, dropped first under backpressure, exactly
+// like a relayed robot sample. Deliberately not a second TX path.
+bool emitOwnTelemetry(std::uint16_t topicId, const std::uint8_t* payload, std::size_t size) noexcept {
+    return enqueueOwn(btp::MessageType::Telemetry, topicId, payload, size);
+}
+
 void drainQueueClass(SerialSession::PriorityClass cls, std::size_t maxItems) noexcept {
     QueueHandle_t queue = g_queues[classIndex(cls)];
     if (queue == nullptr) {
@@ -750,7 +873,7 @@ void drainQueueClass(SerialSession::PriorityClass cls, std::size_t maxItems) noe
     }
 }
 
-// Strict priority order (COMMANDS_AND_ACTIONS.md section 12), with a small
+// Strict priority order (model.md section 6), with a small
 // per-class burst cap per tick() so telemetry still makes progress instead
 // of starving outright under a steady stream of session/terminal traffic.
 void drainTx() noexcept {
@@ -763,12 +886,10 @@ void drainTx() noexcept {
 } // namespace
 
 void begin(Stream& io, RunShellLineFn runShellLine, const std::uint8_t selfUuid[16],
-          const char* terminalPrompt, RequestUpstreamSubscribeFn requestUpstreamSubscribe,
-          RequestUpstreamUnsubscribeFn requestUpstreamUnsubscribe) noexcept {
+          const char* terminalPrompt, RelayToRadioFn relayToRadio) noexcept {
     g_io = &io;
     g_runShellLine = runShellLine;
-    g_requestUpstreamSubscribe = requestUpstreamSubscribe;
-    g_requestUpstreamUnsubscribe = requestUpstreamUnsubscribe;
+    g_relayToRadio = relayToRadio;
     g_session.setLocalUuid(selfUuid);
 
     for (std::size_t i = 0U; i < kPriorityClassCount; ++i) {
@@ -804,6 +925,18 @@ bool isConsoleOwned() noexcept {
 
 bool isProtocolled() noexcept {
     return g_session.isProtocolled();
+}
+
+void peekTxCounters(TxCounters& out) noexcept {
+    out.framesRx = g_framesRx;
+    out.framesTx = g_framesTx;
+    out.crcErrors = g_crcErrors;
+    out.decodeErrors = g_decodeErrors;
+    out.reassemblyRejected = g_reassemblyRejected;
+    out.telemetryDropped = g_telemetryDropped;
+    for (std::size_t i = 0U; i < kPriorityClassCount; ++i) {
+        out.droppedByClass[i] = g_droppedByClass[i];
+    }
 }
 
 bool tryEnterFromConsoleLine(const char* line, std::uint32_t nowMs) noexcept {
@@ -891,6 +1024,12 @@ void tick(std::uint32_t nowMs) noexcept {
             dispatchUpstreamActions(actions, count);
         }
 
+        // Topico 27: this dongle's own hub.* topics. Placed after the sweep so
+        // a lease that just expired stops publishing on the same tick, and
+        // before drainTx() so a sample queued now leaves on this tick instead
+        // of waiting for the next one. A fast no-op with no subscriber.
+        DonglePublisher::tick(nowMs, &emitOwnTelemetry);
+
         drainTx();
     }
 }
@@ -909,10 +1048,10 @@ bool forwardRelay(const btp::Header& header, const std::uint8_t* payload, std::s
     // ask towards the robot (handleUnsubscribeRequest), this gate just makes
     // sure any sample still in flight from before that lands isn't relayed
     // either. LOG keeps flowing unconditionally: it is not part of the
-    // subscribe/rate-control model (COMMANDS_AND_ACTIONS.md section 7 only
+    // subscribe/rate-control model (commands.md section 4 only
     // ever mentions telemetry topics), same as before this topico.
     if (header.type == btp::MessageType::Telemetry) {
-        if (!SubscriptionRegistry::isWanted(header.source_id, header.object_id)) {
+        if (SubscriptionRegistry::isKnownUnwanted(header.source_id, header.object_id)) {
             ++g_telemetryDropped;
             SubscriptionRegistry::recordDropped(header.source_id, header.object_id);
             return false;
@@ -935,6 +1074,51 @@ bool forwardRelay(const btp::Header& header, const std::uint8_t* payload, std::s
     }
 
     const bool queued = enqueueFrameBytes(SerialSession::classify(header.type, header.object_id), frameBytes, frameSize);
+    if (header.type == btp::MessageType::Telemetry) {
+        if (queued) {
+            SubscriptionRegistry::recordForwarded(header.source_id, header.object_id, payloadSize);
+        } else {
+            SubscriptionRegistry::recordDropped(header.source_id, header.object_id);
+        }
+    }
+    return queued;
+}
+
+bool relayUp(const btp::Header& header, const std::uint8_t* frame, std::size_t frameSize) noexcept {
+    if (!g_session.isProtocolled()) {
+        if (header.type == btp::MessageType::Telemetry) {
+            ++g_telemetryDropped;
+        }
+        return false;
+    }
+
+    if (frame == nullptr || frameSize == 0U) {
+        return false;
+    }
+
+    // The same telemetry gate forwardRelay applies, and it keeps working on a
+    // frame this dongle cannot read: object_id sits at a fixed header offset
+    // in the clear even when the payload is sealed (BTP/docs/encryption.md
+    // section 5 -- the header is the AAD, authenticated but not encrypted).
+    // The payload size fed to recordForwarded is the fragment's, not the
+    // logical message's, because under D5 nothing here ever sees the whole
+    // message; summed over the fragments it comes out to the same number.
+    const std::size_t payloadSize = frameSize - btp::kV1MinimumFrameSize;
+    if (header.type == btp::MessageType::Telemetry) {
+        if (SubscriptionRegistry::isKnownUnwanted(header.source_id, header.object_id)) {
+            ++g_telemetryDropped;
+            SubscriptionRegistry::recordDropped(header.source_id, header.object_id);
+            return false;
+        }
+    }
+
+    // Verbatim: the datagram goes into the queue exactly as the radio
+    // delivered it, and writeFrameCobs() only wraps it in COBS on the way
+    // out. Nothing is decoded, reassembled or re-encoded on this path (D5),
+    // so the producer's identity triple -- the AEAD nonce -- cannot be
+    // touched here even by accident.
+    const bool queued =
+        enqueueFrameBytes(SerialSession::classify(header.type, header.object_id), frame, frameSize);
     if (header.type == btp::MessageType::Telemetry) {
         if (queued) {
             SubscriptionRegistry::recordForwarded(header.source_id, header.object_id, payloadSize);

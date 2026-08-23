@@ -10,7 +10,7 @@
 // on the dongle side: SubscriptionRegistry's aggregation of several desktop
 // clients into a single upstream SUBSCRIBE per (source_id, topic_id), and
 // SerialSession::buildStatusV2's status_version=2 serialization
-// (COMMANDS_AND_ACTIONS.md section 8.1).
+// (commands.md section 5.1).
 //
 // Both modules are pure C++, so this suite runs under env:native exactly like
 // test_protocol_router/test_serial_session. The ESP-NOW/Serial glue that sends
@@ -176,7 +176,7 @@ void test_unsubscribing_an_absent_subscription_is_a_silent_no_op() {
 
     const auto outcome = SubscriptionRegistry::onDesktopUnsubscribe(kClientA, 999U, 1000U);
 
-    // COMMANDS_AND_ACTIONS.md section 7: retries are idempotent. The caller
+    // commands.md section 4: retries are idempotent. The caller
     // still answers SUCCESS/NONE; nothing goes upstream.
     TEST_ASSERT_FALSE(outcome.found);
     TEST_ASSERT_EQUAL(static_cast<int>(SubscriptionRegistry::UpstreamKind::None),
@@ -312,7 +312,7 @@ void test_counters_are_disambiguated_by_source_and_topic() {
     SubscriptionRegistry::resetForTests();
 
     // Same topic_id published by two different robots: topic_id alone is not
-    // globally unique (COMMANDS_AND_ACTIONS.md section 8.1).
+    // globally unique (commands.md section 5.1).
     (void)SubscriptionRegistry::onDesktopSubscribe(kClientA, kRobotOne, kTopicSeven, 1000U, kLeaseMs, 1000U);
     (void)SubscriptionRegistry::onDesktopSubscribe(kClientA, kRobotTwo, kTopicSeven, 1000U, kLeaseMs, 1000U);
 
@@ -346,9 +346,9 @@ void test_counters_survive_the_topic_losing_all_subscribers() {
     SubscriptionRegistry::TopicStatusEntry entries[SubscriptionRegistry::kMaxTopics];
     const std::size_t count = SubscriptionRegistry::topicStatusSnapshot(entries, SubscriptionRegistry::kMaxTopics);
 
-    // Section 8.1: bytes_total is monotonic since the emitter's boot, and an
-    // idle topic reports effective_rate_millihz = 0 ("nao esta sendo publicado
-    // agora") rather than vanishing from the list.
+    // Section 5.1: bytes_total is monotonic since the emitter's boot, and an
+    // idle topic reports effective_rate_millihz = 0 ("not currently
+    // published") rather than vanishing from the list.
     TEST_ASSERT_EQUAL(1U, count);
     TEST_ASSERT_EQUAL_UINT64(250U, entries[0].bytesTotal);
     TEST_ASSERT_EQUAL_UINT16(0U, entries[0].subscriberCount);
@@ -393,7 +393,7 @@ void test_status_v2_serializes_one_fixed_record_per_topic() {
     const std::size_t size = SerialSession::buildStatusV2(counters, records, 2U, payload, sizeof(payload));
 
     // 92-byte v1 block + uint16 count + 2 fixed-size records, with no
-    // record_size prefix of its own (section 8.1).
+    // record_size prefix of its own (section 5.1).
     TEST_ASSERT_EQUAL(SerialSession::kStatusPayloadSize + 2U + 2U * SerialSession::kTopicStatusRecordSize, size);
     TEST_ASSERT_EQUAL_UINT16(2U, read_u16(payload));  // status_version bumped to 2
     TEST_ASSERT_EQUAL_UINT64(123456U, read_u64(payload + 4U));   // v1 fields keep their offsets
@@ -440,7 +440,7 @@ void test_status_v2_with_no_topics_is_just_the_count_field() {
     uint8_t payload[SerialSession::kStatusPayloadSize + 2U];
     const std::size_t size = SerialSession::buildStatusV2(counters, nullptr, 0U, payload, sizeof(payload));
 
-    // Section 8.1 explicitly allows topic_status_count = 0.
+    // Section 5.1 explicitly allows topic_status_count = 0.
     TEST_ASSERT_EQUAL(SerialSession::kStatusPayloadSize + 2U, size);
     TEST_ASSERT_EQUAL_UINT16(2U, read_u16(payload));
     TEST_ASSERT_EQUAL_UINT16(0U, read_u16(payload + 92U));
@@ -489,6 +489,46 @@ void test_registry_snapshot_feeds_status_v2_end_to_end() {
     TEST_ASSERT_EQUAL_UINT32(3141U, SubscriptionRegistry::upstreamSubscriptionId(kRobotOne, kTopicSeven));
 }
 
+// The relay gate must fail OPEN, and this is the distinction that decides it.
+//
+// Once subscriptions live on the endpoint channel, a desktop subscribes
+// directly at the robot and never tells this dongle. Every topic then looks
+// unknown here -- so a gate written as !isWanted() would drop ALL telemetry
+// rather than the one topic nobody asked for, and the hub would go quiet for a
+// reason nothing anywhere reports. isKnownUnwanted() answers false for a topic
+// it was never told about, which is what makes "relay by default" hold.
+//
+// Uses its own (source, topic) pair and its own client: setUp() does not reset
+// the registry, so every test here shares one global state.
+void test_unknown_topic_is_relayed_but_a_released_one_is_not() {
+    constexpr uint32_t kRobotGate = 0x5AFE0001U;
+    constexpr uint32_t kTopicGate = 42U;
+    constexpr uint32_t kTopicGateOther = 43U;
+    constexpr uint32_t kClientGate = 0xCCCC0003U;
+
+    // Never mentioned to this registry: unknown, therefore relayed.
+    TEST_ASSERT_FALSE(SubscriptionRegistry::isKnownUnwanted(kRobotGate, kTopicGate));
+    TEST_ASSERT_FALSE(SubscriptionRegistry::isWanted(kRobotGate, kTopicGate));
+
+    // Subscribed through the dongle: known and wanted, so still relayed.
+    const SubscriptionRegistry::DesktopSubscribeOutcome outcome =
+        SubscriptionRegistry::onDesktopSubscribe(kClientGate, kRobotGate, kTopicGate, 1000U, kLeaseMs, 0U);
+    TEST_ASSERT_TRUE(outcome.accepted);
+    TEST_ASSERT_TRUE(SubscriptionRegistry::isWanted(kRobotGate, kTopicGate));
+    TEST_ASSERT_FALSE(SubscriptionRegistry::isKnownUnwanted(kRobotGate, kTopicGate));
+
+    // Last consumer gone: now, and only now, the gate closes. This is the case
+    // the gate was added for -- a sample already in flight when the last chart
+    // closed, for a topic this dongle does know about.
+    SubscriptionRegistry::onDesktopUnsubscribe(kClientGate, outcome.subscriptionId, 100U);
+    TEST_ASSERT_FALSE(SubscriptionRegistry::isWanted(kRobotGate, kTopicGate));
+    TEST_ASSERT_TRUE(SubscriptionRegistry::isKnownUnwanted(kRobotGate, kTopicGate));
+
+    // A different topic on the same robot stays unknown, and stays relayed:
+    // knowing about one topic says nothing about another.
+    TEST_ASSERT_FALSE(SubscriptionRegistry::isKnownUnwanted(kRobotGate, kTopicGateOther));
+}
+
 void test_stale_subscribe_result_is_ignored() {
     SubscriptionRegistry::resetForTests();
 
@@ -523,5 +563,6 @@ int main(int, char**) {
     RUN_TEST(test_status_v2_with_no_topics_is_just_the_count_field);
     RUN_TEST(test_registry_snapshot_feeds_status_v2_end_to_end);
     RUN_TEST(test_stale_subscribe_result_is_ignored);
+    RUN_TEST(test_unknown_topic_is_relayed_but_a_released_one_is_not);
     return UNITY_END();
 }

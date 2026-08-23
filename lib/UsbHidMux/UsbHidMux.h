@@ -2,7 +2,8 @@
 
 /**
  * @brief Hardware bring-up spike for the dongle's second USB interface (BTP
- * v1.1.0 "usb_hid" transport profile, bally_protocol/docs/TRANSPORT_USB_HID.md).
+ * v1.1.0 "usb_hid" transport profile,
+ * BTP/docs/fragmentation-and-transports.md section 3.3).
  *
  * This validates the composite CDC+HID device on the ESP32-S3 native USB OTG
  * peripheral (ARDUINO_USB_MODE=0) before any BTP framing is wired in:

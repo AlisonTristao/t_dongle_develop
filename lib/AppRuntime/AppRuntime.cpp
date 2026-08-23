@@ -12,10 +12,13 @@
 #include "StartupConfig.h"
 #include "ShellConfig.h"
 #include "EspNowConfig.h"
+#include "EspNowCommands.h"
+#include "DonglePublisher.h"
 #include "ManifestCache.h"
 #include "SerialMux.h"
 #include "ShellOutput.h"
 #include "BtpTransport.h"
+#include "DongleKeyStore.h"
 #include "UsbHidMux.h"
 #include <USB.h>
 
@@ -155,6 +158,7 @@ void AppRuntime::flushPendingEspNowOutput(bool& needPromptRefresh) {
     dropped += EspNowConfig::takeDroppedCrcCount();
     dropped += EspNowConfig::takeDroppedReassemblyCount();
     dropped += EspNowConfig::takeDroppedQueueFullCount();
+    dropped += EspNowConfig::takeDroppedAuthCount();
     if (dropped > 0) {
         lcdDashboard_.notifyDropped(dropped);
 
@@ -239,6 +243,13 @@ void AppRuntime::begin() {
     }
     BtpTransport::configureIdentity(BtpTransport::btp_command::source_id_from_mac(selfMac), bootId);
 
+    // Topico 29 passo 3: restores channel C's key L from NVS, if a previous
+    // "hub -set_key_l" session ever persisted one, so the fleet key survives
+    // a reboot without the operator retyping the password every time. Silent
+    // when nothing was ever saved -- every radio send/open then fails closed
+    // (RadioSeal.h) until "hub -set_key_l" runs.
+    DongleKeyStore::loadFromNvs();
+
     // SerialMux (topico 13): the port's single writer once a BTP v1 session
     // negotiates on this same USB link. selfUuid still has no separate
     // persisted identity store (topico 16 did not add one either) -- MAC
@@ -255,8 +266,90 @@ void AppRuntime::begin() {
     ManifestCache::configure(selfUuid);
     SerialMux::begin(Serial, [](const char* cmd, const char* source, const char* userId, std::string* out) {
         ShellConfig::runLine(std::string(cmd), source, out, userId);
-    }, selfUuid, ShellOutput::commandPrompt().c_str(), EspNowConfig::requestUpstreamSubscribe,
-    EspNowConfig::requestUpstreamUnsubscribe);
+    }, selfUuid, ShellOutput::commandPrompt().c_str(), EspNowConfig::sendRawToMac);
+
+    // "espnow -stats" reads counters owned by two libraries that must not
+    // depend on the command module (EspNowConfig.h from EspNowCommands would
+    // close EspNowCommands -> EspNowConfig -> ShellConfig -> EspNowCommands).
+    // AppRuntime is the only layer already holding both, so it binds the
+    // provider -- same boundary as the SerialMux::begin callbacks above.
+    EspNowCommands::setStatsProvider([](EspNowCommands::StatsSnapshot& out) {
+        EspNowConfig::RxCounters rx{};
+        EspNowConfig::peekRxCounters(rx);
+        out.datagrams = rx.datagrams;
+        out.fragmentsAccepted = rx.fragmentsAccepted;
+        out.routedTelemetry = rx.routedTelemetry;
+        out.routedLog = rx.routedLog;
+        out.routedCommand = rx.routedCommand;
+        out.routedControl = rx.routedControl;
+        out.routedTerminal = rx.routedTerminal;
+        out.droppedRx = rx.droppedRx;
+        out.droppedDecode = rx.droppedDecode;
+        out.droppedCrc = rx.droppedCrc;
+        out.droppedReassembly = rx.droppedReassembly;
+        out.droppedQueueFull = rx.droppedQueueFull;
+        out.droppedAuth = EspNowConfig::peekDroppedAuthCount();
+
+        SerialMux::TxCounters tx{};
+        SerialMux::peekTxCounters(tx);
+        out.framesTx = tx.framesTx;
+        out.telemetryDropped = tx.telemetryDropped;
+        out.droppedSession = tx.droppedByClass[static_cast<size_t>(SerialSession::PriorityClass::kSession)];
+        out.droppedTerminal = tx.droppedByClass[static_cast<size_t>(SerialSession::PriorityClass::kTerminal)];
+        out.droppedLogStatus = tx.droppedByClass[static_cast<size_t>(SerialSession::PriorityClass::kLogStatus)];
+        out.droppedTelemetryQueue = tx.droppedByClass[static_cast<size_t>(SerialSession::PriorityClass::kTelemetry)];
+        out.protocolled = SerialMux::isProtocolled();
+    });
+
+    // Topico 27: same boundary, same reason. DonglePublisher is pure C++ and
+    // must not include EspNowConfig.h/SerialMux.h (ManifestCache and SerialMux
+    // both include *it*, so the edge would close a cycle -- CONTRIBUTING.md
+    // section 3). AppRuntime is the only layer already holding all three, so
+    // it binds the one provider that gathers everything a publish cycle needs.
+    // Called at most once per SerialMux tick, and only while some hub.* topic
+    // has a subscriber.
+    DonglePublisher::setSnapshotProvider([](DonglePublisher::Snapshot& out) {
+        EspNowConfig::RxCounters rx{};
+        EspNowConfig::peekRxCounters(rx);
+        out.link.datagrams = rx.datagrams;
+        out.link.fragmentsAccepted = rx.fragmentsAccepted;
+        out.link.routedTelemetry = rx.routedTelemetry;
+        out.link.routedLog = rx.routedLog;
+        out.link.routedCommand = rx.routedCommand;
+        out.link.routedControl = rx.routedControl;
+        out.link.routedTerminal = rx.routedTerminal;
+        out.link.droppedRx = rx.droppedRx;
+        out.link.droppedDecode = rx.droppedDecode;
+        out.link.droppedCrc = rx.droppedCrc;
+        out.link.droppedReassembly = rx.droppedReassembly;
+        out.link.droppedQueueFull = rx.droppedQueueFull;
+
+        SerialMux::TxCounters tx{};
+        SerialMux::peekTxCounters(tx);
+        out.usb.framesRx = tx.framesRx;
+        out.usb.framesTx = tx.framesTx;
+        out.usb.crcErrors = tx.crcErrors;
+        out.usb.decodeErrors = tx.decodeErrors;
+        out.usb.reassemblyRejected = tx.reassemblyRejected;
+        out.usb.telemetryDropped = tx.telemetryDropped;
+        for (size_t i = 0; i < DonglePublisher::kUsbDropClassCount; ++i) {
+            out.usb.droppedByClass[i] = tx.droppedByClass[i];
+        }
+
+        BtpTransport::PeerSnapshot peers[BtpTransport::kPeerIdentityCapacity];
+        const size_t peerCount = BtpTransport::enumeratePeers(peers, BtpTransport::kPeerIdentityCapacity);
+        const uint32_t nowMs = millis();
+        for (size_t i = 0; i < peerCount; ++i) {
+            out.peers[i].sourceId = peers[i].sourceId;
+            out.peers[i].bootId = peers[i].bootId;
+            std::memcpy(out.peers[i].mac, peers[i].mac, sizeof(out.peers[i].mac));
+            // Unsigned wrap makes this the correct elapsed time even across
+            // the ~49-day millis() rollover.
+            out.peers[i].lastSeenAgeMs = nowMs - peers[i].lastSeenMs;
+            out.peers[i].online = peers[i].linkOk;
+        }
+        out.peerCount = peerCount;
+    });
 
     // UsbHidMux (topico 20, hardware bring-up spike): the dongle's second
     // USB interface, active alongside the CDC/SerialMux link above on the

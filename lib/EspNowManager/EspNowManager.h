@@ -15,8 +15,7 @@
  *
  * This class is deliberately protocol-agnostic: it moves bytes and knows
  * nothing about BTP (type/CRC/fragmentation). Decoding lives one layer up in
- * ProtocolRouter/EspNowConfig, so this file has no dependency on
- * bally_protocol.
+ * ProtocolRouter/EspNowConfig, so this file has no dependency on BTP.
  */
 class EspNowManager final {
 public:

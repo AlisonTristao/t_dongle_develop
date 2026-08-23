@@ -294,7 +294,7 @@ void printLine(const string& text) {
     g_commandOutputBuffer += "\n";
 
     // In a BTP-protocolled session SerialMux is the port's only writer
-    // (bally_protocol/docs/TRANSPORT_SERIAL.md section 7): a raw console
+    // (BTP/docs/session-and-terminal.md sections 3-4): a raw console
     // print here would interleave with COBS frames on the wire. Command
     // output during that session already reaches the caller through
     // ShellConfig::runLine's captured text (see SerialMux's COMMAND_REQUEST/

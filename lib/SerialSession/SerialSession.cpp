@@ -395,8 +395,8 @@ Session::FrameResult Session::onFrame(const btp::DecodedFrame& frame, std::uint6
             }
 
             // Malformed HELLO or no common version: fail closed, back to console
-            // (COMMANDS_AND_ACTIONS.md section 5: "fecha a sessao depois de
-            // transmitir a resposta").
+            // (session-and-terminal.md section 2: "closes the session after
+            // transmitting the response").
             const std::size_t written = buildHelloResultFailure(
                 frame.header.source_id, frame.header.boot_id, frame.header.sequence,
                 outPayload, outPayloadCapacity);

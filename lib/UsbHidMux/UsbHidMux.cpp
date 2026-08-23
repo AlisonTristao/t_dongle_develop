@@ -16,8 +16,8 @@ constexpr size_t kReportDataSize = 63;
 // shorter, so without this the receiver has no way to tell real data from
 // padding. USBHIDVendor::write() applies this automatically on the way out;
 // _onOutput()/read() do not do the equivalent on the way in (see below), so
-// this module has to. See bally_protocol/docs/TRANSPORT_USB_HID.md section 2
-// and BTP's ADR 0011 -- the real BTP integration will rely on this same
+// this module has to. See BTP/docs/fragmentation-and-transports.md
+// section 3.3 -- the real BTP integration will rely on this same
 // convention, so the bring-up spike already exercises it end to end instead
 // of a differently-framed byte echo.
 USBHIDVendor vendor(kReportDataSize, /*prepend_size=*/true);

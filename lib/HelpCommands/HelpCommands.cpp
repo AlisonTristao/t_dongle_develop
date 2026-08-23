@@ -106,6 +106,10 @@ uint8_t wrapper_help_e() {
     printLine("Historico rapido de comandos: dongle -history 20");
     printLine("Sistema: dongle -info | dongle -reboot");
     printLine("Sessao BTP v1 nesta porta: dongle -btp_v1 (ou o cliente manda BTP/1 ENTER <16 hex> direto); volta ao console com SESSION_CLOSE ou por timeout");
+    printLine("Vinculo de relay: hub -bind <filho>, <robo> aponta um filho do console para um robo; hub -unbind <filho> desfaz");
+    printLine("Os dois ids sao source_id em hex (ex.: 33445566); sem vinculo, o filho fala com o proprio dongle");
+    printLine("Chave do enlace (canal C): hub -set_key_l <senha> deriva e grava a chave em NVS; hub -key_status mostra se ha chave carregada");
+    printLine("Sem chave L, o radio nao sela nem abre nada: heartbeat, comando remoto e presenca ficam recusados e contados (espnow -stats, campo auth=)");
     printLine("Banco sqlite no SD: database -status | database -tables | database -read peers, 20");
     printLine("Logs comando+saida: database -logs 20");
     printLine("Historico ESP-NOW RX/TX: database -espnow_history 30");

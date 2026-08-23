@@ -2,6 +2,8 @@
 
 #include "ShellCommandSupport.h"
 #include "BtpTransport.h"
+#include "RadioSeal.h"
+#include "DongleKeyStore.h"
 #include "error_codes.h"
 
 #include <cstdio>
@@ -220,15 +222,28 @@ bool sendShellCommandRequest(const uint8_t mac[6], const string& commandText, bo
 
     const size_t payloadSize = BtpTransport::btp_command::kRequestPrefixSize + textLen;
     const uint64_t timestampUs = static_cast<uint64_t>(millis()) * 1000ULL;
+    // Topico 30: a COMMAND_REQUEST this dongle originates toward a robot is
+    // channel C, key L -- sealed like every other message BtpTransport sends
+    // over the radio.
     return BtpTransport::sendLogicalWithStatus(
         sendWithStatusViaManager, context().espNow, mac, btp::MessageType::Command,
         BtpTransport::btp_command::kCommandRequestObjectId,
-        payload, payloadSize, timestampUs, outDelivered, 700);
+        payload, payloadSize, timestampUs, outDelivered, 700, RadioSeal::seal, nullptr);
 }
 
 uint8_t wrapper_espnow_send_to(int32_t deviceNumber, string command) {
     if (context().espNow == nullptr) {
         return failWithCode(AppError::Code::ESPNOW_NOT_READY, "espnow indisponivel para comando send_to");
+    }
+
+    // Checked up front, and with its own error code: without this,
+    // sendShellCommandRequest's seal failure would surface as
+    // PEER_BOOT_UNKNOWN below, which names the wrong cause when the real one
+    // is "no key L configured yet" (topico 30: fail closed, no cleartext
+    // fallback -- see "hub -set_key_l").
+    if (!DongleKeyStore::hasKeyL()) {
+        return failWithCode(AppError::Code::LINK_KEY_NOT_CONFIGURED,
+                            "chave L nao configurada, rode hub -set_key_l primeiro");
     }
 
     if (deviceNumber <= 0) {
@@ -270,6 +285,11 @@ uint8_t wrapper_espnow_send_to(int32_t deviceNumber, string command) {
 uint8_t wrapper_espnow_send_all(string command) {
     if (context().espNow == nullptr) {
         return failWithCode(AppError::Code::ESPNOW_NOT_READY, "espnow indisponivel para comando send_all");
+    }
+
+    if (!DongleKeyStore::hasKeyL()) {
+        return failWithCode(AppError::Code::LINK_KEY_NOT_CONFIGURED,
+                            "chave L nao configurada, rode hub -set_key_l primeiro");
     }
 
     const string msg = stripOuterQuotes(command);
@@ -328,9 +348,68 @@ uint8_t wrapper_espnow_send_all(string command) {
     return RESULT_OK;
 }
 
+EspNowCommands::StatsProviderFn g_statsProvider = nullptr;
+
+// Prints both hops' cumulative counters. Numbers only, no rate: computing a
+// rate needs two calls and the operator's own clock, and printing a
+// self-computed "per second" from a single sample would invite reading one
+// burst as a steady state. Field names stay snake_case so they can be diffed
+// mechanically between two runs.
+uint8_t wrapper_espnow_stats() {
+    if (g_statsProvider == nullptr) {
+        return failWithCode(AppError::Code::ESPNOW_NOT_READY, "contadores indisponiveis: provider nao vinculado");
+    }
+
+    EspNowCommands::StatsSnapshot s{};
+    g_statsProvider(s);
+
+    char line[256] = {0};
+
+    printLine("[espnow] contadores acumulados desde o boot");
+
+    std::snprintf(line, sizeof(line), "[espnow] rx_datagramas=%u rx_fragmentos=%u",
+                  static_cast<unsigned>(s.datagrams), static_cast<unsigned>(s.fragmentsAccepted));
+    printLine(line);
+
+    std::snprintf(line, sizeof(line),
+                  "[espnow] roteados: telemetria=%u log=%u comando=%u controle=%u terminal=%u",
+                  static_cast<unsigned>(s.routedTelemetry), static_cast<unsigned>(s.routedLog),
+                  static_cast<unsigned>(s.routedCommand), static_cast<unsigned>(s.routedControl),
+                  static_cast<unsigned>(s.routedTerminal));
+    printLine(line);
+
+    std::snprintf(line, sizeof(line),
+                  "[espnow] descartes: fila_rx=%u decode=%u crc=%u reassembly=%u fila_tipo=%u auth=%u",
+                  static_cast<unsigned>(s.droppedRx), static_cast<unsigned>(s.droppedDecode),
+                  static_cast<unsigned>(s.droppedCrc), static_cast<unsigned>(s.droppedReassembly),
+                  static_cast<unsigned>(s.droppedQueueFull), static_cast<unsigned>(s.droppedAuth));
+    printLine(line);
+
+    std::snprintf(line, sizeof(line), "[usb] sessao=%s frames_tx=%llu",
+                  s.protocolled ? "protocolada" : "console",
+                  static_cast<unsigned long long>(s.framesTx));
+    printLine(line);
+
+    std::snprintf(line, sizeof(line),
+                  "[usb] descartes: telemetria=%llu fila_sessao=%llu fila_terminal=%llu "
+                  "fila_log=%llu fila_telemetria=%llu",
+                  static_cast<unsigned long long>(s.telemetryDropped),
+                  static_cast<unsigned long long>(s.droppedSession),
+                  static_cast<unsigned long long>(s.droppedTerminal),
+                  static_cast<unsigned long long>(s.droppedLogStatus),
+                  static_cast<unsigned long long>(s.droppedTelemetryQueue));
+    printLine(line);
+
+    return RESULT_OK;
+}
+
 } // namespace
 
 namespace EspNowCommands {
+
+void setStatsProvider(StatsProviderFn provider) {
+    g_statsProvider = provider;
+}
 
 uint8_t registerAll() {
     if (context().shell == nullptr) {
@@ -346,6 +425,7 @@ uint8_t registerAll() {
     context().shell->add(wrapper_espnow_update, "update", "update peer: <number>, <name>, <description>", "espnow");
     context().shell->add(wrapper_espnow_send_to, "send_to", "send to index: <number>, <command> (peer must have sent something first)", "espnow");
     context().shell->add(wrapper_espnow_send_all, "send_all", "send to all peers with known boot_id: <command>", "espnow");
+    context().shell->add(wrapper_espnow_stats, "stats", "cumulative RX/TX counters for both hops", "espnow");
 
     return RESULT_OK;
 }

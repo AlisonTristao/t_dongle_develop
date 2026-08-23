@@ -18,7 +18,7 @@ para alterar/estender o firmware.
 - Framework Arduino via PlatformIO
 - ESP32-S3 (`esp32-s3-devkitc-1`), C++17
 - [TinyShell](https://github.com/AlisonTristao/TinyShell) — dispatch de módulos/comandos
-- [BTP](https://github.com/AlisonTristao/BTP) (`lib_deps` fixado em `v1.0.1-beta`) — codec/fragmentação
+- [BTP](https://github.com/AlisonTristao/BTP) (`lib_deps` fixado em `v1.1.0-beta`) — codec/fragmentação
   do Binary Telemetry Protocol v1, compartilhado com `Bally_OS`/`TraceView`
 - SQLite (`Sqlite3Esp32`) sobre SD_MMC
 - Adafruit GFX + ST7735 (LCD 160x80)
@@ -98,7 +98,7 @@ Serviços/domínio
 Plataforma
   ShellSerial (input não bloqueante) / ShellOutput (formatação) / StartupConfig (boot)
   Arduino/ESP-IDF: WiFi, esp_now, FreeRTOS, SD_MMC, time
-  BTP (lib externa via git, lib_deps fixado em v1.0.1-beta): codec/fragmentação BTP v1
+  BTP (lib externa via git, lib_deps fixado em v1.1.0-beta): codec/fragmentação BTP v1
 ```
 
 Grafo de dependências entre as libs (setas = "depende de"; auditado nesta revisão —
@@ -255,6 +255,39 @@ Sintaxe: `<modulo> -<comando> [args]`. Comandos podem ser encadeados com `;`
 | `reboot` | `dongle -reboot` | reinicia o ESP32 |
 | `btp_v1` | `dongle -btp_v1` | negocia uma sessão BTP v1 protocolada nesta mesma porta (ver seção 7bis) |
 
+### 5.2bis `hub` — vínculos de relay e chave do enlace (tópicos 28 e 30)
+
+| Comando | Sintaxe | Descrição |
+|---|---|---|
+| `bind` | `hub -bind 1A2B3C4D, 33445566` | aponta um filho do console (primeiro id) para um robô (segundo id) |
+| `unbind` | `hub -unbind 1A2B3C4D` | remove o vínculo daquele filho |
+| `set_key_l` | `hub -set_key_l <senha>` | deriva a chave do canal C (dongle↔robô) da senha e grava em NVS |
+| `key_status` | `hub -key_status` | mostra se há chave carregada, sem nunca imprimir a chave |
+
+Registrado em `DongleCommands` mas em módulo próprio, porque o assunto é o hub e não os
+periféricos desta placa. Os dois argumentos de `bind`/`unbind` são `source_id` BTP em
+hexadecimal (a forma em que eles aparecem em log, LCD e `hub.peers`); `0x` é aceito e
+opcional. A tabela tem 8 entradas, vive só em RAM e some no boot.
+
+**Por que ela precisa existir:** o header do BTP não tem campo de destino, e TERMINAL não
+tem nem `target_source_id` no payload — então, no sentido descendente (console → robô), o
+dongle não tem como deduzir o destino de um frame. Ele precisa ser informado. É o exato
+contrário do `hub.peers`: a descoberta desce como telemetria, o vínculo sobe como decisão
+de operador. Um filho sem vínculo continua falando com o próprio dongle (terminal e
+comandos locais), que é o comportamento anterior ao tópico.
+
+**Chave do canal C (tópico 30):** desde que o rádio passou a ser selado, todo tráfego
+dongle↔robô (heartbeat, presença, `COMMAND_REQUEST`/`COMMAND_RESULT`) exige a chave L
+carregada — sem ela, `BtpTransport::sendLogical`/`encodeSingleFrame` simplesmente não
+enviam nada (fecha fechado, sem fallback em texto claro) e um frame recebido que não abre
+sob essa chave é descartado e contado (`espnow -stats`, campo `auth=`). `hub -set_key_l`
+deriva a mesma chave que `bally_OS/scripts/provision_key.py --password-l` produziria da
+mesma senha (PBKDF2-HMAC-SHA256, salt e iterações fixos — ver `lib/DongleKeyStore`), grava
+em NVS para sobreviver a um reboot, e imprime só `verify_l` (uma tag pública de 8 octetos,
+nunca a chave) para o operador confirmar na bancada que dongle e robô combinaram a mesma
+senha. Este dongle nunca deriva ou guarda a chave E (canal B, TraceView↔robô) — só
+administra o enlace, não lê o conteúdo que passa por ele.
+
 ### 5.3 `espnow` — peers e mensagens
 
 | Comando | Sintaxe | Descrição |
@@ -263,6 +296,18 @@ Sintaxe: `<modulo> -<comando> [args]`. Comandos podem ser encadeados com `;`
 | `add` / `remove` / `remove_mac` / `update` | `espnow -add "MAC", "nome", "desc"` | gestão de peers |
 | `send_to` | `espnow -send_to 1, "dongle -clock"` | envia COMMAND_REQUEST pro peer de índice 1 |
 | `send_all` | `espnow -send_all "<comando>"` | envia COMMAND_REQUEST pra cada peer com `boot_id` conhecido |
+| `stats` | `espnow -stats` | contadores acumulados dos dois hops (rádio e USB), para medir vazão |
+
+`stats` imprime contadores **cumulativos desde o boot**, não taxas: rode duas vezes e
+divida a diferença pelo intervalo. Ele existe porque o `EspNowConfig` só contava
+*descartes* — nada contava o que passou, então não havia como distinguir um rádio saturado
+de um enlace USB saturado. O bloco `[espnow]` cobre o hop robô → dongle (datagramas
+recebidos, fragmentos, mensagens roteadas por tipo, descartes por motivo, e desde o tópico
+30 o campo `auth=` — um frame do canal C que não abriu sob a chave L, contado à parte
+porque não é decode/CRC/fila cheia, é autenticação recusada) e o bloco `[usb]` cobre o hop
+dongle → desktop (`frames_tx` e descartes **por classe de fila**, o que o STATUS não
+separa). Fila de telemetria transbordando indica enlace saturado; fila de sessão
+transbordando indica `loop()` travado — consertos opostos.
 
 `send_to`/`send_all` enviam um frame BTP `COMMAND`/`COMMAND_REQUEST` (ação "shell") — isso faz
 o **peer receptor executar o comando remotamente** e responder com um `COMMAND_RESULT`,
@@ -270,7 +315,8 @@ exibido como `[cmd_result] ...` (ver seção 7). Diferença importante em relaç
 `CMDO`: um `COMMAND_REQUEST` precisa do `boot_id` atual do peer, que só é conhecido depois
 de já termos recebido alguma mensagem dele (sem handshake HELLO ainda, tópico 16) — por
 isso o alias de broadcast `000` foi removido e `send_to`/`send_all` falham com
-`PEER_BOOT_UNKNOWN` para um peer do qual nunca recebemos nada.
+`PEER_BOOT_UNKNOWN` para um peer do qual nunca recebemos nada, e com `LINK_KEY_NOT_CONFIGURED`
+(tópico 30) se a chave L ainda não foi carregada com `hub -set_key_l`.
 
 ### 5.4 `database` — SQLite no SD
 
@@ -331,7 +377,7 @@ Cada comando rodado via `ShellConfig::runLine()` pode virar uma linha em `comman
 
 Todo datagrama trocado com um peer é um frame BTP v1 (fonte canônica no
 repositório [BTP](https://github.com/AlisonTristao/BTP), integrada aqui via
-`lib_deps = https://github.com/AlisonTristao/BTP.git#v1.0.1-beta`):
+`lib_deps = https://github.com/AlisonTristao/BTP.git#v1.1.0-beta`):
 `btp::Header` (`type`, `flags`, `source_id`, `boot_id`, `sequence`, `timestamp_us`,
 `object_id`, `fragment_index`, `fragment_count`) + payload + CRC-32. `EspNowManager` só
 transporta bytes crus; `ProtocolRouter` decodifica, valida o CRC e faz reassembly
@@ -346,7 +392,7 @@ consumidor ainda (tópicos 16/19) e são apenas drenados/descartados, liberando 
 
 `HELLO`/`MANIFEST` **não são `MessageType` novos**: no wire format já congelado eles são
 `object_id`s dentro de `CONTROL` (`0x0001`=`HELLO`, `0x0004`=`MANIFEST_DATA`, ver
-`BTP/docs/COMMANDS_AND_ACTIONS.md` seção 3.2) — não havia motivo pra inventar
+`BTP/docs/commands.md` seção 1, subseção `object_id` namespaces) — não havia motivo pra inventar
 valores de enum novos no codec canônico só pra este tópico.
 
 ### 7.2 Identidade deste dongle (`BtpTransport`)
@@ -369,6 +415,15 @@ BTP `CONTROL`/`STATUS` (`object_id=0x0009`, payload vazio — "publicação espo
 resposta" por definição no wire format) para o **último peer de onde chegou dado real** (não
 é broadcast pra todos, é sempre o mais recente). O resultado (ACK de entrega, não o payload)
 atualiza o tile `LINK` do dashboard.
+
+Desde o tópico 30 este frame é selado com a chave L (canal C, `RadioSeal::seal`) como
+qualquer outro que o dongle originar no rádio; sem chave carregada (`hub -set_key_l`) o
+selamento falha e nada é enviado — fecha fechado, nunca em texto claro. O ACK de entrega é
+só uma confirmação de camada de rádio (o heartbeat não tem resposta), não prova por si só
+que o peer tem a mesma chave; a prova de fato vem de `hub.peers.online` (tópico 27,
+`DonglePublisher::PeerRecord`), que passou a exigir também que o último frame consumido
+daquele peer tenha aberto sob L (`EspNowConfig.cpp`'s `RadioSeal::open`), não só o ACK do
+heartbeat.
 
 ### 7.4 Execução remota de comando (`COMMAND`/`COMMAND_REQUEST`)
 
@@ -418,7 +473,7 @@ do dongle.
 ### 7.6 Sessão BTP v1 na serial USB (`SerialSession`/`SerialMux`, tópico 13)
 
 A mesma porta USB do console humano também serve BTP v1 para um cliente automático (ex.:
-TraceView), seguindo `BTP/docs/TRANSPORT_SERIAL.md`:
+TraceView), seguindo `BTP/docs/session-and-terminal.md`:
 
 - **Entrada**: a porta começa em modo console (`ShellSerial`). Uma linha completa
   `BTP/1 ENTER <16 hex>\r\n` é reconhecida como controle reservado (não é um comando
@@ -438,11 +493,27 @@ TraceView), seguindo `BTP/docs/TRANSPORT_SERIAL.md`:
   `ShellCommandSupport::printLine` e os pontos de log direto do `EspNowConfig`/`AppRuntime`
   passam a checar `SerialMux::isConsoleOwned()` antes de escrever na `Serial`, para nenhuma
   task nunca escrever a porta por fora do mux enquanto uma sessão está ativa.
-- **Canais**: `TELEMETRY`/`LOG` roteados pelo `EspNowConfig` (vindos do robô via ESP-NOW) são
-  retransmitidos byte a byte para a sessão via `SerialMux::forwardRelay`, sob o header
-  original (nunca reescreve `source_id`/`timestamp_us`). `COMMAND_REQUEST`/`TERMINAL_IN`
-  vindos do cliente rodam via `ShellConfig::runLine` com identidade `"serial"` (mesmo
-  perímetro de confiança do console físico) e respondem `COMMAND_RESULT`/`TERMINAL_OUT`.
+- **Canais**: desde o tópico 28 o tráfego do rádio **sobe por padrão**. `EspNowConfig` lê só
+  o envelope de cada datagrama e consulta `bally::dongle_consumes()`
+  (`include/bally_channels.h`, a única cópia dessa lista); o que não está na lista vai para o
+  cliente **verbatim, fragmento por fragmento**, via `SerialMux::relayUp` — sem remontar e sem
+  recodificar (o `ProtocolRouter` saiu do caminho de relay). O que o dongle consome, e tudo
+  enquanto a porta ainda é do console, segue o caminho antigo (`ProtocolRouter` +
+  `forwardRelay`). No sentido descendente, um frame do cabo que não é endereçado ao dongle
+  vai para o rádio pelo `SerialMux::relayDown`, resolvendo o destino pelo `HubRegistry`
+  (seção 5.2bis) e por `BtpTransport::lookupPeerMacBySourceId`.
+
+  Nos dois sentidos o relay **nunca reescreve `source_id`, `boot_id` nem `sequence`**: esses
+  três campos *são* o nonce AEAD (`BTP/docs/encryption.md` seção 4), e todo o resto deste
+  firmware re-origina mensagens via `sendLogical` — seguir esse padrão aqui quebraria um selo
+  calculado em outro repositório. Refragmentar, ao contrário do que parece, seria seguro para
+  o selo (o AAD é o header lógico canonicalizado, com `fragment_index`/`fragment_count`/
+  `FRAGMENTED` deliberadamente fora dele); o dongle não refragmenta por vazão e retransmissão,
+  não pelo selo. `test/test_hub_relay` fixa isso.
+
+  `COMMAND_REQUEST`/`TERMINAL_IN` vindos do cliente e endereçados **ao dongle** continuam
+  rodando via `ShellConfig::runLine` com identidade `"serial"` (mesmo perímetro de confiança
+  do console físico) e respondendo `COMMAND_RESULT`/`TERMINAL_OUT`.
   `STATUS` (contadores de `frames_rx/tx`, CRC, decode, etc.) é publicado a cada 2s — desde o
   tópico 17 com `status_version=2` sempre que houver pelo menos um tópico rastreado (ver 7.7).
 - **Saída**: `SESSION_CLOSE` do cliente ou o watchdog (`session_timeout_ms` negociado, sem
@@ -458,7 +529,7 @@ TraceView), seguindo `BTP/docs/TRANSPORT_SERIAL.md`:
 ### 7.7 Assinaturas e controle de taxa (`SubscriptionRegistry`, tópico 17)
 
 O dongle é um agregador, não um repassador: ele nunca encaminha o `SUBSCRIBE` cru de um
-cliente para o robô (`BTP/docs/COMMANDS_AND_ACTIONS.md` seção 7).
+cliente para o robô (`BTP/docs/commands.md` seção 4).
 
 - **Agregação**: `SubscriptionRegistry` mantém uma linha por `(source_id, topic_id)` com o
   conjunto de sessões seriais interessadas (`clientId` = `source_id` do `HELLO` daquela
@@ -480,15 +551,17 @@ cliente para o robô (`BTP/docs/COMMANDS_AND_ACTIONS.md` seção 7).
 - **Contadores e `STATUS` v2**: `SerialMux::forwardRelay` só retransmite `TELEMETRY` de um
   tópico assinado e contabiliza, por `(source_id, topic_id)`, bytes de payload lógico
   encaminhados e amostras descartadas. Esses valores viram registros `topic_status` no
-  `STATUS` com `status_version=2` (seção 8.1) — a desambiguação por `source_id` é obrigatória
+  `STATUS` com `status_version=2` (`commands.md` seção 5.1) — a desambiguação por `source_id` é obrigatória
   porque este dongle relata mais de uma fonte. O bloco v1 de 92 octetos continua idêntico e no
   mesmo offset. Nem o `timestamp_us` nem o schema da telemetria são tocados em nenhum ponto
   desse caminho.
-- **Conflito conhecido na spec**: a seção 8.1 diz "24 octetos" por registro `topic_status`, mas
-  a lista de campos logo abaixo (`uint32 + uint16 + uint16 + uint32 + uint64 + uint64`) soma
-  **28**. Este firmware serializa 28 (os tipos por campo são inequívocos; o "24" é um erro de
-  aritmética no texto) e concentra o valor em `SerialSession::kTopicStatusRecordSize`, com
-  `static_assert`, para realinhar em uma linha caso a spec seja corrigida.
+- **Registro `topic_status` de 28 octetos**: a seção 5.1 do `BTP/docs/commands.md` declara
+  "28 x T" e a lista de campos (`uint32 + uint16 + uint16 + uint32 + uint64 + uint64`) soma
+  **28**, que é o que este firmware serializa. (Uma revisão antiga daquela seção dizia "24
+  octetos" por um erro de aritmética no texto, com os tipos por campo já inequívocos; a spec
+  foi corrigida desde então.) O valor está concentrado em
+  `SerialSession::kTopicStatusRecordSize`, com `static_assert`, para realinhar em uma linha
+  caso o layout mude.
 
 ## 8. LCD Dashboard (`LcdDashboard`)
 
@@ -553,6 +626,7 @@ traduzida pro português por engano — ver CONTRIBUTING.md § 1.
 include/
   config.h              # pinos + BoardConfig::SUDO_PASSWORD
   error_codes.h         # AppError::Code (um range por subsistema)
+  bally_channels.h      # tabela unica de canal/chave (topico 25/30), copia byte-identica em 3 repos
 lib/
   AppRuntime/            # dono dos objetos runtime, setup/loop, tasks FreeRTOS
   ShellConfig/           # bind + registro de módulos + runLine()
@@ -560,11 +634,17 @@ lib/
   ShellAliases/          # tabela de atalhos de comando
   DongleCommands/ EspNowCommands/ DatabaseCommands/ SudoCommands/ HelpCommands/
   EspNowManager/          # registry de peers + envio/recepção de bytes crus (sem BTP)
-  BtpTransport/           # identidade BTP, sequência, envio fragmentado, COMMAND envelope
+  BtpTransport/           # identidade BTP, sequência, envio fragmentado+selado, COMMAND envelope
+  DongleKeyStore/         # deriva/guarda a chave L (PBKDF2, puro C++, testável em env:native)
+  RadioSeal/              # unico ponto que chama btp::aead -- seal/open do canal C (so Arduino)
   ProtocolRouter/         # decode BTP + CRC + reassembly compartilhado (puro C++)
+  HubRegistry/            # tabela de vinculo filho-do-console -> robo (tópico 28)
+  HubRelay/               # classifica ingresso do rádio e reenquadra sem reoriginar (tópico 28)
+  DonglePublisher/        # manifesto e telemetria própria do dongle (hub.link/hub.usb/hub.peers)
   EspNowConfig/           # callbacks ESP-NOW, filas priorizadas por tipo, heartbeat, exec remota
   SerialSession/          # estado console/handshake BTP v1 da sessão serial (puro C++)
   SerialMux/              # unico escritor da serial no modo protocolado: COBS + filas FreeRTOS
+  UsbHidMux/              # segundo interface USB (HID), spike de eco (tópico 20, sem BTP real)
   ManifestCache/          # cache/agregação de MANIFEST_DATA por source_id (puro C++)
   SubscriptionRegistry/   # agregação de assinaturas e contadores por tópico (puro C++)
   DatabaseStore/                 # schema SQLite e leituras/gravações
@@ -580,21 +660,28 @@ scripts/
   check_user_text.py    # so para env:native (audita convencao pt-br/ingles, ver CONTRIBUTING.md #1)
 test/
   test_tablelinker/      # demo antiga do TinyShell, hardware-only
-  test_protocol_router/  # BTP vs. vetores canônicos, roda em env:native
+  test_protocol_router/  # BTP vs. vetores canônicos + plumbing de selagem, roda em env:native
   test_serial_session/   # handshake/COBS/estresse da sessão serial, roda em env:native
   test_subscription_registry/  # agregação de assinaturas + STATUS v2, roda em env:native
+  test_dongle_publisher/ # serialização hub.link/hub.usb/hub.peers + manifesto, roda em env:native
+  test_hub_relay/        # ingresso/relay verbatim + vínculo (tópico 28), roda em env:native
+  test_dongle_key_store/ # PBKDF2 vs. vetor de provision_key.py (tópico 29/30), roda em env:native
 platformio.ini
 CONTRIBUTING.md
 ```
 
 ## 12. Limitações conhecidas
 
-- ESP-NOW sem criptografia por padrão (`encrypt=false`)
+- ESP-NOW em si roda sem criptografia de link própria (`encrypt=false`) — desde o tópico 30
+  isso não deixa o canal C em claro: todo tráfego dongle↔robô é selado por cima com
+  AES-128-GCM (chave L, ver seção 5.2bis). O canal B (TraceView↔robô) permanece cifra do
+  robô ao TraceView, e nunca deste dongle — ele repassa sem conseguir ler.
 - sem retry automático de envio após timeout de callback
 - limite de peers em memória: `MAX_DEVICES = 16`
-- payload reassemblado limitado a `ProtocolRouter::kMaxPayloadSize` (600 bytes; cobre um
-  `COMMAND_REQUEST` de texto completo com folga) — mensagem maior que isso é rejeitada
-  como `MessageTooLarge` antes de virar `RoutedMessage`
+- payload reassemblado limitado a `ProtocolRouter::kMaxPayloadSize` (616 bytes desde o
+  tópico 30 — os 600 de `BtpTransport::kMaxLogicalPayloadSize` mais os 16 octetos da tag
+  AEAD do canal C; cobre um `COMMAND_REQUEST` de texto completo com folga) — mensagem maior
+  que isso é rejeitada como `MessageTooLarge` antes de virar `RoutedMessage`
 - `espnow -send_to`/`-send_all` só conseguem endereçar um peer do qual já recebemos alguma
   mensagem BTP (não há handshake HELLO ainda, tópico 16, pra descobrir `boot_id` de outra
   forma) — o antigo alias de broadcast `000` foi removido por isso
@@ -622,9 +709,9 @@ CONTRIBUTING.md
   robô morre pelo lease dele, não por comando
 - a taxa efetiva no `SUBSCRIBE_RESULT` respondido ao cliente é a do clamp local (schema
   cacheado); a taxa que o robô realmente concedeu só aparece no `topic_status` do `STATUS` v2
-- `SerialSession::kTopicStatusRecordSize` vale 28, não os "24 octetos" que a seção 8.1 do
-  `COMMANDS_AND_ACTIONS.md` afirma — a soma dos campos declarados na própria seção dá 28 (ver
-  7.7); se a spec for corrigida para outro layout, é essa constante que muda
+- `SerialSession::kTopicStatusRecordSize` vale 28, igual ao que a seção 5.1 do
+  `BTP/docs/commands.md` declara hoje (uma revisão antiga daquela seção dizia "24 octetos", ver
+  7.7); se o layout mudar, é essa constante que muda
 - banco em arquivo local no SD (sujeito a falhas de cartão/contato)
 - senha do `sudo` é uma constante compilada — trocar exige reflash; qualquer peer
   cadastrado que souber a senha tem controle total do dongle (ver seção 7.5)

@@ -5,7 +5,7 @@
 
 /**
  * @brief Dongle-side aggregator for BTP v1 SUBSCRIBE/UNSUBSCRIBE
- * (bally_protocol/docs/COMMANDS_AND_ACTIONS.md section 7), topico 17.
+ * (BTP/docs/commands.md section 4), topico 17.
  *
  * One row per (source_id, topic_id) a desktop client has ever asked this
  * dongle for. Each row keeps its own small table of desktop-side
@@ -28,7 +28,7 @@
  * performs the actual send and tells this module the ESP-NOW sequence it
  * used (noteUpstreamRequestSent) so the eventual SUBSCRIBE_RESULT/
  * UNSUBSCRIBE_RESULT (correlated only by reply_to_sequence on the wire, see
- * COMMANDS_AND_ACTIONS.md section 7 -- there is no topic_id in *_RESULT) can
+ * commands.md section 4 -- there is no topic_id in *_RESULT) can
  * be matched back to a row.
  */
 namespace SubscriptionRegistry {
@@ -53,8 +53,8 @@ constexpr std::uint32_t kMaxLeaseMs = 300000U;  // 5 minutes, mirrors bally_soft
 
 // The upstream SUBSCRIBE is re-sent once this fraction of the granted lease
 // has elapsed, so the robot's own lease never expires under a desktop client
-// that is still renewing (COMMANDS_AND_ACTIONS.md section 7: "a assinatura
-// expira apos o lease se nao for renovada por novo SUBSCRIBE"). Halfway gives
+// that is still renewing (commands.md section 4: "a subscription expires
+// after its lease unless renewed by another SUBSCRIBE"). Halfway gives
 // one free retry before the robot would drop the topic, without turning every
 // desktop renewal into an ESP-NOW frame (topico 17 PASSO 7: rate limiting
 // must not flood).
@@ -92,16 +92,16 @@ struct DesktopSubscribeOutcome {
 // clientId identifies the desktop session (see class comment). Repeating the
 // same (clientId, sourceId, topicId, requestedRateMillihz, requestedLeaseMs)
 // while that exact subscription is still active returns the same
-// subscriptionId, matching COMMANDS_AND_ACTIONS.md section 7's "retorna a
-// mesma assinatura sem criar outra".
+// subscriptionId, matching commands.md section 4's "returns the same
+// subscription rather than creating another".
 DesktopSubscribeOutcome onDesktopSubscribe(std::uint32_t clientId, std::uint32_t sourceId, std::uint32_t topicId,
                                            std::uint32_t requestedRateMillihz, std::uint32_t requestedLeaseMs,
                                            std::uint32_t nowMs) noexcept;
 
 struct DesktopUnsubscribeOutcome {
-    // Matches COMMANDS_AND_ACTIONS.md section 7's "remover uma assinatura ja
-    // ausente retorna SUCCESS/NONE" -- `found` is informational only, never
-    // turned into an error by the caller.
+    // Matches commands.md section 4's "removing an already-absent
+    // subscription returns SUCCESS/NONE" -- `found` is informational only,
+    // never turned into an error by the caller.
     bool found = false;
     // Unsubscribe only when the row lost its last consumer; Subscribe (with a
     // lower rateMillihz) when other consumers remain but the departing one was
@@ -136,7 +136,7 @@ void noteUpstreamRequestSent(std::uint32_t sourceId, std::uint32_t topicId, std:
 // (used for STATUS reporting and as this dongle's own effective-rate ceiling
 // going forward) and the robot-assigned upstreamSubscriptionId (needed to
 // address a later upstream UNSUBSCRIBE at the right subscription -- see
-// COMMANDS_AND_ACTIONS.md section 7's UNSUBSCRIBE payload, which targets a
+// commands.md section 4's UNSUBSCRIBE payload, which targets a
 // subscription_id, not a topic_id). Returns false when no row's last
 // outstanding request matches (stale/unsolicited reply, silently ignored by
 // the caller).
@@ -163,6 +163,24 @@ void recordDropped(std::uint32_t sourceId, std::uint32_t topicId) noexcept;
 // hasn't landed yet).
 bool isWanted(std::uint32_t sourceId, std::uint32_t topicId) noexcept;
 
+// True only when this registry KNOWS about (sourceId, topicId) and every
+// subscriber for it has gone away. An unknown pair answers false, which is the
+// whole difference from !isWanted().
+//
+// That difference is what the relay gate needs once subscriptions live on the
+// endpoint channel instead of this one. A desktop that subscribes directly at
+// a robot never tells this dongle about it, so every topic looks unknown here
+// -- and !isWanted() would then drop ALL telemetry rather than the topic
+// nobody asked for. Relaying by default is also the rule the hub follows
+// everywhere else: what the hub was not told about goes up, where it is
+// visible, instead of disappearing here.
+//
+// What this still catches is the case the gate was added for: a sample that
+// was already in flight when the last chart closed, for a topic this dongle
+// does know about. It also keeps working unchanged for topics subscribed
+// through the dongle itself, such as its own hub.* ones.
+bool isKnownUnwanted(std::uint32_t sourceId, std::uint32_t topicId) noexcept;
+
 struct TopicStatusEntry {
     std::uint32_t sourceId = 0U;
     std::uint16_t topicId = 0U;
@@ -172,7 +190,7 @@ struct TopicStatusEntry {
     std::uint64_t samplesDroppedTotal = 0U;
 };
 
-// Snapshot for STATUS v2 (COMMANDS_AND_ACTIONS.md section 8.1). Only rows
+// Snapshot for STATUS v2 (commands.md section 5.1). Only rows
 // that have ever seen at least one desktop subscription are included.
 std::size_t topicStatusSnapshot(TopicStatusEntry* out, std::size_t maxOut) noexcept;
 

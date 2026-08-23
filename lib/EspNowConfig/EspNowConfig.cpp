@@ -1,11 +1,12 @@
 #include "EspNowConfig.h"
 #include "LcdDashboard.h"
 #include "ManifestCache.h"
+#include "HubRelay.h"
 #include "SerialMux.h"
 #include "ShellConfig.h"
 #include "ShellOutput.h"
-#include "SubscriptionRegistry.h"
 #include "BtpTransport.h"
+#include "RadioSeal.h"
 
 #include <cstdio>
 #include <cstring>
@@ -30,11 +31,51 @@ QueueHandle_t g_telemetryQueue = nullptr;
 QueueHandle_t g_terminalQueue = nullptr;
 QueueHandle_t g_controlQueue = nullptr;
 
-volatile uint32_t g_droppedRxCount = 0;      // raw datagram queue full
-volatile uint32_t g_droppedDecodeCount = 0;  // ProtocolRouter: bad envelope
-volatile uint32_t g_droppedCrcCount = 0;     // ProtocolRouter: CRC mismatch
-volatile uint32_t g_droppedReassemblyCount = 0; // ProtocolRouter: reassembly conflict/timeout/etc
-volatile uint32_t g_droppedQueueFullCount = 0;  // routed message, but its type queue was full
+// Cumulative counters, never cleared by a read. The takeDropped*Count()
+// accessors below keep their original "delta since my last call" contract by
+// remembering their own watermark instead of zeroing the counter -- the LCD
+// dashboard consumes those deltas every tick (AppRuntime::
+// flushPendingEspNowOutput), so a counter it clears is useless for measuring
+// a rate. peekRxCounters() reads the totals and clears nothing, which is what
+// makes "difference two snapshots, divide by the interval" possible.
+//
+// The totals count from the last enableAsyncRx() (see the reset there), which
+// is a well-defined epoch: the dongle's own boot, in practice.
+volatile uint32_t g_droppedRxTotal = 0;         // raw datagram queue full
+volatile uint32_t g_droppedDecodeTotal = 0;     // ProtocolRouter: bad envelope
+volatile uint32_t g_droppedCrcTotal = 0;        // ProtocolRouter: CRC mismatch
+volatile uint32_t g_droppedReassemblyTotal = 0; // ProtocolRouter: reassembly conflict/timeout/etc
+volatile uint32_t g_droppedQueueFullTotal = 0;  // routed message, but its type queue was full
+// Topico 30: a consumed (channel C) message that did not open under key L --
+// no key configured, missing ENCRYPTED, wrong cipher, or a TagMismatch. This
+// is the counter "recusado e contado" (a forged frame is refused AND
+// counted) points at; unlike the five above it is not part of the wire
+// schema (RxCounters/hub.link) -- see the comment at
+// processRxDatagramInternal's open() call for why that scope stays out of
+// this topic.
+volatile uint32_t g_droppedAuthTotal = 0;
+
+// Watermarks for the takeDropped*Count() deltas. Unsigned subtraction against
+// the total stays correct across a 32-bit wrap.
+volatile uint32_t g_droppedRxTaken = 0;
+volatile uint32_t g_droppedDecodeTaken = 0;
+volatile uint32_t g_droppedCrcTaken = 0;
+volatile uint32_t g_droppedReassemblyTaken = 0;
+volatile uint32_t g_droppedQueueFullTaken = 0;
+volatile uint32_t g_droppedAuthTaken = 0;
+
+// Ingress counters: the g_dropped*Total set above only ever answered "what was
+// lost", which is not enough to compute a rate -- nothing counted what came
+// through. These do, at the two points that matter: every datagram the radio
+// handed us, and every complete logical message the router published, by type.
+volatile uint32_t g_rxDatagramTotal = 0;        // datagrams handed to ProtocolRouter
+volatile uint32_t g_fragmentAcceptedTotal = 0;  // fragment stored, message not complete yet
+volatile uint32_t g_routedTelemetryTotal = 0;
+volatile uint32_t g_routedLogTotal = 0;
+volatile uint32_t g_routedCommandTotal = 0;
+volatile uint32_t g_routedControlTotal = 0;
+volatile uint32_t g_routedTerminalTotal = 0;
+
 bool g_asyncRxEnabled = false;
 
 // Heartbeat target: last peer we received real data from.
@@ -71,8 +112,11 @@ void primeManifestIfNeeded(const uint8_t mac[6], const btp::Header& header) {
     }
 
     const uint64_t timestampUs = static_cast<uint64_t>(nowMs) * 1000ULL;
+    // Topico 30: this priming request is dongle<->robot, channel C, key L --
+    // sealed like every other message this file originates over the radio.
     BtpTransport::sendLogical(sendViaManager, g_manager, mac, btp::MessageType::Control,
-                              ManifestCache::kManifestRequestObjectId, requestPayload, requestSize, timestampUs);
+                              ManifestCache::kManifestRequestObjectId, requestPayload, requestSize,
+                              timestampUs, RadioSeal::seal, nullptr);
 }
 
 // "state changed: SETUP -> WAIT" style lines emitted by the robot's Logger.
@@ -106,23 +150,6 @@ bool tryExtractRobotState(const char* text, String& outState) {
 
 void macToText(const uint8_t mac[6], char out[18]) {
     std::snprintf(out, 18, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-}
-
-void writeU16Le(uint8_t* out, uint16_t value) {
-    out[0] = static_cast<uint8_t>(value);
-    out[1] = static_cast<uint8_t>(value >> 8U);
-}
-
-void writeU32Le(uint8_t* out, uint32_t value) {
-    out[0] = static_cast<uint8_t>(value);
-    out[1] = static_cast<uint8_t>(value >> 8U);
-    out[2] = static_cast<uint8_t>(value >> 16U);
-    out[3] = static_cast<uint8_t>(value >> 24U);
-}
-
-uint32_t readU32Le(const uint8_t* data) {
-    return static_cast<uint32_t>(data[0]) | (static_cast<uint32_t>(data[1]) << 8U) |
-           (static_cast<uint32_t>(data[2]) << 16U) | (static_cast<uint32_t>(data[3]) << 24U);
 }
 
 // Copies a routed payload into a NUL-terminated stack buffer for display
@@ -161,13 +188,13 @@ bool enqueueRouted(QueueHandle_t queue, const ProtocolRouter::RoutedMessage& rou
         return true;
     }
 
-    ++g_droppedQueueFullCount;
+    ++g_droppedQueueFullTotal;
     return false;
 }
 
 // Sends one COMMAND_RESULT back to the requester, correlated by the original
-// request's (source_id, boot_id, sequence) per bally_protocol/docs/
-// COMMANDS_AND_ACTIONS.md section 2.
+// request's (source_id, boot_id, sequence) per BTP/docs/commands.md
+// section 1's request reference.
 void replyCommandResult(
     const uint8_t mac[6],
     const btp::Header& requestHeader,
@@ -196,9 +223,11 @@ void replyCommandResult(
     }
 
     const uint64_t timestampUs = static_cast<uint64_t>(millis()) * 1000ULL;
+    // Topico 30: a COMMAND_RESULT this dongle originates (answering a
+    // COMMAND_REQUEST a peer sent it) is channel C, same as the request.
     BtpTransport::sendLogical(sendViaManager, g_manager, mac, btp::MessageType::Command,
                               BtpTransport::btp_command::kCommandResultObjectId,
-                              resultPayload, resultSize, timestampUs);
+                              resultPayload, resultSize, timestampUs, RadioSeal::seal, nullptr);
 }
 
 // A peer we sent a COMMAND_REQUEST to (espnow -send_to/-send_all) replying
@@ -296,11 +325,29 @@ void handleRoutedCommand(const uint8_t mac[6], const ProtocolRouter::RoutedMessa
         handleRoutedCommandRequest(mac, routed);
         return;
     }
-    // Reserved COMMAND object_id (bally_protocol/docs/COMMANDS_AND_ACTIONS.md
-    // section 3.1): a v1 receiver MUST reject it without reinterpreting it.
+    // Reserved COMMAND object_id (BTP/docs/commands.md section 1's
+    // `object_id` namespaces): a v1 receiver MUST reject it without
+    // reinterpreting it.
+}
+
+// Counts one complete logical message per type. Sits here rather than inside
+// queueForType() because COMMAND never reaches a queue (handled synchronously)
+// and would otherwise be the one type with no ingress number.
+void countRouted(btp::MessageType type) {
+    switch (type) {
+        case btp::MessageType::Telemetry: ++g_routedTelemetryTotal; break;
+        case btp::MessageType::Log:       ++g_routedLogTotal; break;
+        case btp::MessageType::Command:   ++g_routedCommandTotal; break;
+        case btp::MessageType::Control:   ++g_routedControlTotal; break;
+        case btp::MessageType::Terminal:  ++g_routedTerminalTotal; break;
+        case btp::MessageType::Invalid:
+        default: break;
+    }
 }
 
 void dispatchRouted(const uint8_t mac[6], const ProtocolRouter::RoutedMessage& routed) {
+    countRouted(routed.header.type);
+
     if (routed.header.type == btp::MessageType::Command) {
         // Latency sensitive (remote shell execution): handled synchronously,
         // not queued -- see EspNowConfig.h for the rationale.
@@ -312,26 +359,93 @@ void dispatchRouted(const uint8_t mac[6], const ProtocolRouter::RoutedMessage& r
     enqueueRouted(queue, routed);
 }
 
+// Topico 28, upstream half: the radio's ingress rule, inverted.
+//
+// Before this, every datagram was decoded, reassembled and dispatched by
+// type, and only a couple of types found a consumer at the end of that -- so
+// a handler left empty swallowed a whole MessageType in silence
+// (handleTerminalItem was exactly that: the robot's terminal output never
+// arrived anywhere, and nobody noticed).
+//
+// The rule now is the hub's: EVERYTHING goes up to the console except the
+// short, explicit list in bally::dongle_consumes() (bally_channels.h, the one
+// place that list is written). Forgetting to add something to it makes the
+// message arrive at the console -- visible and harmless -- instead of
+// disappearing.
+//
+// Only the 36-octet envelope is read to decide, which is what lets this work
+// on traffic the dongle holds no key for: BTP encrypts the payload and never
+// the header (docs/encryption.md section 5 -- the header is the AAD).
+// ProtocolRouter is off the relay path entirely and stays only for what the
+// dongle actually consumes (D5).
 void processRxDatagramInternal(const uint8_t mac[6], const uint8_t* data, size_t len) {
     if (g_lcdDashboard != nullptr) {
         g_lcdDashboard->notifyRx();
     }
 
+    ++g_rxDatagramTotal;
+
+    const HubRelay::RadioIngress ingress = HubRelay::classifyRadio(data, len, BtpTransport::sourceId());
+    if (ingress.error != btp::Error::Ok) {
+        if (ingress.error == btp::Error::CrcMismatch) {
+            ++g_droppedCrcTotal;
+        } else {
+            ++g_droppedDecodeTotal;
+        }
+        return;
+    }
+
+    // Learned from every datagram, consumed or not: lookupPeerMacBySourceId
+    // is how the DOWNSTREAM relay finds a robot's MAC (SerialMux::relayDown),
+    // so a robot the dongle only ever relays for still has to be addressable.
+    if (mac != nullptr) {
+        std::memcpy(g_heartbeatTargetMac, mac, sizeof(g_heartbeatTargetMac));
+        g_hasHeartbeatTarget = true;
+        BtpTransport::rememberPeer(mac, ingress.header.source_id, ingress.header.boot_id, millis());
+
+        if (g_manager != nullptr && g_manager->deviceIndexByMac(mac) < 0) {
+            char autoName[24] = {0};
+            std::snprintf(autoName, sizeof(autoName), "peer-%02X%02X", mac[4], mac[5]);
+            g_manager->addDevice(mac, autoName, "adicionado automaticamente por RX ESP-NOW");
+        }
+    }
+
+    // Counted by type here rather than after routing, because a relayed
+    // datagram never reaches countRouted(): this is one fragment, not one
+    // logical message, so `espnow -stats` now reads as radio ingress per
+    // type instead of completed messages per type.
+    if (!ingress.consume && SerialMux::isProtocolled()) {
+        countRouted(ingress.header.type);
+        SerialMux::relayUp(ingress.header, data, len);
+        return;
+    }
+
+    // Consumed, or nobody upstream to relay to. With the port still
+    // console-owned the relay has no destination at all, so the pre-hub local
+    // path stays in charge -- that is what keeps LOG lines on the console,
+    // the LCD's robot-state tile alive and the manifest cache warm while a
+    // human is at the bench. It is what "relay" degrades to with no consumer,
+    // not a second consume list.
     ProtocolRouter::RoutedMessage routed{};
     const ProtocolRouter::Outcome outcome = g_router.submit(mac, data, len, millis(), &routed);
 
     switch (outcome) {
         case ProtocolRouter::Outcome::DroppedDecode:
-            ++g_droppedDecodeCount;
+            ++g_droppedDecodeTotal;
             return;
         case ProtocolRouter::Outcome::DroppedCrc:
-            ++g_droppedCrcCount;
+            ++g_droppedCrcTotal;
             return;
         case ProtocolRouter::Outcome::DroppedReassembly:
-            ++g_droppedReassemblyCount;
+            ++g_droppedReassemblyTotal;
+            return;
+        case ProtocolRouter::Outcome::FragmentAccepted:
+            // Not a loss and not yet a message: counted on its own so the
+            // ratio datagrams/routed can be read as "how much of the traffic
+            // is fragmentation overhead" instead of looking like a leak.
+            ++g_fragmentAcceptedTotal;
             return;
         case ProtocolRouter::Outcome::DroppedInvalidArgument:
-        case ProtocolRouter::Outcome::FragmentAccepted:
         case ProtocolRouter::Outcome::DuplicateFragment:
             return;
         case ProtocolRouter::Outcome::Routed:
@@ -339,16 +453,39 @@ void processRxDatagramInternal(const uint8_t mac[6], const uint8_t* data, size_t
     }
 
     if (mac != nullptr) {
-        std::memcpy(g_heartbeatTargetMac, mac, sizeof(g_heartbeatTargetMac));
-        g_hasHeartbeatTarget = true;
-        BtpTransport::rememberPeer(mac, routed.header.source_id, routed.header.boot_id);
         primeManifestIfNeeded(mac, routed.header);
     }
 
-    if (mac != nullptr && g_manager != nullptr && g_manager->deviceIndexByMac(mac) < 0) {
-        char autoName[24] = {0};
-        std::snprintf(autoName, sizeof(autoName), "peer-%02X%02X", mac[4], mac[5]);
-        g_manager->addDevice(mac, autoName, "adicionado automaticamente por RX ESP-NOW");
+    // Topico 30: everything that reached here via `ingress.consume` is
+    // channel C (dongle<->robot, key L) -- heartbeat/presence STATUS, or a
+    // COMMAND addressed to this dongle. It must open under key L before any
+    // handler sees it; the "nobody to relay to" fallback below (a robot's
+    // LOG/TELEMETRY/etc routed locally only because no client is attached,
+    // topico 28's console-owned path) is channel B content this dongle
+    // never holds the key for, and stays untouched -- opening it here would
+    // both fail (wrong key) and be architecturally wrong (bally_channels.h:
+    // "the hub holds key L, never any robot's key E").
+    if (ingress.consume) {
+        uint8_t plaintext[ProtocolRouter::kMaxPayloadSize];
+        const bool opened = routed.payloadSize >= RadioSeal::kTagSize &&
+            RadioSeal::open(routed.header, static_cast<uint16_t>(routed.payloadSize), routed.payload,
+                            plaintext);
+
+        // Real, bidirectional evidence of who holds key L -- stronger than
+        // the heartbeat's own radio-layer ACK (EspNowConfig.h's heartbeatTick
+        // doc comment). A peer that cannot produce an openable frame is
+        // marked not-online even if its heartbeat replies keep ACKing.
+        if (mac != nullptr) {
+            BtpTransport::notePeerLinkResult(mac, opened);
+        }
+
+        if (!opened) {
+            ++g_droppedAuthTotal;
+            return;
+        }
+
+        routed.payloadSize -= RadioSeal::kTagSize;
+        std::memcpy(routed.payload, plaintext, routed.payloadSize);
     }
 
     dispatchRouted(mac, routed);
@@ -370,7 +507,7 @@ void onDataRecv(const uint8_t* mac, const uint8_t* data, size_t len) {
             return;
         }
 
-        ++g_droppedRxCount;
+        ++g_droppedRxTotal;
         return;
     }
 
@@ -410,7 +547,7 @@ void handleLogItem(const ProtocolRouter::RoutedMessage& routed) {
     // Plain human console: unchanged behavior, print as before. Protocolled
     // session (topico 13): relay the original LOG frame verbatim to the
     // desktop instead -- printing here would leak raw console text onto a
-    // port SerialMux owns exclusively (TRANSPORT_SERIAL.md section 7).
+    // port SerialMux owns exclusively (session-and-terminal.md sections 3-4).
     if (SerialMux::isConsoleOwned()) {
         if (g_io != nullptr) {
             char tag[16] = {0};
@@ -432,37 +569,30 @@ void handleTelemetryItem(const ProtocolRouter::RoutedMessage& routed) {
     SerialMux::forwardRelay(routed.header, routed.payload, routed.payloadSize);
 }
 
-// TERMINAL_IN/OUT protocol handling belongs to topico 19; drop for now.
+// This empty handler is the bug D6 was written against: a whole MessageType
+// swallowed in silence, so the robot's terminal output never arrived
+// anywhere and nobody noticed. Since topico 28 TERMINAL is relayed straight
+// off the radio and never reaches this queue while a client is attached; what
+// is left here only runs with the port console-owned, where a robot's
+// terminal stream has no reader by definition.
 void handleTerminalItem(const ProtocolRouter::RoutedMessage&) {}
 
-// A robot answering a MANIFEST_REQUEST (topico 16) or SUBSCRIBE/UNSUBSCRIBE
-// (topico 17) this dongle sent it. Any other CONTROL object_id received over
-// ESP-NOW (a stray HELLO, a reserved id) is ignored -- robots never
-// originate MANIFEST_REQUEST or STATUS toward this dongle in this topic.
+// A robot answering a MANIFEST_REQUEST this dongle sent it (topico 16). Only
+// reachable on the console-owned fallback path since topico 28 -- with a
+// desktop attached, CONTROL that is not on bally::dongle_consumes' list is
+// relayed and never routed. Any other CONTROL object_id is ignored.
 void handleControlItem(const ProtocolRouter::RoutedMessage& routed) {
     if (routed.header.object_id == ManifestCache::kManifestDataObjectId) {
         ManifestCache::ingestManifestData({routed.payload, routed.payloadSize}, millis());
         return;
     }
-    if (routed.header.object_id == SubscriptionRegistry::kSubscribeResultObjectId) {
-        // COMMANDS_AND_ACTIONS.md section 7: ref(12) + status(1) +
-        // reserved(1) + error_code(2) + subscription_id(4) +
-        // effective_rate_millihz(4) + granted_lease_ms(4) = 28 bytes.
-        if (routed.payloadSize < 24U) return;
-        const uint32_t replyToSequence = readU32Le(routed.payload + 8U);
-        const uint8_t status = routed.payload[12];
-        const uint32_t subscriptionId = readU32Le(routed.payload + 16U);
-        const uint32_t effectiveRateMillihz = readU32Le(routed.payload + 20U);
-        SubscriptionRegistry::onUpstreamSubscribeResult(replyToSequence, status, subscriptionId,
-                                                        effectiveRateMillihz);
-        return;
-    }
-    // UNSUBSCRIBE_RESULT (object_id 0x0008) carries only the reference triple
-    // + status/error_code; this dongle already cleared its local grant the
-    // moment it decided to send the upstream UNSUBSCRIBE (see
-    // SubscriptionRegistry::onDesktopUnsubscribe/onClientDisconnected/
-    // expireLeases), so there is nothing further to update here even on
-    // success. Intentionally not parsed further.
+    // SUBSCRIBE_RESULT/UNSUBSCRIBE_RESULT used to be folded into
+    // SubscriptionRegistry here, correlating the upstream request this dongle
+    // had merged on its clients' behalf. Topico 28 removed that: a robot's
+    // subscriptions are channel B now -- TraceView subscribes at the robot
+    // and the robot arbitrates per session -- so the dongle neither asks nor
+    // has anything to correlate, and the answer belongs to the client, which
+    // gets it verbatim through the relay.
 }
 
 } // namespace
@@ -510,11 +640,27 @@ bool enableAsyncRx(size_t queueDepth) {
     xQueueReset(g_telemetryQueue);
     xQueueReset(g_terminalQueue);
     xQueueReset(g_controlQueue);
-    g_droppedRxCount = 0;
-    g_droppedDecodeCount = 0;
-    g_droppedCrcCount = 0;
-    g_droppedReassemblyCount = 0;
-    g_droppedQueueFullCount = 0;
+    // Totals and their watermarks are cleared together, so the deltas
+    // takeDropped*Count() reports stay consistent across the reset.
+    g_droppedRxTotal = 0;
+    g_droppedDecodeTotal = 0;
+    g_droppedCrcTotal = 0;
+    g_droppedReassemblyTotal = 0;
+    g_droppedQueueFullTotal = 0;
+    g_droppedAuthTotal = 0;
+    g_droppedRxTaken = 0;
+    g_droppedDecodeTaken = 0;
+    g_droppedCrcTaken = 0;
+    g_droppedReassemblyTaken = 0;
+    g_droppedQueueFullTaken = 0;
+    g_droppedAuthTaken = 0;
+    g_rxDatagramTotal = 0;
+    g_fragmentAcceptedTotal = 0;
+    g_routedTelemetryTotal = 0;
+    g_routedLogTotal = 0;
+    g_routedCommandTotal = 0;
+    g_routedControlTotal = 0;
+    g_routedTerminalTotal = 0;
     g_asyncRxEnabled = true;
     return true;
 }
@@ -550,34 +696,68 @@ size_t drainRoutedQueues(size_t maxItemsPerQueue) {
     return total;
 }
 
+// Each of these returns what accumulated since its own last call, exactly as
+// before -- the counter itself is no longer cleared (see the comment on the
+// g_dropped*Total block), only this accessor's watermark advances.
 uint32_t takeDroppedRxCount() {
-    const uint32_t dropped = g_droppedRxCount;
-    g_droppedRxCount = 0;
-    return dropped;
+    const uint32_t total = g_droppedRxTotal;
+    const uint32_t delta = total - g_droppedRxTaken;
+    g_droppedRxTaken = total;
+    return delta;
 }
 
 uint32_t takeDroppedDecodeCount() {
-    const uint32_t dropped = g_droppedDecodeCount;
-    g_droppedDecodeCount = 0;
-    return dropped;
+    const uint32_t total = g_droppedDecodeTotal;
+    const uint32_t delta = total - g_droppedDecodeTaken;
+    g_droppedDecodeTaken = total;
+    return delta;
 }
 
 uint32_t takeDroppedCrcCount() {
-    const uint32_t dropped = g_droppedCrcCount;
-    g_droppedCrcCount = 0;
-    return dropped;
+    const uint32_t total = g_droppedCrcTotal;
+    const uint32_t delta = total - g_droppedCrcTaken;
+    g_droppedCrcTaken = total;
+    return delta;
 }
 
 uint32_t takeDroppedReassemblyCount() {
-    const uint32_t dropped = g_droppedReassemblyCount;
-    g_droppedReassemblyCount = 0;
-    return dropped;
+    const uint32_t total = g_droppedReassemblyTotal;
+    const uint32_t delta = total - g_droppedReassemblyTaken;
+    g_droppedReassemblyTaken = total;
+    return delta;
 }
 
 uint32_t takeDroppedQueueFullCount() {
-    const uint32_t dropped = g_droppedQueueFullCount;
-    g_droppedQueueFullCount = 0;
-    return dropped;
+    const uint32_t total = g_droppedQueueFullTotal;
+    const uint32_t delta = total - g_droppedQueueFullTaken;
+    g_droppedQueueFullTaken = total;
+    return delta;
+}
+
+uint32_t takeDroppedAuthCount() {
+    const uint32_t total = g_droppedAuthTotal;
+    const uint32_t delta = total - g_droppedAuthTaken;
+    g_droppedAuthTaken = total;
+    return delta;
+}
+
+uint32_t peekDroppedAuthCount() {
+    return g_droppedAuthTotal;
+}
+
+void peekRxCounters(RxCounters& out) {
+    out.datagrams = g_rxDatagramTotal;
+    out.fragmentsAccepted = g_fragmentAcceptedTotal;
+    out.routedTelemetry = g_routedTelemetryTotal;
+    out.routedLog = g_routedLogTotal;
+    out.routedCommand = g_routedCommandTotal;
+    out.routedControl = g_routedControlTotal;
+    out.routedTerminal = g_routedTerminalTotal;
+    out.droppedRx = g_droppedRxTotal;
+    out.droppedDecode = g_droppedDecodeTotal;
+    out.droppedCrc = g_droppedCrcTotal;
+    out.droppedReassembly = g_droppedReassemblyTotal;
+    out.droppedQueueFull = g_droppedQueueFullTotal;
 }
 
 void heartbeatTick() {
@@ -590,15 +770,19 @@ void heartbeatTick() {
         return;
     }
 
-    uint8_t frame[btp::kV1MinimumFrameSize];
+    // Sealed (topico 30: heartbeat is channel C, key L), so the empty
+    // plaintext still grows into a 16-octet tag on the wire -- the buffer
+    // has to cover that on top of the unsealed minimum.
+    uint8_t frame[btp::kV1MinimumFrameSize + BtpTransport::kAeadTagSize];
     size_t frameSize = 0;
     const uint64_t timestampUs = static_cast<uint64_t>(millis()) * 1000ULL;
-    // STATUS (bally_protocol/docs/COMMANDS_AND_ACTIONS.md 3.2, object_id
-    // 0x0009): "publicação espontânea e não possui resposta" -- an empty
-    // payload is a legitimate liveness probe until topico 17 defines a real
-    // STATUS payload schema.
+    // STATUS (BTP/docs/commands.md section 1's `object_id` namespaces,
+    // object_id 0x0009): "spontaneous and gets no response" (section 5) --
+    // an empty payload is a legitimate liveness probe until topico 17
+    // defines a real STATUS payload schema.
     if (!BtpTransport::encodeSingleFrame(btp::MessageType::Control, 0x0009U, sequence, timestampUs,
-                                         nullptr, 0, frame, sizeof(frame), &frameSize)) {
+                                         nullptr, 0, frame, sizeof(frame), &frameSize,
+                                         RadioSeal::seal, nullptr)) {
         return;
     }
 
@@ -606,75 +790,23 @@ void heartbeatTick() {
     const bool gotStatus = g_manager->sendToMacWithStatus(g_heartbeatTargetMac, frame, frameSize, delivered,
                                                            HEARTBEAT_SEND_TIMEOUT_MS);
 
+    const bool linkOk = gotStatus && delivered;
+
+    // Topico 27: the same verdict, kept per peer as well. Until now it only
+    // lit the LCD's LINK tile -- a single global bit on a screen nobody can
+    // plot; hub.peers publishes it per peer as `online`.
+    BtpTransport::notePeerLinkResult(g_heartbeatTargetMac, linkOk);
+
     if (g_lcdDashboard != nullptr) {
-        g_lcdDashboard->notifyHeartbeat(gotStatus && delivered);
+        g_lcdDashboard->notifyHeartbeat(linkOk);
     }
 }
 
-void requestUpstreamSubscribe(uint32_t sourceId, uint32_t topicId, uint32_t rateMillihz, uint32_t leaseMs) {
-    if (g_manager == nullptr || sourceId == 0 || topicId == 0 || topicId > 0xFFFFU) return;
-
-    uint8_t mac[6] = {0};
-    uint32_t bootId = 0;
-    if (!BtpTransport::lookupPeerMacBySourceId(sourceId, mac, &bootId) || bootId == 0) {
-        return;  // never heard from this robot yet; cannot address it (see EspNowConfig.h)
+bool sendRawToMac(const uint8_t mac[6], const uint8_t* frame, size_t frameSize) {
+    if (g_manager == nullptr || mac == nullptr || frame == nullptr || frameSize == 0) {
+        return false;
     }
-
-    uint32_t sequence = 0;
-    if (!BtpTransport::reserveSequence(&sequence)) return;
-
-    uint8_t payload[20];
-    writeU32Le(payload, sourceId);
-    writeU32Le(payload + 4U, bootId);
-    writeU16Le(payload + 8U, static_cast<uint16_t>(topicId));
-    writeU16Le(payload + 10U, 0U);  // flags, zero in v1
-    writeU32Le(payload + 12U, rateMillihz);
-    writeU32Le(payload + 16U, leaseMs);
-
-    uint8_t frame[btp::kEspNowMaxFrameSize];
-    size_t frameSize = 0;
-    const uint64_t timestampUs = static_cast<uint64_t>(millis()) * 1000ULL;
-    if (!BtpTransport::encodeSingleFrame(btp::MessageType::Control, SubscriptionRegistry::kSubscribeObjectId,
-                                         sequence, timestampUs, payload, sizeof(payload), frame, sizeof(frame),
-                                         &frameSize)) {
-        return;
-    }
-
-    // Remembered before the send so a very fast SUBSCRIBE_RESULT (unlikely
-    // but not impossible) is never missed by a race between send and note.
-    SubscriptionRegistry::noteUpstreamRequestSent(sourceId, topicId, sequence);
-    g_manager->sendToMac(mac, frame, frameSize);
-}
-
-void requestUpstreamUnsubscribe(uint32_t sourceId, uint32_t topicId, uint32_t upstreamSubscriptionId) {
-    (void)topicId;  // UNSUBSCRIBE addresses a subscription_id, not a topic_id (see header comment)
-    if (g_manager == nullptr || sourceId == 0 || upstreamSubscriptionId == 0) {
-        return;  // nothing was ever granted upstream for this topic; no-op
-    }
-
-    uint8_t mac[6] = {0};
-    uint32_t bootId = 0;
-    if (!BtpTransport::lookupPeerMacBySourceId(sourceId, mac, &bootId) || bootId == 0) {
-        return;
-    }
-
-    uint32_t sequence = 0;
-    if (!BtpTransport::reserveSequence(&sequence)) return;
-
-    uint8_t payload[12];
-    writeU32Le(payload, sourceId);
-    writeU32Le(payload + 4U, bootId);
-    writeU32Le(payload + 8U, upstreamSubscriptionId);
-
-    uint8_t frame[btp::kEspNowMaxFrameSize];
-    size_t frameSize = 0;
-    const uint64_t timestampUs = static_cast<uint64_t>(millis()) * 1000ULL;
-    if (!BtpTransport::encodeSingleFrame(btp::MessageType::Control, SubscriptionRegistry::kUnsubscribeObjectId,
-                                         sequence, timestampUs, payload, sizeof(payload), frame, sizeof(frame),
-                                         &frameSize)) {
-        return;
-    }
-    g_manager->sendToMac(mac, frame, frameSize);
+    return g_manager->sendToMac(mac, frame, frameSize);
 }
 
 } // namespace EspNowConfig

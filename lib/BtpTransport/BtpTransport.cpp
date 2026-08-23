@@ -18,6 +18,8 @@ struct PeerIdentity {
     std::uint8_t mac[6] = {0, 0, 0, 0, 0, 0};
     std::uint32_t sourceId = 0U;
     std::uint32_t bootId = 0U;
+    std::uint32_t lastSeenMs = 0U;
+    bool linkOk = false;
 };
 
 PeerIdentity g_peers[kPeerIdentityCapacity];
@@ -91,12 +93,19 @@ bool encodeSingleFrame(btp::MessageType type,
                        std::size_t payloadSize,
                        std::uint8_t* output,
                        std::size_t outputCapacity,
-                       std::size_t* bytesWritten) noexcept {
-    if (sequence == 0U || payloadSize > btp::kEspNowMaxPayloadSize) return false;
+                       std::size_t* bytesWritten,
+                       SealFn seal,
+                       void* sealContext) noexcept {
+    if (sequence == 0U || seal == nullptr) return false;
+    // Bounded before the tag is even considered, so the addition below can
+    // never wrap (payloadSize is at most a few hundred octets in every real
+    // caller).
+    if (payloadSize > btp::kEspNowMaxPayloadSize) return false;
+    if (payloadSize + kAeadTagSize > btp::kEspNowMaxPayloadSize) return false;
 
     const btp::Header header{
         .type = type,
-        .flags = 0U,
+        .flags = btp::kFlagEncrypted,
         .source_id = sourceId(),
         .boot_id = bootId(),
         .sequence = sequence,
@@ -105,7 +114,15 @@ bool encodeSingleFrame(btp::MessageType type,
         .fragment_index = 0U,
         .fragment_count = 1U,
     };
-    const btp::Frame frame{header, {payload, payloadSize}};
+
+    // Sealed once, in place of the plaintext -- see SealFn's contract on why
+    // ENCRYPTED has to already be set on `header` above before this call.
+    std::uint8_t sealed[btp::kEspNowMaxPayloadSize];
+    if (!seal(sealContext, header, static_cast<std::uint16_t>(payloadSize), payload, sealed)) {
+        return false;
+    }
+
+    const btp::Frame frame{header, {sealed, payloadSize + kAeadTagSize}};
     return btp::encode(frame, btp::TransportProfile::EspNow, output, outputCapacity,
                        bytesWritten) == btp::Error::Ok;
 }
@@ -117,33 +134,55 @@ bool sendLogical(SendFn send,
                  std::uint16_t objectId,
                  const std::uint8_t* payload,
                  std::size_t payloadSize,
-                 std::uint64_t timestampUs) noexcept {
-    if (send == nullptr || mac == nullptr || (payload == nullptr && payloadSize != 0U)) return false;
-
-    std::uint8_t count = 0U;
-    if (btp::fragment_count(payloadSize, btp::TransportProfile::EspNow, &count) !=
-        btp::Error::Ok) {
+                 std::uint64_t timestampUs,
+                 SealFn seal,
+                 void* sealContext) noexcept {
+    if (send == nullptr || seal == nullptr || mac == nullptr || (payload == nullptr && payloadSize != 0U)) {
         return false;
     }
+    // Bounds the sealed[] buffer below; every real caller stays well under
+    // this (the largest, a fragmented shell command, tops out around 532).
+    if (payloadSize > kMaxLogicalPayloadSize) return false;
 
     std::uint32_t sequence = 0U;
     if (!reserveSequence(&sequence)) return false;
 
-    const btp::Header logicalHeader{
+    // The header sealing is computed over: canonical (unfragmented) shape,
+    // ENCRYPTED already set so the AAD this produces matches the AAD a
+    // receiver reconstructs from the wire flags. fragment_count is filled in
+    // AFTER sealing, from the SEALED size -- see SealFn's contract.
+    const btp::Header sealHeader{
         .type = type,
-        .flags = static_cast<std::uint16_t>(count > 1U ? btp::kFlagFragmented : 0U),
+        .flags = btp::kFlagEncrypted,
         .source_id = sourceId(),
         .boot_id = bootId(),
         .sequence = sequence,
         .timestamp_us = timestampUs,
         .object_id = objectId,
         .fragment_index = 0U,
-        .fragment_count = count,
+        .fragment_count = 1U,
     };
+
+    std::uint8_t sealed[kMaxLogicalPayloadSize + kAeadTagSize];
+    if (!seal(sealContext, sealHeader, static_cast<std::uint16_t>(payloadSize), payload, sealed)) {
+        return false;
+    }
+    const std::size_t sealedSize = payloadSize + kAeadTagSize;
+
+    std::uint8_t count = 0U;
+    if (btp::fragment_count(sealedSize, btp::TransportProfile::EspNow, &count) !=
+        btp::Error::Ok) {
+        return false;
+    }
+
+    btp::Header logicalHeader = sealHeader;
+    logicalHeader.flags = static_cast<std::uint16_t>(
+        btp::kFlagEncrypted | (count > 1U ? btp::kFlagFragmented : 0U));
+    logicalHeader.fragment_count = count;
 
     for (std::uint8_t index = 0U; index < count; ++index) {
         btp::Frame fragment{};
-        if (btp::make_fragment(logicalHeader, {payload, payloadSize}, btp::TransportProfile::EspNow,
+        if (btp::make_fragment(logicalHeader, {sealed, sealedSize}, btp::TransportProfile::EspNow,
                                index, &fragment) != btp::Error::Ok) {
             return false;
         }
@@ -168,34 +207,51 @@ bool sendLogicalWithStatus(SendWithStatusFn sendWithStatus,
                            std::size_t payloadSize,
                            std::uint64_t timestampUs,
                            bool& outDelivered,
-                           std::uint32_t timeoutMs) noexcept {
+                           std::uint32_t timeoutMs,
+                           SealFn seal,
+                           void* sealContext) noexcept {
     outDelivered = false;
-    if (sendWithStatus == nullptr || mac == nullptr || (payload == nullptr && payloadSize != 0U)) return false;
-
-    std::uint8_t count = 0U;
-    if (btp::fragment_count(payloadSize, btp::TransportProfile::EspNow, &count) != btp::Error::Ok) {
+    if (sendWithStatus == nullptr || seal == nullptr || mac == nullptr ||
+        (payload == nullptr && payloadSize != 0U)) {
         return false;
     }
+    if (payloadSize > kMaxLogicalPayloadSize) return false;
 
     std::uint32_t sequence = 0U;
     if (!reserveSequence(&sequence)) return false;
 
-    const btp::Header logicalHeader{
+    const btp::Header sealHeader{
         .type = type,
-        .flags = static_cast<std::uint16_t>(count > 1U ? btp::kFlagFragmented : 0U),
+        .flags = btp::kFlagEncrypted,
         .source_id = sourceId(),
         .boot_id = bootId(),
         .sequence = sequence,
         .timestamp_us = timestampUs,
         .object_id = objectId,
         .fragment_index = 0U,
-        .fragment_count = count,
+        .fragment_count = 1U,
     };
+
+    std::uint8_t sealed[kMaxLogicalPayloadSize + kAeadTagSize];
+    if (!seal(sealContext, sealHeader, static_cast<std::uint16_t>(payloadSize), payload, sealed)) {
+        return false;
+    }
+    const std::size_t sealedSize = payloadSize + kAeadTagSize;
+
+    std::uint8_t count = 0U;
+    if (btp::fragment_count(sealedSize, btp::TransportProfile::EspNow, &count) != btp::Error::Ok) {
+        return false;
+    }
+
+    btp::Header logicalHeader = sealHeader;
+    logicalHeader.flags = static_cast<std::uint16_t>(
+        btp::kFlagEncrypted | (count > 1U ? btp::kFlagFragmented : 0U));
+    logicalHeader.fragment_count = count;
 
     bool allDelivered = true;
     for (std::uint8_t index = 0U; index < count; ++index) {
         btp::Frame fragment{};
-        if (btp::make_fragment(logicalHeader, {payload, payloadSize}, btp::TransportProfile::EspNow,
+        if (btp::make_fragment(logicalHeader, {sealed, sealedSize}, btp::TransportProfile::EspNow,
                                index, &fragment) != btp::Error::Ok) {
             return false;
         }
@@ -218,13 +274,15 @@ bool sendLogicalWithStatus(SendWithStatusFn sendWithStatus,
     return true;
 }
 
-void rememberPeer(const std::uint8_t mac[6], std::uint32_t sourceId, std::uint32_t bootId) noexcept {
+void rememberPeer(const std::uint8_t mac[6], std::uint32_t sourceId, std::uint32_t bootId,
+                  std::uint32_t nowMs) noexcept {
     if (mac == nullptr || sourceId == 0U || bootId == 0U) return;
 
     for (std::size_t index = 0U; index < kPeerIdentityCapacity; ++index) {
         if (g_peers[index].used && sameMac(g_peers[index].mac, mac)) {
             g_peers[index].sourceId = sourceId;
             g_peers[index].bootId = bootId;
+            g_peers[index].lastSeenMs = nowMs;
             return;
         }
     }
@@ -235,6 +293,10 @@ void rememberPeer(const std::uint8_t mac[6], std::uint32_t sourceId, std::uint32
             std::memcpy(g_peers[index].mac, mac, 6U);
             g_peers[index].sourceId = sourceId;
             g_peers[index].bootId = bootId;
+            g_peers[index].lastSeenMs = nowMs;
+            // A recycled slot must not inherit the previous occupant's
+            // heartbeat verdict: nothing has been probed at this MAC yet.
+            g_peers[index].linkOk = false;
             return;
         }
     }
@@ -246,6 +308,35 @@ void rememberPeer(const std::uint8_t mac[6], std::uint32_t sourceId, std::uint32
     std::memcpy(g_peers[0].mac, mac, 6U);
     g_peers[0].sourceId = sourceId;
     g_peers[0].bootId = bootId;
+    g_peers[0].lastSeenMs = nowMs;
+    g_peers[0].linkOk = false;
+}
+
+void notePeerLinkResult(const std::uint8_t mac[6], bool delivered) noexcept {
+    if (mac == nullptr) return;
+
+    for (std::size_t index = 0U; index < kPeerIdentityCapacity; ++index) {
+        if (g_peers[index].used && sameMac(g_peers[index].mac, mac)) {
+            g_peers[index].linkOk = delivered;
+            return;
+        }
+    }
+}
+
+std::size_t enumeratePeers(PeerSnapshot* out, std::size_t maxOut) noexcept {
+    if (out == nullptr || maxOut == 0U) return 0U;
+
+    std::size_t written = 0U;
+    for (std::size_t index = 0U; index < kPeerIdentityCapacity && written < maxOut; ++index) {
+        if (!g_peers[index].used) continue;
+        std::memcpy(out[written].mac, g_peers[index].mac, 6U);
+        out[written].sourceId = g_peers[index].sourceId;
+        out[written].bootId = g_peers[index].bootId;
+        out[written].lastSeenMs = g_peers[index].lastSeenMs;
+        out[written].linkOk = g_peers[index].linkOk;
+        ++written;
+    }
+    return written;
 }
 
 bool lookupPeer(const std::uint8_t mac[6], std::uint32_t* outSourceId, std::uint32_t* outBootId) noexcept {

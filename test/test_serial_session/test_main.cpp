@@ -35,8 +35,8 @@ using std::uint64_t;
 
 std::vector<std::uint8_t> read_vector(const char* relative_path) {
     const std::string candidates[] = {
-        std::string("../bally_protocol/test-vectors/v1/") + relative_path,
-        std::string("../../bally_protocol/test-vectors/v1/") + relative_path,
+        std::string("../BTP/test-vectors/v1/") + relative_path,
+        std::string("../../BTP/test-vectors/v1/") + relative_path,
     };
     for (const auto& path : candidates) {
         std::ifstream input(path, std::ios::binary);
@@ -103,7 +103,7 @@ std::vector<std::uint8_t> encode_frame(const btp::Header& header, const std::vec
 }
 
 // Wraps encode_frame's bytes in "0x00 || COBS(frame) || 0x00" the same way
-// the real wire link carries them (TRANSPORT_SERIAL.md section 2).
+// the real wire link carries them (fragmentation-and-transports.md 3.2).
 std::vector<std::uint8_t> to_serial_packet(const std::vector<std::uint8_t>& frameBytes) {
     std::vector<std::uint8_t> encoded(btp::kSerialMaxCobsBlockSize);
     std::size_t written = 0U;
@@ -177,7 +177,7 @@ void tearDown() {}
 
 void test_parse_hello_matches_canonical_vector() {
     const std::vector<std::uint8_t> bytes = read_vector("valid/hello.bin");
-    TEST_ASSERT_FALSE_MESSAGE(bytes.empty(), "missing bally_protocol/test-vectors/v1/valid/hello.bin");
+    TEST_ASSERT_FALSE_MESSAGE(bytes.empty(), "missing BTP/test-vectors/v1/valid/hello.bin");
 
     btp::DecodedFrame decoded{};
     const btp::Error error = btp::decode(bytes.data(), bytes.size(), btp::TransportProfile::Serial, &decoded);
@@ -236,7 +236,7 @@ void test_session_accepts_hello_and_negotiates_minimum_limits() {
     TEST_ASSERT_EQUAL_UINT32(0x0C0D0E0FU, session.peerSourceId());
     TEST_ASSERT_EQUAL_UINT32(0x10203040U, session.peerBootId());
 
-    // HELLO_RESULT payload layout (COMMANDS_AND_ACTIONS.md section 5).
+    // HELLO_RESULT payload layout (session-and-terminal.md section 2).
     TEST_ASSERT_EQUAL_UINT32(0x0C0D0E0FU, read_u32(outPayload)); // request_source_id
     TEST_ASSERT_EQUAL_UINT32(0x10203040U, read_u32(outPayload + 4U)); // request_boot_id
     TEST_ASSERT_EQUAL_UINT32(1U, read_u32(outPayload + 8U)); // reply_to_sequence

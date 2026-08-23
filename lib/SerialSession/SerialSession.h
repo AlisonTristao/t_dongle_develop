@@ -8,8 +8,8 @@
 /**
  * @brief Pure C++ (no Arduino/FreeRTOS) state machine for one BTP v1 serial
  * session: Console -> AwaitingHello -> Protocolled, per
- * bally_protocol/docs/TRANSPORT_SERIAL.md section 5-7 and
- * bally_protocol/docs/COMMANDS_AND_ACTIONS.md sections 5, 8 and 10. Also
+ * BTP/docs/session-and-terminal.md sections 1-5 and 7 and
+ * BTP/docs/commands.md section 5. Also
  * builds/parses the small set of CONTROL/logical payloads a session needs
  * (HELLO, HELLO_RESULT, SESSION_CLOSE, SESSION_CLOSE_RESULT, STATUS) and
  * recognizes MANIFEST_REQUEST (topico 16) and SUBSCRIBE/UNSUBSCRIBE
@@ -33,7 +33,7 @@ enum class State : std::uint8_t {
 };
 
 // object_id values this topic understands, within their respective
-// MessageType namespaces (bally_protocol/docs/COMMANDS_AND_ACTIONS.md 3.2/3.3).
+// MessageType namespaces (BTP/docs/commands.md section 1).
 constexpr std::uint16_t kHelloObjectId = 0x0001U;
 constexpr std::uint16_t kHelloResultObjectId = 0x0002U;
 constexpr std::uint16_t kManifestRequestObjectId = 0x0003U;
@@ -51,17 +51,22 @@ constexpr std::uint16_t kTerminalOutObjectId = 0x0002U;
 // This dongle's own advertised capabilities/ceilings for a serial session.
 // Effective limits sent in HELLO_RESULT are min(requested, these).
 struct LocalLimits {
-    std::uint32_t maxLogicalPayload = 700U;      // matches SerialMux's outbound payload cap
+    // Must stay equal to SerialMux's kOutboundPayloadCap: this is the number
+    // HELLO_RESULT promises the desktop, and a MANIFEST_DATA/TELEMETRY frame
+    // larger than what was negotiated is a protocol violation even if the
+    // queues happen to hold it. Raised with that cap by topico 27 so the
+    // dongle's own manifest (1440 octets) fits inside the negotiated limit.
+    std::uint32_t maxLogicalPayload = 1600U;
     std::uint16_t maxInflightReassemblies = 1U;  // topico 13 does not reassemble serial fragments (see deviation note)
     std::uint16_t maxSubscriptions = 8U;         // matches SubscriptionRegistry::kMaxTopics (topico 17)
     std::uint32_t maxDedupEntries = 32U;         // declared; command dedup not implemented on this transport yet
     std::uint32_t sessionTimeoutMs = 15000U;     // watchdog: no valid BTP frame in this window -> back to console
 };
 
-constexpr std::uint32_t kHelloDeadlineMs = 2000U; // COMMANDS_AND_ACTIONS.md section 5
+constexpr std::uint32_t kHelloDeadlineMs = 2000U; // session-and-terminal.md section 3
 
 // Priority classes a caller (SerialMux) uses to pick a send queue, derived
-// from COMMANDS_AND_ACTIONS.md section 12. Classes 2/3 there collapse into
+// from model.md section 6. Classes 2/3 there collapse into
 // kSession/kLogStatus here because this dongle never originates
 // COMMAND_REQUEST or SUBSCRIBE traffic *toward* the desktop in this topic.
 enum class PriorityClass : std::uint8_t {
@@ -151,7 +156,7 @@ constexpr std::size_t kStatusPayloadSize = 92U;
 std::size_t buildStatus(const StatusCounters& counters, std::uint8_t* output,
                         std::size_t outputCapacity) noexcept;
 
-// COMMANDS_AND_ACTIONS.md section 8.1 (topico 17, status_version=2): one
+// commands.md section 5.1 (topico 17, status_version=2): one
 // fixed-size record per (source_id, topic_id) this dongle currently
 // tracks a subscription state for. Kept as a plain wire-shaped struct here
 // (not SubscriptionRegistry::TopicStatusEntry) so this module stays free of
@@ -166,18 +171,16 @@ struct TopicStatusRecord {
     std::uint64_t samplesDroppedTotal = 0U;
 };
 
-// SPEC CONFLICT, resolved here in favour of the field table (documented, not
-// silently patched -- bally_protocol is frozen and was not edited):
-// COMMANDS_AND_ACTIONS.md section 8.1 says "24 x T" and "24 octetos", but the
-// field list it gives right below is source_id(uint32=4) + topic_id(uint16=2)
-// + subscriber_count(uint16=2) + effective_rate_millihz(uint32=4) +
-// bytes_total(uint64=8) + samples_dropped_total(uint64=8) = 28 octets. A
-// 24-octet record cannot hold those six fields at their stated wire types, so
-// the "24" is an arithmetic slip in the prose while the per-field types are
-// unambiguous; every implementer that writes all six fields at the declared
-// widths necessarily lands on 28. This is the single place the stride is
-// defined, so realigning the whole repo to a corrected spec is a one-line
-// change here.
+// commands.md section 5.1 declares "28 x T" and a 28-octet record:
+// source_id(uint32=4) + topic_id(uint16=2) + subscriber_count(uint16=2) +
+// effective_rate_millihz(uint32=4) + bytes_total(uint64=8) +
+// samples_dropped_total(uint64=8) = 28 octets, which is what this firmware
+// has always serialized. (A superseded revision of that section said
+// "24 x T" and "24 octetos" by an arithmetic slip in the prose; the per-field
+// types were unambiguous even then, so every implementer that wrote all six
+// fields at the declared widths landed on 28.) This is the single place the
+// stride is defined, so realigning the whole repo to a changed layout is a
+// one-line change here.
 constexpr std::size_t kTopicStatusRecordSize = 28U;
 
 // Builds a status_version=2 payload: the same 92-byte v1 prefix (with
@@ -188,7 +191,7 @@ constexpr std::size_t kTopicStatusRecordSize = 28U;
 std::size_t buildStatusV2(const StatusCounters& counters, const TopicStatusRecord* topics, std::size_t topicCount,
                           std::uint8_t* output, std::size_t outputCapacity) noexcept;
 
-// ---- ENTER/READY/CONSOLE console handshake text (TRANSPORT_SERIAL.md 5-6) --
+// ---- ENTER/READY/CONSOLE handshake text (session-and-terminal.md 3-4) -----
 
 constexpr std::size_t kNonceHexLength = 16U;
 constexpr std::size_t kReadyLineCapacity = 32U;   // "BTP/1 READY " + 16 hex + "\r\n" + NUL
@@ -257,7 +260,7 @@ public:
 
     // frame must already be a validly decoded BTP envelope (btp::decode()
     // returned Ok) -- COBS/CRC/envelope errors never reach this call and must
-    // not renew the watchdog (matches TRANSPORT_SERIAL.md section 4).
+    // not renew the watchdog (matches session-and-terminal.md section 5).
     FrameResult onFrame(const btp::DecodedFrame& frame, std::uint64_t nowMs,
                         std::uint8_t* outPayload, std::size_t outPayloadCapacity) noexcept;
 

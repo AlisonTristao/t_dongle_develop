@@ -47,6 +47,10 @@ enum class Code : uint16_t {
     SEND_PARTIAL_DELIVERY = 1211,
     PEER_BOOT_UNKNOWN = 1212,
     COMMAND_ENCODE_FAILED = 1213,
+    HUB_BIND_TABLE_FULL = 1214,
+    HUB_BINDING_NOT_FOUND = 1215,
+    LINK_KEY_NOT_CONFIGURED = 1216,
+    LINK_KEY_SAVE_FAILED = 1217,
 
     // Database
     DATABASE_NOT_READY = 1301,
@@ -140,6 +144,14 @@ inline const char* name(Code code) {
         return "PEER_BOOT_UNKNOWN";
     case Code::COMMAND_ENCODE_FAILED:
         return "COMMAND_ENCODE_FAILED";
+    case Code::HUB_BIND_TABLE_FULL:
+        return "HUB_BIND_TABLE_FULL";
+    case Code::HUB_BINDING_NOT_FOUND:
+        return "HUB_BINDING_NOT_FOUND";
+    case Code::LINK_KEY_NOT_CONFIGURED:
+        return "LINK_KEY_NOT_CONFIGURED";
+    case Code::LINK_KEY_SAVE_FAILED:
+        return "LINK_KEY_SAVE_FAILED";
     case Code::DATABASE_NOT_READY:
         return "DATABASE_NOT_READY";
     case Code::DATABASE_INIT_FAILED:

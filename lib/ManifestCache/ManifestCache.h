@@ -7,7 +7,7 @@
 
 /**
  * @brief Dongle-side cache/aggregator for BTP v1 MANIFEST_DATA
- * (bally_protocol/docs/COMMANDS_AND_ACTIONS.md section 6), topico 16.
+ * (BTP/docs/commands.md section 3), topico 16.
  *
  * One entry per robot source_id, keyed by the identity actually observed
  * over ESP-NOW (BtpTransport::rememberPeer already tracks (mac, source_id,
@@ -16,8 +16,8 @@
  * already-length-prefixed bytes the robot sent -- this dongle relays a
  * catalog, it does not need to understand field internals (scale/offset/
  * enum labels/...) to forward them correctly, only to walk each record's
- * own `record_size` prefix to find its boundary (COMMANDS_AND_ACTIONS.md
- * section 6.2: "Cada registro comeca com record_size..."). That is also why
+ * own `record_size` prefix to find its boundary (commands.md
+ * section 3.3: "Every record begins with record_size..."). That is also why
  * this cache never needs its own parallel field-schema representation.
  *
  * In-memory only, rebuilt across a dongle reboot rather than persisted to
@@ -94,16 +94,16 @@ bool ingestManifestData(btp::ByteView payload, std::uint32_t nowMs) noexcept;
 std::uint32_t catalogRevision() noexcept;
 
 // Number of entries a target_source_id=0 enumeration would produce: this
-// dongle's own self-description (always index 0, role=DONGLE, no topics/
-// actions of its own) plus one per cached robot source, sorted by
-// source_id (COMMANDS_AND_ACTIONS.md section 6.1: "ordena-as por
-// source_id").
+// dongle's own self-description (always index 0, role=DONGLE, carrying the
+// hub.* topic records DonglePublisher declares -- topico 27) plus one per
+// cached robot source, sorted by source_id (commands.md section 3.1: "sorts
+// them by source_id").
 std::size_t enumerationCount() noexcept;
 
 // Builds ONE MANIFEST_DATA response (SUCCESS, CATALOG_COMPLETE set only on
 // the last index) for enumeration index `index` (0 = self, per above).
 // requestHeader supplies the request-reference triple to echo back
-// (COMMANDS_AND_ACTIONS.md section 2). Whole topic/action records that do
+// (commands.md section 1). Whole topic/action records that do
 // not fit in outputCapacity are dropped (never emitted partially); the
 // response's own topic_count/action_count reflect what was actually
 // written, not the cached count -- see this repo's topico 16 RESULTADO.
@@ -122,15 +122,20 @@ std::size_t buildTargetedResponse(std::uint32_t targetSourceId, std::uint32_t ta
                                   std::uint32_t knownRevision, const btp::Header& requestHeader,
                                   std::uint8_t* output, std::size_t outputCapacity) noexcept;
 
-// Topico 17: walks the cached, verbatim topic records for sourceId (this
-// dongle's own self-description has none) looking for topicId, and reads
-// its max_rate_millihz (COMMANDS_AND_ACTIONS.md section 6.2's per-topic
+// Topico 17: walks the cached, verbatim topic records for sourceId looking
+// for topicId, and reads its max_rate_millihz (commands.md section 3.3's
+// per-topic
 // record, offset 8 of the record's content -- topic_id/schema_version(2
 // each), encoding/flags(1 each), field_count(2), then max_rate_millihz(4)).
 // Returns false when the source or topic is not cached; SubscriptionRegistry
 // callers treat that as "cannot grant a subscription for an unknown topic"
 // (REJECTED/NOT_FOUND), the same way a MANIFEST_REQUEST for an unknown topic
 // would be handled by the source itself.
+//
+// Topico 27: when sourceId is this dongle's own, the answer comes from
+// DonglePublisher's schema tables instead of the cache, so a desktop client
+// subscribes to hub.link/hub.usb/hub.peers through the exact same
+// SUBSCRIBE handler it uses for a robot topic.
 bool lookupTopicMaxRateMillihz(std::uint32_t sourceId, std::uint32_t topicId,
                                std::uint32_t* outMaxRateMillihz) noexcept;
 

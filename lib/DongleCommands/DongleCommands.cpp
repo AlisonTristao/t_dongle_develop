@@ -1,14 +1,17 @@
 #include "DongleCommands.h"
 
+#include "HubRegistry.h"
 #include "SerialMux.h"
 #include "ShellCommandSupport.h"
 #include "SudoManager.h"
+#include "DongleKeyStore.h"
 #include "error_codes.h"
 
 #include <Esp.h>
 #include <WiFi.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <sys/time.h>
@@ -630,8 +633,9 @@ uint8_t wrapper_dongle_info() {
 // called from AppRuntime::handleShellInput). Prints its confirmation BEFORE
 // calling SerialMux::enterFromCommand(), never after: once that call
 // succeeds, "BTP/1 READY ...\r\n" is already on the wire and no further
-// plain-text output may follow it (bally_protocol/docs/TRANSPORT_SERIAL.md
-// section 7 -- "impedir qualquer saida textual entre READY e BTP/1 CONSOLE").
+// plain-text output may follow it (BTP/docs/session-and-terminal.md
+// sections 3 and 4 -- binary framing starts at the newline that ends READY,
+// and the port only returns to text with "BTP/1 CONSOLE").
 uint8_t wrapper_dongle_btp_v1() {
     printLine("[dongle] negociando sessao BTP v1 (aguardando HELLO por 2s)...");
 
@@ -639,6 +643,152 @@ uint8_t wrapper_dongle_btp_v1() {
         return failWithCode(AppError::Code::SERIAL_SESSION_BUSY, "sessao serial ja esta negociando ou protocolada");
     }
 
+    return RESULT_OK;
+}
+
+// A source_id is printed as eight bare hex digits everywhere in this project
+// (log tags, hub.peers, the LCD), so that is the form an operator will copy
+// and paste back in. strtoul with base 0 would read those as decimal or
+// reject them, so bare input is retried as hex -- 0x-prefixed input still
+// works and still means hex.
+bool parseSourceId(const string& text, uint32_t& outValue) {
+    const string cleaned = stripOuterQuotes(text);
+    if (cleaned.empty()) {
+        return false;
+    }
+
+    char* end = nullptr;
+    unsigned long parsed = std::strtoul(cleaned.c_str(), &end, 0);
+    if (end == nullptr || *end != '\0') {
+        end = nullptr;
+        parsed = std::strtoul(cleaned.c_str(), &end, 16);
+        if (end == nullptr || *end != '\0' || end == cleaned.c_str()) {
+            return false;
+        }
+    }
+    if (parsed == 0UL || parsed > 0xFFFFFFFFUL) {
+        return false;
+    }
+
+    outValue = static_cast<uint32_t>(parsed);
+    return true;
+}
+
+// Topico 28: binds one console-side child to one robot, which is the only
+// thing that can tell the downstream relay where a frame is going -- a BTP
+// header has no destination field, and TERMINAL carries none in its payload
+// either (see lib/HubRegistry). The exact opposite direction of hub.peers:
+// discovery goes down to the console as telemetry, the binding comes back up
+// as an operator's decision.
+uint8_t wrapper_hub_bind(string child, string peer) {
+    uint32_t childSourceId = 0;
+    uint32_t peerSourceId = 0;
+    if (!parseSourceId(child, childSourceId) || !parseSourceId(peer, peerSourceId)) {
+        return failWithCode(AppError::Code::INVALID_ARGUMENT,
+                            "source_id invalido (use 8 digitos hex, ex.: 33445566)");
+    }
+
+    if (!HubRegistry::bind(childSourceId, peerSourceId)) {
+        return failWithCode(AppError::Code::HUB_BIND_TABLE_FULL, "tabela de vinculo cheia");
+    }
+
+    char line[80] = {0};
+    std::snprintf(line, sizeof(line), "[hub] vinculo %08lX -> %08lX",
+                  static_cast<unsigned long>(childSourceId),
+                  static_cast<unsigned long>(peerSourceId));
+    printLine(line);
+    return RESULT_OK;
+}
+
+uint8_t wrapper_hub_unbind(string child) {
+    uint32_t childSourceId = 0;
+    if (!parseSourceId(child, childSourceId)) {
+        return failWithCode(AppError::Code::INVALID_ARGUMENT,
+                            "source_id invalido (use 8 digitos hex, ex.: 33445566)");
+    }
+
+    if (!HubRegistry::unbind(childSourceId)) {
+        return failWithCode(AppError::Code::HUB_BINDING_NOT_FOUND, "esse filho nao esta vinculado");
+    }
+
+    char line[64] = {0};
+    std::snprintf(line, sizeof(line), "[hub] vinculo %08lX removido",
+                  static_cast<unsigned long>(childSourceId));
+    printLine(line);
+    return RESULT_OK;
+}
+
+void appendHex(string& out, const uint8_t* data, size_t size) {
+    char byteText[3] = {0};
+    for (size_t i = 0; i < size; ++i) {
+        std::snprintf(byteText, sizeof(byteText), "%02x", data[i]);
+        out += byteText;
+    }
+}
+
+// Topico 29 passo 3 / topico 30: types the channel C password (key L) once,
+// on this dongle's own console -- Channel A, physical access, same
+// justification CONTRIBUTING.md section 5 already accepts for leaving that
+// channel in the clear and for "sudo -login" not being redacted from the
+// persisted command log either (ShellConfig::runLine logs every command
+// verbatim except the "database -exec_nolog" family): whoever can type here
+// can already read the SD card this would land on, so there is nothing this
+// command's own logging could leak that physical access does not already
+// grant.
+//
+// Derives with DongleKeyStore::deriveKeyL -- PBKDF2-HMAC-SHA256, same salt
+// and iteration count as bally_OS/scripts/provision_key.py -- so the same
+// password typed here and into that script produce byte-identical keys
+// (topico 29's acceptance criteria). Never prints the key itself, only its
+// public verify tag (see wrapper_hub_key_status).
+uint8_t wrapper_hub_set_key_l(string password) {
+    const string cleaned = stripOuterQuotes(password);
+    if (cleaned.empty()) {
+        return failWithCode(AppError::Code::INVALID_ARGUMENT, "senha vazia recusada");
+    }
+
+    uint8_t key[DongleKeyStore::kKeyLength] = {0};
+    DongleKeyStore::deriveKeyL(cleaned.c_str(), cleaned.size(), key);
+    DongleKeyStore::setKeyL(key);
+
+    const bool persisted = DongleKeyStore::saveToNvs();
+
+    uint8_t verify[DongleKeyStore::kVerifyLength] = {0};
+    DongleKeyStore::verifyTagL(key, verify);
+    string verifyHex;
+    appendHex(verifyHex, verify, sizeof(verify));
+
+    // Never left lying around on the stack longer than needed.
+    volatile uint8_t* wipe = key;
+    for (size_t i = 0; i < sizeof(key); ++i) wipe[i] = 0;
+
+    if (!persisted) {
+        warnWithCode(AppError::Code::LINK_KEY_SAVE_FAILED,
+                    "chave em uso nesta sessao mas NAO gravada em NVS (sobrevive so ate o proximo reboot)");
+    }
+
+    printLine("[hub] chave L configurada, verify_l=" + verifyHex);
+    return RESULT_OK;
+}
+
+// Bench diagnostic (topico 32 leans on this): confirms a key is loaded and
+// which one, without ever printing the key itself -- verify_l is public by
+// construction (a one-way function of the key), same reasoning as
+// bally_OS's KeyStore::verify_l(). Compare against
+// "provision_key.py --password-l <mesma senha>"'s own printed verify_l to
+// confirm this dongle and a robot's card agree before trusting the link.
+uint8_t wrapper_hub_key_status() {
+    if (!DongleKeyStore::hasKeyL()) {
+        printLine("[hub] chave L: nao configurada (rode hub -set_key_l)");
+        return RESULT_OK;
+    }
+
+    uint8_t verify[DongleKeyStore::kVerifyLength] = {0};
+    DongleKeyStore::verifyTagL(DongleKeyStore::keyL(), verify);
+    string verifyHex;
+    appendHex(verifyHex, verify, sizeof(verify));
+
+    printLine("[hub] chave L: configurada, verify_l=" + verifyHex);
     return RESULT_OK;
 }
 
@@ -680,6 +830,15 @@ uint8_t registerAll() {
     context().shell->add(wrapper_dongle_reboot, "reboot", "restart the ESP32", "dongle");
     context().shell->add(wrapper_dongle_info, "info", "chip/heap/flash/uptime/mac summary", "dongle");
     context().shell->add(wrapper_dongle_btp_v1, "btp_v1", "negotiate a BTP v1 protocolled session on this port", "dongle");
+
+    // Its own module rather than another "dongle" verb: the binding table is
+    // about the hub's two sides, not about this board's peripherals, and a
+    // separate module is what makes "hub -bind" read next to "hub.peers".
+    context().shell->create_module("hub", "relay bindings between console children and robots");
+    context().shell->add(wrapper_hub_bind, "bind", "route a child at a robot: <child_source_id>, <peer_source_id>", "hub");
+    context().shell->add(wrapper_hub_unbind, "unbind", "drop a child routing: <child_source_id>", "hub");
+    context().shell->add(wrapper_hub_set_key_l, "set_key_l", "derive and store channel C key from a password: <senha>", "hub");
+    context().shell->add(wrapper_hub_key_status, "key_status", "show whether channel C key L is loaded (never prints the key)", "hub");
 
     return RESULT_OK;
 }

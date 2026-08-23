@@ -18,7 +18,16 @@ import re
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+try:
+    _SCRIPT_PATH = Path(__file__).resolve()
+except NameError:
+    # SCons exec()s extra_scripts (see the module docstring) with a globals
+    # dict that has no __file__, so the line above raises there and took the
+    # whole env:native build down with it before any test could compile. SCons
+    # runs with the project directory as cwd, which is this script's grandparent.
+    _SCRIPT_PATH = (Path.cwd() / "scripts" / "check_user_text.py").resolve()
+
+REPO_ROOT = _SCRIPT_PATH.parent.parent
 SCAN_DIRS = ["lib", "src"]
 
 PORTUGUESE_CALLS = ("printLine", "failWithCode", "warnWithCode")
@@ -183,4 +192,22 @@ def main():
     return 1
 
 
-sys.exit(main())
+_status = main()
+
+# Exit ONLY on failure, and never on success.
+#
+# SCons exec()s an extra_script in its own process rather than importing it
+# (see the module docstring), so a sys.exit() here does not merely end this
+# script -- it ends the build. On success that is silent and total: the check
+# prints "OK", SCons stops with status 0, PlatformIO reports the build as
+# SUCCESS, and not one object file is produced. `platformio test -e native`
+# then fails with no compiler output to explain why, because there was no
+# compilation at all. That is a much worse failure than the one this guard
+# exists to catch.
+#
+# Falling off the end of the module instead lets SCons carry on to the actual
+# build, and still yields exit status 0 when the script is run standalone. On
+# failure the exit is what is wanted in both contexts: a nonzero status
+# standalone, and an aborted build under SCons.
+if _status != 0:
+    sys.exit(_status)

@@ -1,6 +1,7 @@
 #include <ManifestCache.h>
 
 #include <BtpTransport.h>
+#include <DonglePublisher.h>
 
 #include <cstring>
 
@@ -15,11 +16,19 @@ constexpr std::uint16_t kErrorNotFound = 0x000BU;
 constexpr std::uint8_t kFlagNotModified = 0x01U;
 constexpr std::uint8_t kFlagCatalogComplete = 0x02U;
 
-// This dongle's own descriptor never changes within a build (no topics/
-// actions of its own to publish yet); a fixed revision satisfies "a revisao
-// e monotonica e comeca em 1" trivially, same reasoning bally_software's
-// ManifestResponder uses for its own kConfigRevision.
-constexpr std::uint32_t kSelfConfigRevision = 1U;
+// This dongle's own descriptor is a compile-time constant (DonglePublisher's
+// schema tables), so a fixed revision satisfies "a revisao e monotonica e
+// comeca em 1" trivially, same reasoning bally_software's ManifestResponder
+// uses for its own kConfigRevision.
+//
+// Bumped 1 -> 2 by topico 27: revision 1 described a dongle with zero topics.
+// A client that cached revision 1 and asks again with
+// known_config_revision = 1 would otherwise be answered NOT_MODIFIED and
+// never learn about hub.link/hub.usb/hub.peers -- commands.md section 3.3
+// requires the bump for exactly this reason ("a changed config_revision
+// invalidates cached descriptors"). Any future change to the hub.* schemas
+// must bump it again.
+constexpr std::uint32_t kSelfConfigRevision = 2U;
 constexpr const char* kSelfName = "t_dongle_develop";
 
 struct Entry {
@@ -209,7 +218,7 @@ PendingRequest* findOrAllocatePending(std::uint32_t sourceId) noexcept {
 }
 
 // Collects pointers to used entries, insertion-sorted by source_id
-// ascending (COMMANDS_AND_ACTIONS.md section 6.1). N is at most kCapacity
+// ascending (commands.md section 3.1). N is at most kCapacity
 // (8), so an O(n^2) insertion sort is simplest and cheap enough.
 std::size_t collectSortedEntries(Entry* out[kCapacity]) noexcept {
     std::size_t count = 0U;
@@ -398,11 +407,20 @@ std::size_t buildEnumerationResponse(std::size_t index, const btp::Header& reque
     const std::uint8_t flags = (index + 1U == total) ? kFlagCatalogComplete : static_cast<std::uint8_t>(0U);
 
     if (index == 0U) {
+        // Topico 27: index 0 is still this dongle, but it is no longer an
+        // empty descriptor -- it now carries the hub.* topic records, so a
+        // plain target_source_id = 0 enumeration is all a client needs to
+        // discover the dongle's own topics alongside the robots'. No special
+        // branch anywhere: the dongle became one more source in the catalog.
+        std::size_t selfRecordsSize = 0U;
+        std::uint16_t selfTopicCount = 0U;
+        const std::uint8_t* selfRecords = DonglePublisher::topicRecords(&selfRecordsSize, &selfTopicCount);
+
         return writeManifestData(requestHeader, kStatusSuccess, flags, kErrorNone,
                                  static_cast<std::uint16_t>(index), static_cast<std::uint16_t>(total),
                                  kSelfConfigRevision, g_selfUuid, BtpTransport::sourceId(), BtpTransport::bootId(),
-                                 kSourceRoleDongle, /*online=*/true, kSelfName, nullptr, 0U, 0U, 0U, output,
-                                 outputCapacity);
+                                 kSourceRoleDongle, /*online=*/true, kSelfName, selfRecords, selfRecordsSize,
+                                 selfTopicCount, 0U, output, outputCapacity);
     }
 
     Entry* sorted[kCapacity];
@@ -449,9 +467,19 @@ std::size_t buildTargetedResponse(std::uint32_t targetSourceId, std::uint32_t ta
                                  foundName, nullptr, 0U, 0U, 0U, output, outputCapacity);
     }
 
-    const std::uint8_t* records = isSelf ? nullptr : entry->records;
-    const std::size_t recordsSize = isSelf ? 0U : entry->recordsSize;
-    const std::uint16_t topicCount = isSelf ? 0U : entry->topicCount;
+    // Topico 27: a MANIFEST_REQUEST targeted at BtpTransport::sourceId() is
+    // answered from DonglePublisher's schema tables, through this same
+    // writeManifestData() call the robots' cached manifests use -- the
+    // dongle's own catalog is served by the existing path, not by a parallel
+    // responder object like bally_software's ManifestResponder.
+    std::size_t selfRecordsSize = 0U;
+    std::uint16_t selfTopicCount = 0U;
+    const std::uint8_t* selfRecords =
+        isSelf ? DonglePublisher::topicRecords(&selfRecordsSize, &selfTopicCount) : nullptr;
+
+    const std::uint8_t* records = isSelf ? selfRecords : entry->records;
+    const std::size_t recordsSize = isSelf ? selfRecordsSize : entry->recordsSize;
+    const std::uint16_t topicCount = isSelf ? selfTopicCount : entry->topicCount;
     const std::uint16_t actionCount = isSelf ? 0U : entry->actionCount;
 
     return writeManifestData(requestHeader, kStatusSuccess, kFlagCatalogComplete, kErrorNone, 0U, 1U, foundRevision,
@@ -462,6 +490,17 @@ std::size_t buildTargetedResponse(std::uint32_t targetSourceId, std::uint32_t ta
 bool lookupTopicMaxRateMillihz(std::uint32_t sourceId, std::uint32_t topicId,
                                std::uint32_t* outMaxRateMillihz) noexcept {
     if (outMaxRateMillihz == nullptr || topicId == 0U || topicId > 0xFFFFU) return false;
+
+    // Topico 27: the dongle's own topics are never in g_entries (that table
+    // only holds manifests received over ESP-NOW), so a SUBSCRIBE aimed at
+    // this dongle would have been answered NOT_FOUND. Answering it from
+    // DonglePublisher here is what makes hub.* subscribable at all -- and it
+    // keeps SerialMux::handleSubscribeRequest untouched, which is why a
+    // desktop client needs no change to subscribe to the dongle.
+    if (sourceId == BtpTransport::sourceId()) {
+        return DonglePublisher::lookupTopicMaxRateMillihz(static_cast<std::uint16_t>(topicId),
+                                                           outMaxRateMillihz);
+    }
 
     const Entry* entry = findEntry(sourceId);
     if (entry == nullptr) return false;

@@ -12,7 +12,7 @@
  * logical messages: btp::decode() (envelope + CRC-32) then, only for
  * fragmented frames, btp::Reassembler. Everything here is plain C++ with no
  * Arduino/FreeRTOS dependency, so it runs the same way under env:native
- * against bally_protocol's canonical test vectors as it does on-device.
+ * against BTP's canonical test vectors as it does on-device.
  *
  * Ownership: the "queue by type, drain from tasks/tick()" part (step 10 of
  * topico 12) is Arduino-only and lives one layer up, in EspNowConfig, which
@@ -23,8 +23,17 @@
 namespace ProtocolRouter {
 
 // Bounded to BtpTransport::kMaxLogicalPayloadSize's max real user, a
-// fragmented COMMAND_REQUEST (20-byte prefix + up to 512 shell bytes).
-constexpr std::size_t kMaxPayloadSize = 600U;
+// fragmented COMMAND_REQUEST (20-byte prefix + up to 512 shell bytes), PLUS
+// btp::aead's 16-octet tag: everything this router reassembles is channel C
+// (dongle<->robot, key L) as of topico 30, so a message sealed at
+// BtpTransport::kMaxLogicalPayloadSize (600) is 616 octets on the wire, and
+// this buffer has to hold that whole, still-sealed message before
+// RadioSeal::open() gets a chance to shrink it back down -- opening happens
+// AFTER reassembly, never before (BTP/docs/encryption.md section 6). No real
+// caller sends a 600-octet plaintext today (532 is the largest, a full-size
+// shell command), but the ceiling is meant to be an honest upper bound, not
+// one that only happens to work for today's traffic.
+constexpr std::size_t kMaxPayloadSize = 616U;
 constexpr std::size_t kSlotCount = 4U;
 constexpr std::uint64_t kReassemblyTimeoutMs = 4000U;
 

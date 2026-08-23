@@ -63,67 +63,137 @@ void disableAsyncRx();
 bool dequeueRxDatagram(RxDatagramEvent& outEvent, uint32_t timeoutMs = 0);
 
 /**
- * @brief Decodes+routes one raw datagram (ProtocolRouter), then dispatches
- * the result: COMMAND is handled synchronously here (remote execution
- * shouldn't wait for the next drainRoutedQueues() call); LOG/TELEMETRY/
- * TERMINAL/CONTROL are pushed into their own bounded queue for
- * drainRoutedQueues() to consume from the main loop.
+ * @brief Classifies one raw datagram and branches (topico 28).
+ *
+ * Reads only the BTP envelope, then applies bally::dongle_consumes()
+ * (include/bally_channels.h -- the single copy of that list). Anything not on
+ * it is relayed to the desktop client verbatim, fragment by fragment, with no
+ * reassembly and no re-encoding (SerialMux::relayUp, D5).
+ *
+ * What the dongle does consume, and everything at all while the port is still
+ * console-owned (no client to relay to), takes the pre-hub path: decode +
+ * reassemble via ProtocolRouter, then dispatch -- COMMAND synchronously here
+ * (remote execution shouldn't wait for the next drainRoutedQueues() call),
+ * LOG/TELEMETRY/TERMINAL/CONTROL into their own bounded queue.
  */
 void processRxDatagram(const RxDatagramEvent& event);
 
 /**
  * @brief Drains up to maxItemsPerQueue entries from each of the CONTROL/LOG/
- * TELEMETRY/TERMINAL queues, in that priority order. LOG entries are printed
- * (source_id-tagged, no packet/arrival framing). TELEMETRY/TERMINAL/CONTROL
- * have no consumer yet in this topic (bytes only, no String/printf
- * formatting is applied to them) so they are drained and discarded, freeing
- * queue capacity; only their drop/processed counters are observable.
+ * TELEMETRY/TERMINAL queues, in that priority order.
+ *
+ * Since topico 28 these queues only ever see what the dongle consumes, plus
+ * everything at all while the port is console-owned: with a client attached,
+ * the rest is relayed straight off the radio and never routed. LOG is printed
+ * to the console (source_id-tagged); CONTROL/MANIFEST_DATA feeds
+ * ManifestCache; TELEMETRY and TERMINAL are drained and discarded on this
+ * path, since their only real consumer is the relay.
  * @return total entries drained across all four queues.
  */
 size_t drainRoutedQueues(size_t maxItemsPerQueue = 8);
 
+/** Each returns what accumulated since its own last call and is consumed by
+ * AppRuntime::flushPendingEspNowOutput every tick to feed the LCD's dropped
+ * tile. Use peekRxCounters() instead when you need a value that survives
+ * being read. */
 uint32_t takeDroppedRxCount();
 uint32_t takeDroppedDecodeCount();
 uint32_t takeDroppedCrcCount();
 uint32_t takeDroppedReassemblyCount();
 uint32_t takeDroppedQueueFullCount();
+/** Topico 30: a consumed (channel C) frame that did not open under key L --
+ * no key configured, missing ENCRYPTED, wrong cipher, or a forged/corrupted
+ * tag. Not part of RxCounters/hub.link (see the .cpp comment); read by
+ * `espnow -stats` and by AppRuntime's dropped-LCD-tile tally. */
+uint32_t takeDroppedAuthCount();
+
+/** Non-destructive cumulative-since-boot read of the same counter
+ * takeDroppedAuthCount() drains -- what `espnow -stats` prints, since that
+ * command (like the rest of StatsSnapshot) reports running totals a user
+ * diffs across two calls, not a delta consumed by a single reader. */
+uint32_t peekDroppedAuthCount();
+
+/**
+ * @brief Cumulative RX counters for the ESP-NOW hop, counted since the last
+ * enableAsyncRx() (in practice, since boot).
+ *
+ * The takeDropped*Count() family only ever answered "what was lost", and it
+ * answers it destructively -- which is enough to light up an LCD tile and not
+ * enough to compute a rate. These totals add the missing half ("what came
+ * through") and clear nothing, so two snapshots plus the elapsed time give the
+ * real ingress rate of the radio hop, per message type.
+ *
+ * That number is the one thing the throughput investigation had no way to
+ * measure: the dongle could see the USB side via the STATUS heartbeat's
+ * frames_tx/bytes_total, but nothing observed how much ESP-NOW actually
+ * delivered, so it was impossible to tell a saturated radio from a saturated
+ * USB link. `espnow -stats` prints these; see EspNowCommands.
+ *
+ * `datagrams` counts every datagram handed to ProtocolRouter, so
+ * `datagrams - fragmentsAccepted - (every dropped* field)` is the number that
+ * should match the sum of the routed* fields.
+ */
+struct RxCounters {
+    uint32_t datagrams;
+    uint32_t fragmentsAccepted;
+    uint32_t routedTelemetry;
+    uint32_t routedLog;
+    uint32_t routedCommand;
+    uint32_t routedControl;
+    uint32_t routedTerminal;
+    uint32_t droppedRx;
+    uint32_t droppedDecode;
+    uint32_t droppedCrc;
+    uint32_t droppedReassembly;
+    uint32_t droppedQueueFull;
+};
+
+void peekRxCounters(RxCounters& out);
 
 /**
  * @brief Sends one heartbeat probe (BTP CONTROL/STATUS, object_id 0x0009,
- * empty payload -- "publicação espontânea, sem resposta" per
- * bally_protocol/docs/COMMANDS_AND_ACTIONS.md) to the most recently seen
+ * empty payload -- "spontaneous and gets no response" per
+ * BTP/docs/commands.md section 5) to the most recently seen
  * ESP-NOW peer (the last one we received real data from, not another
  * heartbeat) and updates the dashboard's link tile with the delivery result.
  * No-op when no peer has sent us anything yet. Meant to be called on a fixed
  * timer, e.g. every HEARTBEAT_INTERVAL_MS from its own task (this call
  * blocks up to HEARTBEAT_SEND_TIMEOUT_MS waiting for the ESP-NOW send
  * callback).
+ *
+ * Topico 30: sealed with key L (channel C, RadioSeal::seal) like every other
+ * message this dongle originates over the radio. Without a key configured
+ * (DongleKeyStore::hasKeyL() false) the seal fails and this returns before
+ * ever calling notePeerLinkResult(), so a peer's `linkOk`/hub.peers `online`
+ * simply never turns true from this path alone -- fail-closed, not a stale
+ * "last known good".
+ *
+ * This probe gets no response (BTP/docs/commands.md section 5), so a
+ * successful notePeerLinkResult() from here is only "the radio ACK'd my
+ * sealed probe to that MAC", never proof the PEER holds key L too -- an
+ * ESP-NOW send-status callback is a link-layer fact about the local radio,
+ * not an application-level answer. The stronger, genuinely bidirectional
+ * signal is EspNowConfig.cpp's processRxDatagramInternal: every CONSUMED
+ * inbound frame from a peer is opened with RadioSeal::open(), and that
+ * outcome (success or TagMismatch) also feeds notePeerLinkResult() -- a
+ * peer that cannot produce a frame this dongle can open under key L gets
+ * marked NOT online even if its heartbeat replies keep ACKing at the radio
+ * layer. `online` is the AND of both signals settling on "yes".
  */
 void heartbeatTick();
 
 /**
- * @brief Topico 17 (PASSO 3): sends a SUBSCRIBE toward the robot identified
- * by sourceId, over ESP-NOW, so it starts (or adjusts) publishing topicId at
- * (up to) rateMillihz. Fire-and-forget, matching every other best-effort
- * CONTROL exchange in this dongle (primeManifestIfNeeded, heartbeatTick) --
- * SerialMux already answered the desktop client synchronously from its own
- * cached knowledge (see SerialMux.cpp's handleSubscribeRequest), so this call
- * is not on that reply's critical path. No-op if this dongle has never heard
- * a BTP frame from sourceId yet (BtpTransport::lookupPeerMacBySourceId
- * fails) -- matches the same "can only target an already-observed peer"
- * limitation topico 12 documented for COMMAND_REQUEST. Meant to be passed as
- * SerialMux::RequestUpstreamSubscribeFn.
+ * @brief Topico 28: writes one already-encoded BTP frame to a peer MAC,
+ * unchanged. The whole point is that it takes octets and not a message: it is
+ * bound to SerialMux::RelayToRadioFn, whose caller (relayDown) has a frame
+ * that belongs to somebody else and must not be re-originated -- rewriting
+ * source_id/boot_id/sequence would rewrite the AEAD nonce
+ * (BTP/docs/encryption.md section 4).
+ *
+ * This replaces topico 17's requestUpstreamSubscribe/requestUpstreamUnsubscribe,
+ * removed here: a robot's subscriptions moved to channel B, so the dongle no
+ * longer merges its clients into a SUBSCRIBE of its own toward the radio.
  */
-void requestUpstreamSubscribe(uint32_t sourceId, uint32_t topicId, uint32_t rateMillihz, uint32_t leaseMs);
-
-/**
- * @brief Topico 17 (PASSO 5): sends an UNSUBSCRIBE toward the robot,
- * releasing upstreamSubscriptionId (the id the robot itself granted, from
- * SubscriptionRegistry::upstreamSubscriptionId -- COMMANDS_AND_ACTIONS.md
- * section 7's UNSUBSCRIBE targets a subscription_id, not a topic_id). Same
- * fire-and-forget/no-op-if-unknown-peer contract as requestUpstreamSubscribe.
- * Meant to be passed as SerialMux::RequestUpstreamUnsubscribeFn.
- */
-void requestUpstreamUnsubscribe(uint32_t sourceId, uint32_t topicId, uint32_t upstreamSubscriptionId);
+bool sendRawToMac(const uint8_t mac[6], const uint8_t* frame, size_t frameSize);
 
 } // namespace EspNowConfig

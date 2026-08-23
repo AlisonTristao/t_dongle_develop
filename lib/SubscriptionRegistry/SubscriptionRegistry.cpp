@@ -29,7 +29,7 @@ struct TopicRow {
 
     // PASSO 8 counters, monotonic for this row's lifetime (never reset when
     // refcount hits zero -- only a dongle reboot resets them, same
-    // "monotonic, saturates" convention as STATUS section 8).
+    // "monotonic, saturates" convention as STATUS section 5).
     std::uint64_t bytesTotal = 0U;
     std::uint64_t samplesDroppedTotal = 0U;
 };
@@ -190,9 +190,9 @@ DesktopSubscribeOutcome onDesktopSubscribe(std::uint32_t clientId, std::uint32_t
     }
 
     // Same client re-subscribing to the same topic with a *different*
-    // rate/lease replaces its row entry atomically (COMMANDS_AND_ACTIONS.md
-    // section 7: "uma nova sequencia cria ou substitui... a assinatura da
-    // mesma sessao e do mesmo topico").
+    // rate/lease replaces its row entry atomically (commands.md
+    // section 4: "a new sequence atomically creates or replaces the
+    // subscription for that session and topic").
     int slot = -1;
     for (std::size_t i = 0U; i < kMaxClientsPerTopic; ++i) {
         if (row.clients[i].used && row.clients[i].clientId == clientId) {
@@ -241,7 +241,7 @@ DesktopUnsubscribeOutcome onDesktopUnsubscribe(std::uint32_t clientId, std::uint
             }
         }
     }
-    // Not found anywhere: COMMANDS_AND_ACTIONS.md section 7 treats this as
+    // Not found anywhere: commands.md section 4 treats this as
     // SUCCESS/NONE (idempotent retry), not an error -- outcome.found stays
     // false and the caller does not turn that into a wire error.
     return outcome;
@@ -345,6 +345,14 @@ bool isWanted(std::uint32_t sourceId, std::uint32_t topicId) noexcept {
     const int rowIndex = findRow(sourceId, topicId);
     if (rowIndex < 0) return false;
     return refcount(g_rows[static_cast<std::size_t>(rowIndex)]) > 0U;
+}
+
+bool isKnownUnwanted(std::uint32_t sourceId, std::uint32_t topicId) noexcept {
+    const int rowIndex = findRow(sourceId, topicId);
+    // No row means this registry was never told anything about the topic, and
+    // knowing nothing is not the same as knowing nobody wants it.
+    if (rowIndex < 0) return false;
+    return refcount(g_rows[static_cast<std::size_t>(rowIndex)]) == 0U;
 }
 
 std::size_t topicStatusSnapshot(TopicStatusEntry* out, std::size_t maxOut) noexcept {
