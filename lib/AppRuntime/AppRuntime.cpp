@@ -225,7 +225,7 @@ void AppRuntime::begin() {
 
     serialShell_.setPrompt(ShellOutput::commandPrompt());
 
-    StartupConfig::waitForSerialAndAnimateLed(donglePeripherals_);
+    StartupConfig::announceBoot(donglePeripherals_);
     donglePeripherals_.beginSd(false);
 
     ShellOutput::printTagged(Serial, "startup", String("mac=") + WiFi.macAddress());

@@ -4,29 +4,7 @@
 
 namespace {
 
-void colorWheel(uint8_t position, uint8_t& r, uint8_t& g, uint8_t& b) {
-    if (position < 85U) {
-        r = static_cast<uint8_t>(255U - position * 3U);
-        g = static_cast<uint8_t>(position * 3U);
-        b = 0;
-        return;
-    }
-
-    if (position < 170U) {
-        const uint8_t p = static_cast<uint8_t>(position - 85U);
-        r = 0;
-        g = static_cast<uint8_t>(255U - p * 3U);
-        b = static_cast<uint8_t>(p * 3U);
-        return;
-    }
-
-    const uint8_t p = static_cast<uint8_t>(position - 170U);
-    r = static_cast<uint8_t>(p * 3U);
-    g = 0;
-    b = static_cast<uint8_t>(255U - p * 3U);
-}
-
-void showSerialStatusOnLcd(DonglePeripherals& peripherals, bool connected) {
+void showBootStatusOnLcd(DonglePeripherals& peripherals) {
     Adafruit_ST7735* lcd = peripherals.lcd();
     if (lcd == nullptr) {
         return;
@@ -37,8 +15,8 @@ void showSerialStatusOnLcd(DonglePeripherals& peripherals, bool connected) {
     constexpr uint16_t kStatusBg = ST77XX_WHITE;
     constexpr uint16_t kStatusFg = ST77XX_BLACK;
 
-    const char* line1 = connected ? "serial conectado" : "serial desconectado";
-    const char* line2 = connected ? "iniciando..." : "aguardando monitor";
+    const char* line1 = "bally dongle";
+    const char* line2 = "iniciando...";
 
     peripherals.setLcdBacklight(true);
     lcd->fillScreen(kStatusBg);
@@ -78,78 +56,27 @@ void showSerialStatusOnLcd(DonglePeripherals& peripherals, bool connected) {
     }
 }
 
-bool isSerialTerminalOpen() {
-    return static_cast<bool>(Serial);
-}
-
-void drainSerialInput() {
-    while (Serial.available()) {
-        Serial.read();
-    }
-}
-
 } // namespace
 
 namespace StartupConfig{
 
-void waitForSerialAndAnimateLed(DonglePeripherals& peripherals) {
+void announceBoot(DonglePeripherals& peripherals) {
+    // Previously blocked here (while(!Serial)) until the host asserted DTR
+    // on the USB CDC port, so a terminal attaching after power-on wouldn't
+    // miss early boot output. Only interactive terminals (Arduino Serial
+    // Monitor, PuTTY, ...) assert DTR on open; an automated BTP client (e.g.
+    // TraceView's QSerialPort) does not, so that wait never resolved and the
+    // dongle sat here forever instead of ever reaching the shell/BTP
+    // handshake. Boot now proceeds immediately once powered on -- no serial
+    // connection required.
     peripherals.beginLed();
-    showSerialStatusOnLcd(peripherals, false);
+    peripherals.setLedColor(0, 255, 0, 8);
 
-    uint8_t wheel = 0;
-    uint8_t brightness = 3;
-    int8_t direction = 1;
-    uint32_t openSinceMs = 0;
+    showBootStatusOnLcd(peripherals);
 
-    // Require stable open for a short period to avoid false positives during upload/reset toggles.
-    constexpr uint32_t kStableOpenMs = 1200;
-
-    while (true) {
-        const bool open = isSerialTerminalOpen();
-        if (open) {
-            if (openSinceMs == 0) {
-                openSinceMs = millis();
-            } else if ((millis() - openSinceMs) >= kStableOpenMs) {
-                break;
-            }
-        } else {
-            openSinceMs = 0;
-        }
-
-        uint8_t r = 0;
-        uint8_t g = 0;
-        uint8_t b = 0;
-        colorWheel(wheel, r, g, b);
-        peripherals.setLedColor(r, g, b, brightness);
-
-        wheel = static_cast<uint8_t>(wheel + 2U);
-
-        const int16_t nextBrightness = static_cast<int16_t>(brightness) + direction;
-        if (nextBrightness >= 31) {
-            brightness = 31;
-            direction = -1;
-        } else if (nextBrightness <= 2) {
-            brightness = 2;
-            direction = 1;
-        } else {
-            brightness = static_cast<uint8_t>(nextBrightness);
-        }
-
-        delay(24);
-    }
-
-    drainSerialInput();
-
-    // No interactive ENTER/clock prompt here anymore -- the BTP client
-    // (e.g. TraceView) queries and, if needed, corrects the clock itself via
-    // the "dongle clock" / "dongle set_clock" shell commands once connected,
-    // so boot goes straight from "port open" to the shell being ready.
     ShellOutput::printTagged(Serial, "startup", "iniciando...");
 
-    showSerialStatusOnLcd(peripherals, true);
-
     peripherals.ledOff();
-    delay(80);
 }
 
 } // namespace StartupConfig

@@ -6,15 +6,13 @@
 namespace StartupConfig{
 
 /**
- * @brief Waits for serial monitor attach while updating startup visuals.
- *
- * Visual behavior:
- * - RGB LED carousel while disconnected.
- * - LCD status text for disconnected/connected states.
+ * @brief Initializes LED/LCD and announces boot status. Does not wait for a
+ * serial terminal/monitor to attach -- see the definition for why that wait
+ * was removed.
  *
  * No interactive prompt follows: the clock is queried/corrected by the BTP
  * client via the "dongle clock" / "dongle set_clock" shell commands.
  */
-void waitForSerialAndAnimateLed(DonglePeripherals& peripherals);
+void announceBoot(DonglePeripherals& peripherals);
 
 } // namespace StartupConfig

@@ -185,10 +185,12 @@ a regra de quando um módulo novo deve entrar em `Context` ou pode ser incluído
 
 1. `BoardConfig::initBoardPins(false)` — pinos em estado seguro (LCD apagado)
 2. inicia `ShellSerial` na baudrate de `platformio.ini` (`BAUDRATE`)
-3. aguarda monitor serial conectar, animando o LED (`StartupConfig`) — assim que a porta fica
-   estável aberta por `kStableOpenMs` (1200ms), segue direto pro shell, sem prompt bloqueante
-   de "pressione ENTER" nem de data/hora (removidos): um cliente automático (ex.: TraceView)
-   chega ao shell interativo/negociação BTP em tempo finito sem precisar digitar nada
+3. inicializa LED/LCD e anuncia o boot (`StartupConfig::announceBoot`) — não aguarda mais um
+   monitor serial conectar (esse gate dependia de `Serial` refletir DTR asserted pelo host, o
+   que só terminais interativos fazem ao abrir a porta; um cliente automático como o TraceView
+   nunca assertava DTR, então o boot travava aqui indefinidamente); sem prompt bloqueante de
+   "pressione ENTER" nem de data/hora: qualquer cliente chega ao shell interativo/negociação BTP
+   em tempo finito sem precisar digitar nada nem abrir a porta de um jeito específico
 4. inicia SD, imprime MAC Wi-Fi
 5. deriva a identidade BTP deste boot (`BtpTransport::configureIdentity`) e chama
    `SerialMux::begin(...)`, ligando-o ao `ShellConfig::runLine` via callback
