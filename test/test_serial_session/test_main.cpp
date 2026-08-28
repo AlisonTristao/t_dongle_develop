@@ -326,6 +326,16 @@ void test_session_close_returns_to_console() {
     TEST_ASSERT_EQUAL_UINT8(0x00U, scratch[12]); // SUCCESS
 }
 
+void test_transport_loss_abandons_active_session_once() {
+    SerialSession::Session session((SerialSession::LocalLimits{}));
+    session.beginNegotiation(100U);
+
+    TEST_ASSERT_FALSE(session.isConsole());
+    TEST_ASSERT_TRUE(session.onTransportLost());
+    TEST_ASSERT_TRUE(session.isConsole());
+    TEST_ASSERT_FALSE(session.onTransportLost());
+}
+
 // ---- ENTER/READY console handshake text ------------------------------------
 
 void test_enter_line_produces_lowercase_ready_line() {
@@ -604,6 +614,7 @@ int main(int, char**) {
     RUN_TEST(test_session_rejects_hello_without_common_version);
     RUN_TEST(test_session_hello_deadline_times_out_back_to_console);
     RUN_TEST(test_session_close_returns_to_console);
+    RUN_TEST(test_transport_loss_abandons_active_session_once);
     RUN_TEST(test_enter_line_produces_lowercase_ready_line);
     RUN_TEST(test_ready_line_from_nonce_is_16_lowercase_hex_digits);
     RUN_TEST(test_classify_never_mixes_telemetry_and_terminal);

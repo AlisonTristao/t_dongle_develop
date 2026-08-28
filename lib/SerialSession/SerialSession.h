@@ -275,6 +275,13 @@ public:
     // and fills outConsoleLine with "BTP/1 CONSOLE\r\n".
     bool pollTimeout(std::uint64_t nowMs, char outConsoleLine[kConsoleLineCapacity]) noexcept;
 
+    // The USB transport disappeared (normally DTR was deasserted). Unlike a
+    // protocol SESSION_CLOSE there is nobody left to receive a result or the
+    // CONSOLE banner, so this only makes the state transition. The caller
+    // performs the same queue/subscription cleanup as the normal close path.
+    // Returns true exactly when an active/negotiating session was abandoned.
+    bool onTransportLost() noexcept;
+
     const EffectiveLimits& effectiveLimits() const noexcept { return effective_; }
     std::uint32_t peerSourceId() const noexcept { return peerSourceId_; }
     std::uint32_t peerBootId() const noexcept { return peerBootId_; }

@@ -1086,6 +1086,23 @@ bool enterFromCommand(std::uint32_t nowMs) noexcept {
     return true;
 }
 
+void onTransportLost(std::uint32_t nowMs) noexcept {
+    if (!g_session.onTransportLost()) {
+        return;
+    }
+
+    // No bytes can be returned here: CDC already reports that the host is no
+    // longer listening. Preserve the semantic cleanup of SESSION_CLOSE so a
+    // later TraceView session starts from a genuinely clean console state.
+    SubscriptionRegistry::UpstreamAction actions[SubscriptionRegistry::kMaxTopics];
+    const std::size_t count = SubscriptionRegistry::onClientDisconnected(
+        g_session.peerSourceId(), nowMs, actions, SubscriptionRegistry::kMaxTopics);
+    dispatchUpstreamActions(actions, count);
+    resetQueues();
+    g_decoder.reset();
+    g_terminalPty.reset();
+}
+
 void tick(std::uint32_t nowMs) noexcept {
     if (g_session.isConsole()) {
         return; // ShellSerial owns the port; nothing for the mux to do.

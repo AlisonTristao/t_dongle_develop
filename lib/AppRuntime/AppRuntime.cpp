@@ -635,6 +635,14 @@ void AppRuntime::tick() {
     flushPendingEspNowOutput(asyncOutputOccurred);
     lcdDashboard_.tick();
 
+    // Native USB CDC's bool conversion reflects the host DTR line. If the
+    // desktop closes the COM port without completing SESSION_CLOSE (process
+    // killed, cable pulled, OS error), release SerialMux immediately instead
+    // of leaving it protocol-owned until the 30 s watchdog expires.
+    if (!Serial) {
+        SerialMux::onTransportLost(millis());
+    }
+
     handleShellInput();
     flushPendingEspNowOutput(asyncOutputOccurred);
 

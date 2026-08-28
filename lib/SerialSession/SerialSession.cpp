@@ -480,4 +480,13 @@ bool Session::pollTimeout(std::uint64_t nowMs, char outConsoleLine[kConsoleLineC
     return true;
 }
 
+bool Session::onTransportLost() noexcept {
+    if (state_ == State::Console) {
+        return false;
+    }
+    state_ = State::Console;
+    deadlineMs_ = 0U;
+    return true;
+}
+
 } // namespace SerialSession

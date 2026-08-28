@@ -164,6 +164,12 @@ bool tryEnterFromConsoleLine(const char* line, std::uint32_t nowMs) noexcept;
 // already negotiating/protocolled.
 bool enterFromCommand(std::uint32_t nowMs) noexcept;
 
+// Immediately abandons an active/negotiating session when the physical USB
+// transport vanishes (CDC DTR low). There is no wire response on this path;
+// it exists so an abruptly closed desktop cannot leave the dongle stuck in
+// protocol mode until the inactivity watchdog expires.
+void onTransportLost(std::uint32_t nowMs) noexcept;
+
 // Drives everything else: incremental RX decode + dispatch, watchdog
 // timeout, periodic STATUS heartbeat and TX queue draining. No-op (and does
 // not touch Serial) while console-owned -- safe to call unconditionally once
