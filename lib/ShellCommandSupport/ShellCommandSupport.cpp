@@ -1,5 +1,6 @@
 #include "ShellCommandSupport.h"
 
+#include "ClockText.h"
 #include "SerialMux.h"
 #include "ShellOutput.h"
 
@@ -244,37 +245,8 @@ bool parseMacAddress(const string& text, uint8_t outMac[6]) {
 }
 
 bool parseDateTimeText(const string& text, time_t& outEpoch) {
-    int year = 0;
-    int month = 0;
-    int day = 0;
-    int hour = 0;
-    int minute = 0;
-    int second = 0;
-
     const string clean = stripOuterQuotes(text);
-    if (std::sscanf(clean.c_str(), "%d-%d-%d %d:%d:%d", &year, &month, &day, &hour, &minute, &second) != 6) {
-        return false;
-    }
-
-    if (year < 2024 || month < 1 || month > 12 || day < 1 || day > 31 || hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) {
-        return false;
-    }
-
-    std::tm tmValue = {};
-    tmValue.tm_year = year - 1900;
-    tmValue.tm_mon = month - 1;
-    tmValue.tm_mday = day;
-    tmValue.tm_hour = hour;
-    tmValue.tm_min = minute;
-    tmValue.tm_sec = second;
-
-    const time_t epoch = mktime(&tmValue);
-    if (epoch <= 0) {
-        return false;
-    }
-
-    outEpoch = epoch;
-    return true;
+    return ClockText::parse(clean, outEpoch);
 }
 
 uint8_t clampByte(int32_t value) {

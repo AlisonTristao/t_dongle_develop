@@ -85,7 +85,8 @@ uint8_t wrapper_dongle_clock() {
 uint8_t wrapper_dongle_set_clock(string dateTimeText) {
     time_t epoch = 0;
     if (!parseDateTimeText(dateTimeText, epoch)) {
-        return failWithCode(AppError::Code::CLOCK_FORMAT_INVALID, "formato invalido. Use: YYYY-MM-DD HH:MM:SS");
+        return failWithCode(AppError::Code::CLOCK_FORMAT_INVALID,
+                            "formato invalido. Use: YYYY-MM-DD HH:MM:SS ou @epoch");
     }
 
     timeval tv = {};
@@ -834,7 +835,8 @@ uint8_t registerAll() {
 
     context().shell->add(wrapper_dongle_ping, "ping", "quick local test", "dongle");
     context().shell->add(wrapper_dongle_clock, "clock", "show current RTC time", "dongle");
-    context().shell->add(wrapper_dongle_set_clock, "set_clock", "set RTC: <\"YYYY-MM-DD HH:MM:SS\">", "dongle");
+    context().shell->add(wrapper_dongle_set_clock, "set_clock",
+                         "set RTC: <\"YYYY-MM-DD HH:MM:SS\"|\"@epoch\">", "dongle");
     context().shell->add(wrapper_dongle_run, "run", "execute a command locally: <command>", "dongle");
     context().shell->add(wrapper_dongle_led, "led", "set RGB LED: <r>, <g>, <b>", "dongle");
     context().shell->add(wrapper_dongle_led_off, "led_off", "turn off LED", "dongle");

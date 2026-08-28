@@ -6,7 +6,9 @@
 #include <esp_system.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <vector>
 
 #include "config.h"
@@ -26,6 +28,12 @@
 namespace {
 
 constexpr size_t kRxDisplayFlushBurst = 48;
+
+// Same POSIX timezone used by bally_OS's default RobotSettings. The system
+// clock itself is Unix epoch/UTC; this only defines how manual set_clock
+// calendar input and every localtime_r() presentation (LCD, database, shell)
+// map that epoch to Bally's local wall clock.
+constexpr char kDongleTimezone[] = "BRT3";
 
 // Deferred SQLite open (topico 35 C.3): first try this many ms into uptime
 // (let begin()'s allocations settle), then retry at this cadence, at most
@@ -325,6 +333,9 @@ void AppRuntime::handleShellInput() {
 }
 
 void AppRuntime::begin() {
+    setenv("TZ", kDongleTimezone, 1);
+    tzset();
+
     // Must run before the USB stack comes up (ARDUINO_USB_CDC_ON_BOOT=1
     // starts it as soon as Serial is touched below) -- tinyusb reads these
     // strings when building the descriptor for host enumeration.

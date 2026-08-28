@@ -87,7 +87,7 @@ uint8_t wrapper_help_e() {
     printLine("[help] comandos gerais");
     printLine("Uso: <module> -<command> [args]");
     printLine("Horario RTC local: dongle -clock");
-    printLine("Ajustar RTC local: dongle -set_clock \"YYYY-MM-DD HH:MM:SS\"");
+    printLine("Ajustar RTC local: dongle -set_clock \"YYYY-MM-DD HH:MM:SS\" (ou \"@epoch\")");
     printLine("Exemplo local LCD: dongle -lcd \"Ola dongle\"");
     printLine("Se LCD nao aparecer: dongle -lcd_bl 1 e depois dongle -lcd_reinit");
     printLine("Se LCD estiver invertido: dongle -lcd_rot 0..3");
