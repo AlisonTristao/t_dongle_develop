@@ -64,10 +64,12 @@ constexpr std::uint16_t kLinkTopicId = kHubTopicBlockBase + 0x01U;   // hub.link
 constexpr std::uint16_t kUsbTopicId = kHubTopicBlockBase + 0x02U;    // hub.usb
 constexpr std::uint16_t kPeersTopicId = kHubTopicBlockBase + 0x03U;  // hub.peers
 
-// First version of all three layouts. Any change to a layout or to the
-// meaning of a field needs a new value here *and* a bump of
-// ManifestCache::kSelfConfigRevision (commands.md section 3.3).
-constexpr std::uint16_t kSchemaVersion = 1U;
+// Version 2 adds the five downstream-relay outcome counters to hub.usb.
+// Any change to a layout or to the meaning of a field needs a new value here
+// *and* a bump of ManifestCache::kSelfConfigRevision (commands.md section
+// 3.3), otherwise a client can retain and decode the old layout as if it were
+// still current.
+constexpr std::uint16_t kSchemaVersion = 2U;
 
 // Peers this dongle can describe at once. Must equal
 // BtpTransport::kPeerIdentityCapacity -- static_assert'ed in the .cpp -- and
@@ -134,6 +136,16 @@ struct UsbCounters {
     std::uint64_t reassemblyRejected;
     std::uint64_t telemetryDropped;
     std::uint64_t droppedByClass[kUsbDropClassCount];
+    // Downstream relay outcomes by reason (SerialMux::TxCounters). Published
+    // because "my command never reaches the robot" is otherwise undiagnosable
+    // from the desktop: unbound says the binding is missing, no_peer says the
+    // robot has not been heard from, oversized says the child encoded on the
+    // wrong transport profile. Each one points at a different repository.
+    std::uint64_t relayDownOk;
+    std::uint64_t relayDownUnbound;
+    std::uint64_t relayDownNoPeer;
+    std::uint64_t relayDownOversized;
+    std::uint64_t relayDownSendFailed;
 };
 
 /**
@@ -203,7 +215,7 @@ struct Snapshot {
 constexpr std::size_t kSchemaVersionPrefixSize = 2U;
 constexpr std::size_t kLinkPayloadSize = kSchemaVersionPrefixSize + 12U * 4U;  // 50
 constexpr std::size_t kUsbPayloadSize =
-    kSchemaVersionPrefixSize + 6U * 8U + kUsbDropClassCount * 8U;  // 82
+    kSchemaVersionPrefixSize + 6U * 8U + kUsbDropClassCount * 8U + 5U * 8U;  // 122
 
 // hub.peers is six variable arrays, each prefixed by its own
 // `element_count:uint16_le` (telemetry.md 4.1). Per peer that is

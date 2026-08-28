@@ -23,7 +23,8 @@ uint8_t wrapper_database_init() {
         return failWithCode(AppError::Code::ESPNOW_NOT_READY, "espnow indisponivel para bootstrap do database");
     }
 
-    if (context().database->begin(*context().espNow, context().io)) {
+    if (context().database->begin(context().io)) {
+        context().database->loadPeers(*context().espNow);
         const bool syncOk = context().database->syncPeersFromManager(*context().espNow);
         if (!syncOk) {
             warnWithCode(AppError::Code::DATABASE_PEER_SYNC_FAILED, "database inicializado, mas falhou ao sincronizar peers");

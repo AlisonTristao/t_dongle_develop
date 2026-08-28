@@ -42,9 +42,20 @@ struct StatsSnapshot {
     // schema): "espnow -stats" is the one place this dongle can currently
     // see it.
     uint32_t droppedAuth;
+    // Radio datagrams dropped because async RX never came up at boot (heap
+    // starvation). Nonzero = the dongle booted degraded and cannot hear the
+    // radio at all -- fix the boot heap (topico 34/35), do not chase a
+    // "robot offline". Bench-only, like droppedAuth.
+    uint32_t syncFallbackDrops;
 
     // USB-Serial hop (dongle -> desktop).
+    uint64_t framesRx;
     uint64_t framesTx;
+    // Frames the mux could not push to the port -- the host is not asserting
+    // DTR on the CDC (so USBCDC::write() drops every byte) or the cable is
+    // gone. framesRx climbing while framesTx is flat and this rises is the
+    // signature of "the desktop sends but never hears us" (topico 35 F1).
+    uint64_t framesTxStalled;
     uint64_t telemetryDropped;
     uint64_t droppedSession;
     uint64_t droppedTerminal;

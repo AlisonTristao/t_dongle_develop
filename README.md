@@ -184,7 +184,9 @@ a regra de quando um módulo novo deve entrar em `Context` ou pode ser incluído
 ### `AppRuntime::begin()`
 
 1. `BoardConfig::initBoardPins(false)` — pinos em estado seguro (LCD apagado)
-2. inicia `ShellSerial` na baudrate de `platformio.ini` (`BAUDRATE`)
+2. `Serial.setRxBufferSize(1024)` (margem para as linhas `BTP/1 ENTER` que o
+   host empilha durante o boot, o default da CDC é 256 B) e inicia `ShellSerial`
+   na baudrate de `platformio.ini` (`BAUDRATE`, cosmético na CDC nativa)
 3. inicializa LED/LCD e anuncia o boot (`StartupConfig::announceBoot`) — não aguarda mais um
    monitor serial conectar (esse gate dependia de `Serial` refletir DTR asserted pelo host, o
    que só terminais interativos fazem ao abrir a porta; um cliente automático como o TraceView
@@ -194,15 +196,27 @@ a regra de quando um módulo novo deve entrar em `Context` ou pode ser incluído
 4. inicia SD, imprime MAC Wi-Fi
 5. deriva a identidade BTP deste boot (`BtpTransport::configureIdentity`) e chama
    `SerialMux::begin(...)`, ligando-o ao `ShellConfig::runLine` via callback
-6. conecta callbacks ESP-NOW e habilita a fila RX assíncrona (`EspNowConfig`)
-7. `espNowManager_.begin(...)`, depois `databaseStore_.begin(...)` + `logBootEvent("power_on")`
+6. conecta callbacks ESP-NOW e habilita a fila RX assíncrona (`EspNowConfig`);
+   se essa alocação falhar (heap), `onDataRecv` passa a **descartar** datagramas
+   de rádio — nunca a processá-los inline (estouraria a stack da task Wi-Fi) —
+   e o boot avisa em alto e bom som
+7. `espNowManager_.begin(...)`
 8. sobe as tasks FreeRTOS (RX worker, heartbeat worker)
 9. `ShellConfig::bind(...)` + `ShellConfig::registerDefaultModules()`
-10. restaura histórico do shell a partir do banco (`readRecentCommands`)
+
+O **SQLite não abre no `begin()`** (tópico 35 C.3): seu bootstrap tem um pico
+transiente de ~30-40 KB e, no meio das alocações de `SerialMux`/ESP-NOW/Wi-Fi,
+era o maior risco de OOM do caminho crítico. `AppRuntime::maybeInitDatabase()`
+(chamado no `tick()`) abre o banco ~400 ms depois do boot, com folga de heap,
+fora de um handshake BTP em andamento; ao abrir faz `logBootEvent`, carrega os
+peers persistidos e restaura o histórico do shell. Até lá, todo método do
+`DatabaseStore` falha fechado (`"nao inicializado"`) e um robô conhecido se
+re-registra no primeiro frame de rádio.
 
 ### `AppRuntime::tick()` (chamado a cada `loop()`)
 
-1. processa avisos assíncronos e saída ESP-NOW pendente
+1. `maybeInitDatabase()` — abre o SQLite fora do caminho de boot (no-op depois
+   de aberto); processa avisos assíncronos e saída ESP-NOW pendente
 2. `lcdDashboard_.tick()` — redesenha tiles que mudaram (throttled internamente)
 3. lê input da serial e roda o comando (`ShellConfig::runLine`) -- só quando `SerialMux`
    ainda não é dono da porta (ver seção 7bis)
@@ -591,6 +605,16 @@ Substitui o antigo terminal de rolagem (o texto já existe na serial e no banco)
 - `ShellCommandSupport::printLine()` manda a mesma linha para: serial, buffer de
   persistência (`command_log_output`) e banner do LCD (com cor por heurística de texto)
 
+> **A CDC nativa do ESP32-S3 (`ARDUINO_USB_MODE=0`) só TRANSMITE com DTR
+> afirmado pelo host.** `tud_cdc_n_connected()` testa só o bit DTR, e
+> `USBCDC::write()` retorna 0 — descartando todo byte — enquanto ele estiver
+> baixo. RX funciona sem DTR. Um terminal que abre a porta sem afirmar DTR vê
+> o serial **vazio** mesmo com o dongle rodando normal. `pio device monitor`,
+> PuTTY e o Serial Monitor do Arduino afirmam; alguns apps web e minicom sem
+> `-a` não. Qualquer cliente novo (script, ferramenta) tem que afirmar DTR —
+> é por isso que o TraceView faz `setDataTerminalReady(true)` ao abrir
+> (`SerialManager::open`). Ver tópico 35 F1.
+
 ## 10. Build, upload e monitor
 
 Config principal: [platformio.ini](platformio.ini) — ambiente `tdongle-s3`,
@@ -604,6 +628,15 @@ platformio run -e tdongle-s3 -t monitor
 
 `scripts/pio_warnings.py` aplica `-Wno-discarded-qualifiers` na compilação C do
 `Sqlite3Esp32` (upstream gera esse warning, não é nosso código).
+
+`-DDIAG_BOOT` (em `build_flags`, **ligado por padrão** enquanto se valida o
+boot na bancada): imprime `after_* free_heap=` a cada alocador do `begin()`,
+`reg:* largest=` a cada módulo do shell, e segura 2 s no início para a CDC
+re-enumerar. Comente essa linha para um build de campo — o boot fica quieto
+(só `last_reset=`, que fica sempre ligado) e o handshake não paga os 2 s.
+`-DDONGLE_USB_NO_AUTORESET` desliga o reboot-por-linha da USBCDC (nenhum toque
+de 1200 bps nem sequência de DTR reinicia o firmware rodando) ao custo de
+gravar só com o botão BOOT — só para build de campo/demo.
 
 Há também um ambiente host-only, `env:native`, que roda `ProtocolRouter`/`BtpTransport`/
 `SerialSession` contra os vetores canônicos de `BTP/test-vectors/v1` sem

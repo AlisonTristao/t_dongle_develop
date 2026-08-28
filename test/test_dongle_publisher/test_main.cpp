@@ -84,6 +84,11 @@ DonglePublisher::UsbCounters sampleUsb() {
         // of the fields above -- see the droppedByClass test.
         c.droppedByClass[i] = 0xD0000000ULL + i;
     }
+    c.relayDownOk = 0xE000000000000001ULL;
+    c.relayDownUnbound = 0xE000000000000002ULL;
+    c.relayDownNoPeer = 0xE000000000000003ULL;
+    c.relayDownOversized = 0xE000000000000004ULL;
+    c.relayDownSendFailed = 0xE000000000000005ULL;
     return c;
 }
 
@@ -159,7 +164,7 @@ void test_usb_payload_layout_is_exact() {
     const size_t written =
         DonglePublisher::packUsb(counters, buffer, sizeof(buffer));
     TEST_ASSERT_EQUAL_UINT32(DonglePublisher::kUsbPayloadSize, written);
-    TEST_ASSERT_EQUAL_UINT32(82U, written);  // 2 + 6*8 + 4*8, spelled out
+    TEST_ASSERT_EQUAL_UINT32(122U, written);  // 2 + 6*8 + 4*8 + 5*8
 
     TEST_ASSERT_EQUAL_UINT16(DonglePublisher::kSchemaVersion, readU16(buffer));
 
@@ -168,6 +173,14 @@ void test_usb_payload_layout_is_exact() {
                                   counters.reassemblyRejected, counters.telemetryDropped};
     for (size_t i = 0U; i < 6U; ++i) {
         TEST_ASSERT_EQUAL_UINT64(expected[i], readU64(buffer + 2U + i * 8U));
+    }
+
+    const size_t relayBase = 2U + 6U * 8U + DonglePublisher::kUsbDropClassCount * 8U;
+    const uint64_t relayExpected[5] = {
+        counters.relayDownOk, counters.relayDownUnbound, counters.relayDownNoPeer,
+        counters.relayDownOversized, counters.relayDownSendFailed};
+    for (size_t i = 0U; i < 5U; ++i) {
+        TEST_ASSERT_EQUAL_UINT64(relayExpected[i], readU64(buffer + relayBase + i * 8U));
     }
 }
 

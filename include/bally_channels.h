@@ -30,7 +30,7 @@ namespace bally {
 
 // Bumped whenever the meaning of anything below changes in a way the other
 // two ends must be rebuilt for. Not a wire field -- nothing here travels.
-static const std::uint8_t kChannelContractVersion = 2U;
+static const std::uint8_t kChannelContractVersion = 4U;
 
 // ---------------------------------------------------------------------------
 // The three channels
@@ -113,11 +113,12 @@ enum class Side : std::uint8_t { Cable, Radio };
 
 // The hub's side of the same question. It needs the arrival side because
 // source_id alone cannot answer it: a frame arriving from the radio is
-// C_Link if the dongle consumes it and B_Endpoint merely passing through if
-// it does not, and both carry the same robot as source. dongle_consumes()
-// below is that decision, so the two functions compose:
+// C_Link if the dongle authenticates and consumes it and B_Endpoint merely
+// passing through if it does not; both carry the same robot as source. The
+// header only identifies a *candidate* below. The final decision follows
+// reassembly and an L-key open, because the reference field is ciphertext.
 //
-//     dongle_channel_of(Side::Radio, dongle_consumes(...))
+//     dongle_channel_of(Side::Radio, authenticated_and_consumed)
 //
 // B_Endpoint here means "the dongle relays this and cannot read it" -- the
 // hub holds key L, never any robot's key E. Whoever holds the dongle
@@ -129,7 +130,7 @@ constexpr Channel dongle_channel_of(Side side, bool consumed) noexcept {
 }
 
 // ---------------------------------------------------------------------------
-// What the dongle consumes, and therefore what it relays
+// What the dongle may consume, and therefore what it must authenticate
 // ---------------------------------------------------------------------------
 // BTP wire constants (docs/commands.md section 1, "object_id namespaces").
 // Redeclared here rather than included from any repository's own header,
@@ -139,6 +140,7 @@ constexpr Channel dongle_channel_of(Side side, bool consumed) noexcept {
 // that header is the one that is wrong.
 static const std::uint16_t kCommandRequestObjectId = 0x0001U;
 static const std::uint16_t kCommandResultObjectId = 0x0002U;
+static const std::uint16_t kManifestDataObjectId = 0x0004U;
 static const std::uint16_t kStatusObjectId = 0x0009U;
 
 // The radio ingress rule, inverted from what a cable would do: EVERYTHING
@@ -151,35 +153,77 @@ static const std::uint16_t kStatusObjectId = 0x0009U;
 // something to the list makes it arrive at the console -- visible, and
 // harmless -- instead of disappearing.
 //
-// The list has exactly two entries, and the second one is a single idea
-// rather than a pair of cases: a COMMAND naming this dongle is this dongle's
-// business, whichever direction it travels. A COMMAND_REQUEST addressed to it
-// is one it should run; a COMMAND_RESULT answering a request it issued is one
-// it asked for. Both stop here; a COMMAND naming anyone else is relayed.
+// The list has exactly three entries, and the last two are each a single
+// idea rather than a pair of cases:
 //
-// Writing it as "addressed to me" rather than as two separate rules is what
-// keeps a capability from quietly disappearing: an earlier version listed only
-// the result, and the consequence was that a command sent to this dongle over
-// the radio stopped being executed while a desktop session was attached --
-// with nothing reporting why.
+//   - a COMMAND naming this dongle is this dongle's business, whichever
+//     direction it travels. A COMMAND_REQUEST addressed to it is one it
+//     should run; a COMMAND_RESULT answering a request it issued is one it
+//     asked for. Both stop here; a COMMAND naming anyone else is relayed.
 //
-// `command_peer_source_id` is the source_id the COMMAND names, and it sits at
-// offset 0 of the payload either way: `target_source_id` for a request, and
-// `request_source_id` for a result. Pass 0 for every other message type.
+//   - a MANIFEST_DATA answering a MANIFEST_REQUEST this dongle itself issued
+//     is this dongle's business for the same reason. bally_dongle's
+//     ManifestCache is what a hub-child's own targeted MANIFEST_REQUEST is
+//     answered from (SerialMux::handleManifestRequest) and what
+//     hub.peers is built from, and both stay empty for a robot forever if
+//     the one reply that would teach the cache about it is relayed away
+//     instead of read (EspNowConfig.cpp's primeManifestIfNeeded /
+//     ingestManifestData). A robot's manifest pushed toward anyone else, or
+//     one this dongle never asked for, is still relayed -- this is
+//     "addressed to me", the same test as COMMAND above, not "every
+//     manifest is the hub's".
+//
+// Writing both as "addressed to me" rather than as separate rules is what
+// keeps a capability from quietly disappearing: an earlier version of the
+// COMMAND rule listed only the result, and the consequence was that a
+// command sent to this dongle over the radio stopped being executed while a
+// desktop session was attached -- with nothing reporting why. The
+// MANIFEST_DATA gap was the same shape, just quieter: ManifestCache never
+// learned a robot's schema while a desktop was attached, because the one
+// message that would teach it was always relayed instead of read, so a
+// robot's catalog silently never appeared even though its link (channel C,
+// the heartbeat) was healthy.
+//
+// `reference_source_id` is the source_id the message's own reference prefix
+// names, and it sits at offset 0 of the *authenticated plaintext* either
+// way: for a COMMAND,
+// `target_source_id` on a request and `request_source_id` on a result
+// (BtpTransport::btp_command); for MANIFEST_DATA, the original request's own
+// source_id, copied back by whoever answers it (bally_OS's
+// ManifestResponder, bally_dongle's ManifestCache -- both start the payload
+// with it). It is not legal to inspect those bytes before RadioSeal::open():
+// on B_Endpoint they are E-key ciphertext, and on a fragmented message they
+// are not necessarily in the datagram currently being handled. Pass 0 for
+// every other message type.
 //
 // heartbeat and presence are one entry, not two: in this firmware both ride
 // CONTROL/STATUS (object_id 0x0009), which the dongle originates toward a
 // peer and whose answer is what lights the link tile. If presence ever gets
 // an object_id of its own, it belongs in this list and nowhere else.
+// Header-only prefilter. A positive result does not say the dongle owns the
+// message; it means only that it must retain/reassemble it and try key L.
+// Call dongle_consumes() only after that succeeds.
+constexpr bool dongle_may_consume(btp::MessageType type,
+                                  std::uint16_t object_id) noexcept {
+    return (type == btp::MessageType::Control && object_id == kStatusObjectId) ||
+           (type == btp::MessageType::Command &&
+            (object_id == kCommandRequestObjectId || object_id == kCommandResultObjectId)) ||
+           (type == btp::MessageType::Control && object_id == kManifestDataObjectId);
+}
+
+// Final C-link ownership check. `reference_source_id` MUST have been read
+// from authenticated plaintext after logical reassembly.
 constexpr bool dongle_consumes(btp::MessageType type, std::uint16_t object_id,
-                               std::uint32_t command_peer_source_id,
+                               std::uint32_t reference_source_id,
                                std::uint32_t self_source_id) noexcept {
     return (type == btp::MessageType::Control &&
             object_id == kStatusObjectId) ||
-           (type == btp::MessageType::Command &&
-            (object_id == kCommandRequestObjectId ||
-             object_id == kCommandResultObjectId) &&
-            command_peer_source_id == self_source_id && self_source_id != 0U);
+           (((type == btp::MessageType::Command &&
+              (object_id == kCommandRequestObjectId ||
+               object_id == kCommandResultObjectId)) ||
+             (type == btp::MessageType::Control &&
+              object_id == kManifestDataObjectId)) &&
+            reference_source_id == self_source_id && self_source_id != 0U);
 }
 
 }  // namespace bally

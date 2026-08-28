@@ -21,6 +21,10 @@ private:
     static void espNowHeartbeatWorkerTask(void* param);
 
     void restoreShellHistoryFromDatabase();
+    // Opens SQLite off the boot path (topico 35 C.3): called every tick(),
+    // a no-op once the DB is up or after the attempt budget is spent. The
+    // first attempt waits a beat so begin()'s big allocations have settled.
+    void maybeInitDatabase();
     BaseType_t selectEspNowWorkerCore() const;
     void startEspNowWorkers(bool asyncRxEnabled);
     void startHeartbeatWorker();
@@ -37,4 +41,9 @@ private:
 
     TaskHandle_t espNowRxTaskHandle_ = nullptr;
     TaskHandle_t espNowHeartbeatTaskHandle_ = nullptr;
+
+    // Deferred SQLite open (topico 35 C.3).
+    bool databaseReady_ = false;
+    uint8_t databaseInitAttempts_ = 0;
+    uint32_t lastDatabaseInitMs_ = 0;
 };

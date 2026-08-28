@@ -16,6 +16,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 
+#include <cstddef>
 #include <cstring>
 
 namespace SerialMux {
@@ -48,8 +49,12 @@ namespace {
 // ~52 KB of heap. That is in line with what this firmware already spends on
 // the ESP-NOW RX/routed queues (~75 KB) and is the reason the two large
 // per-call frame buffers below became file-scope statics instead of growing
-// the main loop's stack by 3 KB.
-constexpr std::size_t kOutboundPayloadCap = 1600U;
+// the main loop's stack by 3 KB. Raised again to 2048 by the hub.usb v2
+// counters: the complete three-topic descriptor must fit in ONE descriptor;
+// emitting hub.link/hub.usb while silently losing hub.peers leaves the UI
+// unable to discover robots. This remains well below BTP serial's 4056-byte
+// wire ceiling and costs about 14 KB more across the 32 queued frames.
+constexpr std::size_t kOutboundPayloadCap = 2048U;
 constexpr std::size_t kMaxFrameBytes = btp::kV1HeaderSize + btp::kV1CrcSize + kOutboundPayloadCap;
 constexpr std::size_t kMaxCobsBytes = kMaxFrameBytes + kMaxFrameBytes / 254U + 4U;
 
@@ -64,17 +69,38 @@ static_assert(DonglePublisher::kUsbDropClassCount == kPriorityClassCount,
 
 constexpr UBaseType_t kQueueDepth[kPriorityClassCount] = {
     /*kSession=*/4U,
-    /*kTerminal=*/4U,
-    /*kLogStatus=*/8U,
+    /*kTerminal=*/3U,
+    /*kLogStatus=*/6U,
     /*kTelemetry=*/16U,
 };
 
 constexpr std::uint32_t kStatusIntervalMs = 2000U;
 
 struct QueuedFrame {
-    std::uint8_t bytes[kMaxFrameBytes];
-    std::size_t size;
+    std::size_t size;                     // first, so a short per-class queue
+    std::uint8_t bytes[kMaxFrameBytes];   // item still copies the length field
 };
+
+// Per-class heap budget for the four TX queues. Only kTelemetry is
+// bounded-small by construction: one ESP-NOW-profile sample (<=250 payload)
+// or a reassembled robot sample (<= ProtocolRouter::kMaxPayloadSize, 616).
+// The other three can each legitimately hold a kOutboundPayloadCap-sized
+// frame -- a chunked COMMAND_RESULT, a chunked TERMINAL_OUT, a MANIFEST_DATA
+// descriptor or a long LOG line -- so they keep the full slot.
+//
+// Sizing every queue to the shared worst case reserved ~67 KB of heap in
+// begin(); the boot then panicked inside shell-module registration at ~14 KB
+// free (topico 34 section 1B). Right-sizing kTelemetry gives ~22 KB back.
+constexpr std::size_t kClassFrameCap[kPriorityClassCount] = {
+    /*kSession=*/  kMaxFrameBytes,
+    /*kTerminal=*/ kMaxFrameBytes,
+    /*kLogStatus=*/kMaxFrameBytes,
+    /*kTelemetry=*/768U,
+};
+
+constexpr std::size_t classQueueItemSize(std::size_t classIdx) noexcept {
+    return offsetof(QueuedFrame, bytes) + kClassFrameCap[classIdx];
+}
 
 Stream* g_io = nullptr;
 RunShellLineFn g_runShellLine = nullptr;
@@ -111,15 +137,31 @@ volatile std::uint64_t g_crcErrors = 0U;
 volatile std::uint64_t g_decodeErrors = 0U;
 volatile std::uint64_t g_reassemblyRejected = 0U; // fragmented frames received (unsupported, see SerialSession.h)
 volatile std::uint64_t g_telemetryDropped = 0U;
+// Frames whose bytes could not all be pushed to the port -- a USB-CDC that
+// reports "not connected" (the host is not asserting DTR) makes every
+// write() return 0, so this counts, from the dongle's own console, exactly
+// the "cable is up but the desktop is deaf" failure. Diagnostic only, not
+// part of the STATUS wire schema.
+volatile std::uint64_t g_framesTxStalled = 0U;
 volatile std::uint64_t g_droppedByClass[kPriorityClassCount] = {0U, 0U, 0U, 0U};
+// Downstream relay outcomes by reason -- see SerialMux.h's TxCounters for why
+// these are five counters and not one.
+volatile std::uint64_t g_relayDownOk = 0U;
+volatile std::uint64_t g_relayDownUnbound = 0U;
+volatile std::uint64_t g_relayDownNoPeer = 0U;
+volatile std::uint64_t g_relayDownOversized = 0U;
+volatile std::uint64_t g_relayDownSendFailed = 0U;
 
 std::size_t classIndex(SerialSession::PriorityClass cls) noexcept {
     return static_cast<std::size_t>(cls);
 }
 
-void writeAll(const std::uint8_t* data, std::size_t len) noexcept {
+// Returns true only if every byte was accepted by the port. A USB-CDC with no
+// host asserting DTR makes write() return 0 forever, so the caller needs to
+// know the bytes went nowhere rather than assume a frame left the building.
+bool writeAll(const std::uint8_t* data, std::size_t len) noexcept {
     if (g_io == nullptr) {
-        return;
+        return false;
     }
     std::size_t remaining = len;
     const std::uint8_t* cursor = data;
@@ -128,7 +170,7 @@ void writeAll(const std::uint8_t* data, std::size_t len) noexcept {
         const std::size_t sent = g_io->write(cursor, remaining);
         if (sent == 0U) {
             if (++idleRetries > 2000U) {
-                return; // port vanished mid-write; give up rather than spin forever
+                return false; // port vanished / host not reading; give up rather than spin forever
             }
             continue;
         }
@@ -136,6 +178,7 @@ void writeAll(const std::uint8_t* data, std::size_t len) noexcept {
         remaining -= sent;
         idleRetries = 0U;
     }
+    return true;
 }
 
 // The only place that ever writes a BTP frame's bytes to the wire. Called
@@ -148,11 +191,16 @@ void writeFrameCobs(const std::uint8_t* frame, std::size_t frameSize) noexcept {
     if (btp::cobs_encode(frame, frameSize, encoded, sizeof(encoded), &written) != btp::CobsError::Ok) {
         return;
     }
+    // Short-circuit on the first failed write: if the leading delimiter did
+    // not go out the payload will not either (same dead port), and stopping
+    // there avoids both the wasted 2000-spin retries and pushing a headless
+    // partial frame onto the wire if the port flickers back mid-sequence.
     const std::uint8_t zero = 0U;
-    writeAll(&zero, 1U);
-    writeAll(encoded, written);
-    writeAll(&zero, 1U);
-    ++g_framesTx;
+    if (writeAll(&zero, 1U) && writeAll(encoded, written) && writeAll(&zero, 1U)) {
+        ++g_framesTx;
+    } else {
+        ++g_framesTxStalled;
+    }
 }
 
 void writeConsoleText(const char* text) noexcept {
@@ -190,11 +238,11 @@ bool encodeOwnFrame(btp::MessageType type, std::uint16_t objectId, const std::ui
 
 bool enqueueFrameBytes(SerialSession::PriorityClass cls, const std::uint8_t* frameBytes,
                        std::size_t frameSize) noexcept {
-    if (frameSize > kMaxFrameBytes) {
+    const std::size_t index = classIndex(cls);
+    if (frameSize > kClassFrameCap[index]) {
         return false;
     }
 
-    const std::size_t index = classIndex(cls);
     QueueHandle_t queue = g_queues[index];
     if (queue == nullptr) {
         return false;
@@ -273,17 +321,20 @@ void dispatchUpstreamActions(const SubscriptionRegistry::UpstreamAction* actions
 // encodes on the EspNow profile from the origin instead.
 bool relayDown(const btp::DecodedFrame& decoded) noexcept {
     if (g_relayToRadio == nullptr) {
+        ++g_relayDownSendFailed;
         return false;
     }
 
     std::uint32_t peerSourceId = 0U;
     if (!HubRegistry::lookup(decoded.header.source_id, &peerSourceId)) {
+        ++g_relayDownUnbound;
         return false;
     }
 
     std::uint8_t mac[6] = {0};
     std::uint32_t peerBootId = 0U;
     if (!BtpTransport::lookupPeerMacBySourceId(peerSourceId, mac, &peerBootId)) {
+        ++g_relayDownNoPeer;
         return false; // never heard a BTP frame from that robot; cannot address it
     }
 
@@ -291,10 +342,16 @@ bool relayDown(const btp::DecodedFrame& decoded) noexcept {
     std::size_t frameSize = 0U;
     if (!HubRelay::reencodeVerbatim(decoded, btp::TransportProfile::EspNow, frameBytes,
                                     sizeof(frameBytes), &frameSize)) {
+        ++g_relayDownOversized;
         return false; // oversized for the radio: the child encodes on the EspNow profile (D4)
     }
 
-    return g_relayToRadio(mac, frameBytes, frameSize);
+    if (!g_relayToRadio(mac, frameBytes, frameSize)) {
+        ++g_relayDownSendFailed;
+        return false;
+    }
+    ++g_relayDownOk;
+    return true;
 }
 
 // Sends the session's last frame synchronously (bypassing the queues -- it
@@ -370,7 +427,14 @@ void handleCommandRequest(const btp::DecodedFrame& decoded) noexcept {
         // frame TraceView aimed at a robot. It used to be dropped here in
         // silence, which is why commanding a robot through the cable was
         // impossible before this topico.
-        relayDown(decoded);
+        // Discarding the result is deliberate and is no longer the same as
+        // ignoring the failure: relayDown() counts every refusal by reason
+        // (TxCounters::relayDown*), which surfaces in hub.usb and in
+        // "espnow -stats". There is nothing useful to answer here beyond
+        // that -- a bound child's payload may be sealed with a key this
+        // dongle does not hold, so it cannot build a protocol reply about
+        // a message it cannot read.
+        (void)relayDown(decoded);
         return;
     }
     if (parseError != ParseError::Ok) {
@@ -426,7 +490,14 @@ void handleTerminalIn(const btp::DecodedFrame& decoded) noexcept {
     // lose its keystrokes, never have them typed into the dongle's shell.
     std::uint32_t boundPeerSourceId = 0U;
     if (HubRegistry::lookup(decoded.header.source_id, &boundPeerSourceId)) {
-        relayDown(decoded);
+        // Discarding the result is deliberate and is no longer the same as
+        // ignoring the failure: relayDown() counts every refusal by reason
+        // (TxCounters::relayDown*), which surfaces in hub.usb and in
+        // "espnow -stats". There is nothing useful to answer here beyond
+        // that -- a bound child's payload may be sealed with a key this
+        // dongle does not hold, so it cannot build a protocol reply about
+        // a message it cannot read.
+        (void)relayDown(decoded);
         return;
     }
 
@@ -552,6 +623,26 @@ std::uint32_t readU16LeAsU32(const std::uint8_t* data) noexcept {
 // subscriber once the caller passes it the already-capped rate below, so a
 // second, lower-rate subscriber can never raise what the first one capped.
 void handleSubscribeRequest(const btp::DecodedFrame& decoded) noexcept {
+    // Topico 28/31.2: a SUBSCRIBE from a bound hub child is for its robot,
+    // not this dongle -- relay it verbatim, same as handleTerminalIn already
+    // does, and BEFORE touching the payload below. Once the robot accepts
+    // channel B for SUBSCRIBE (bally_OS topico 31.2), that payload is sealed
+    // with a key this dongle never holds, so reading it as the plaintext
+    // fields below would be reading ciphertext -- this check has to come
+    // first, not just be "also correct" alongside the local-answer path.
+    std::uint32_t boundPeerSourceId = 0U;
+    if (HubRegistry::lookup(decoded.header.source_id, &boundPeerSourceId)) {
+        // Discarding the result is deliberate and is no longer the same as
+        // ignoring the failure: relayDown() counts every refusal by reason
+        // (TxCounters::relayDown*), which surfaces in hub.usb and in
+        // "espnow -stats". There is nothing useful to answer here beyond
+        // that -- a bound child's payload may be sealed with a key this
+        // dongle does not hold, so it cannot build a protocol reply about
+        // a message it cannot read.
+        (void)relayDown(decoded);
+        return;
+    }
+
     if (decoded.payload.size < 20U || decoded.payload.data == nullptr) {
         return;  // malformed; silently dropped like any other malformed CONTROL payload
     }
@@ -630,6 +721,23 @@ void handleSubscribeRequest(const btp::DecodedFrame& decoded) noexcept {
 // an already-absent subscription is defined as idempotent success, not an
 // error (section 4: "makes retries idempotent").
 void handleUnsubscribeRequest(const btp::DecodedFrame& decoded) noexcept {
+    // Topico 28/31.2: same relay-first rule as handleSubscribeRequest above
+    // -- a bound child's UNSUBSCRIBE is for its robot, and once the robot
+    // accepts channel B for it the payload is sealed under a key this dongle
+    // never holds.
+    std::uint32_t boundPeerSourceId = 0U;
+    if (HubRegistry::lookup(decoded.header.source_id, &boundPeerSourceId)) {
+        // Discarding the result is deliberate and is no longer the same as
+        // ignoring the failure: relayDown() counts every refusal by reason
+        // (TxCounters::relayDown*), which surfaces in hub.usb and in
+        // "espnow -stats". There is nothing useful to answer here beyond
+        // that -- a bound child's payload may be sealed with a key this
+        // dongle does not hold, so it cannot build a protocol reply about
+        // a message it cannot read.
+        (void)relayDown(decoded);
+        return;
+    }
+
     if (decoded.payload.size < 12U || decoded.payload.data == nullptr) {
         return;  // malformed; silently dropped like any other malformed CONTROL payload
     }
@@ -894,7 +1002,7 @@ void begin(Stream& io, RunShellLineFn runShellLine, const std::uint8_t selfUuid[
 
     for (std::size_t i = 0U; i < kPriorityClassCount; ++i) {
         if (g_queues[i] == nullptr) {
-            g_queues[i] = xQueueCreate(kQueueDepth[i], sizeof(QueuedFrame));
+            g_queues[i] = xQueueCreate(kQueueDepth[i], classQueueItemSize(i));
         }
     }
 
@@ -930,6 +1038,7 @@ bool isProtocolled() noexcept {
 void peekTxCounters(TxCounters& out) noexcept {
     out.framesRx = g_framesRx;
     out.framesTx = g_framesTx;
+    out.framesTxStalled = g_framesTxStalled;
     out.crcErrors = g_crcErrors;
     out.decodeErrors = g_decodeErrors;
     out.reassemblyRejected = g_reassemblyRejected;
@@ -937,6 +1046,11 @@ void peekTxCounters(TxCounters& out) noexcept {
     for (std::size_t i = 0U; i < kPriorityClassCount; ++i) {
         out.droppedByClass[i] = g_droppedByClass[i];
     }
+    out.relayDownOk = g_relayDownOk;
+    out.relayDownUnbound = g_relayDownUnbound;
+    out.relayDownNoPeer = g_relayDownNoPeer;
+    out.relayDownOversized = g_relayDownOversized;
+    out.relayDownSendFailed = g_relayDownSendFailed;
 }
 
 bool tryEnterFromConsoleLine(const char* line, std::uint32_t nowMs) noexcept {
@@ -987,6 +1101,10 @@ void tick(std::uint32_t nowMs) noexcept {
         return; // pumpRx() may have just closed the session (SESSION_CLOSE/HelloRejected).
     }
 
+    // Captured before pollTimeout() flips the state: distinguishes an
+    // established session lost to the 30s inactivity watchdog from a
+    // negotiation that never got its HELLO within kHelloDeadlineMs.
+    const bool wasProtocolled = g_session.isProtocolled();
     char consoleLine[SerialSession::kConsoleLineCapacity];
     if (g_session.pollTimeout(nowMs, consoleLine)) {
         // PASSO 6: same "session ended" cleanup as finalizeToConsole() above,
@@ -1001,6 +1119,15 @@ void tick(std::uint32_t nowMs) noexcept {
         }
         resetQueues();
         writeConsoleText(consoleLine);
+        // B.4 (topico 35): bench visibility -- from the port alone a session
+        // that fell to the watchdog is indistinguishable from a healthy
+        // console. The "BTP/1 CONSOLE" line above is for the desktop; this
+        // is for a human reading the monitor.
+        if (g_io != nullptr) {
+            ShellOutput::printTagged(*g_io, "btp",
+                wasProtocolled ? "sessao expirou (watchdog de inatividade) -> console"
+                               : "HELLO nao chegou a tempo -> console");
+        }
         g_decoder.reset();
         g_terminalPty.reset(); // same discard-pending-work rule as finalizeToConsole()
         return;

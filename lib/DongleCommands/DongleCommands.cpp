@@ -363,7 +363,7 @@ uint8_t wrapper_dongle_sd_wipe() {
     }
 
     if (context().database != nullptr) {
-        if (context().database->begin(*context().espNow, context().io)) {
+        if (context().database->begin(context().io)) {
             if (!context().database->syncPeersFromManager(*context().espNow)) {
                 warnWithCode(AppError::Code::DATABASE_PEER_SYNC_FAILED, "database recriado, mas falhou ao sincronizar peers");
             }
@@ -718,6 +718,35 @@ uint8_t wrapper_hub_unbind(string child) {
     return RESULT_OK;
 }
 
+// The counterpart to "hub -bind": without it an operator can set a binding
+// and has no way to read one back, which matters because the table is RAM
+// only and a dongle reboot silently empties it while the desktop still
+// believes its children are routed. HubRegistry::enumerate() has existed
+// since the table did and had no caller at all until this.
+uint8_t wrapper_hub_list() {
+    HubRegistry::Binding bindings[HubRegistry::kMaxBindings];
+    const size_t count = HubRegistry::enumerate(bindings, HubRegistry::kMaxBindings);
+
+    if (count == 0U) {
+        printLine("[hub] nenhum vinculo (o TraceView envia hub -bind ao conectar um filho)");
+        return RESULT_OK;
+    }
+
+    char line[80] = {0};
+    for (size_t i = 0U; i < count; ++i) {
+        std::snprintf(line, sizeof(line), "[hub] %08lX -> %08lX",
+                      static_cast<unsigned long>(bindings[i].childSourceId),
+                      static_cast<unsigned long>(bindings[i].peerSourceId));
+        printLine(line);
+    }
+
+    std::snprintf(line, sizeof(line), "[hub] %lu de %lu slots em uso",
+                  static_cast<unsigned long>(count),
+                  static_cast<unsigned long>(HubRegistry::kMaxBindings));
+    printLine(line);
+    return RESULT_OK;
+}
+
 void appendHex(string& out, const uint8_t* data, size_t size) {
     char byteText[3] = {0};
     for (size_t i = 0; i < size; ++i) {
@@ -837,6 +866,7 @@ uint8_t registerAll() {
     context().shell->create_module("hub", "relay bindings between console children and robots");
     context().shell->add(wrapper_hub_bind, "bind", "route a child at a robot: <child_source_id>, <peer_source_id>", "hub");
     context().shell->add(wrapper_hub_unbind, "unbind", "drop a child routing: <child_source_id>", "hub");
+    context().shell->add(wrapper_hub_list, "list", "show every child-to-robot binding in effect", "hub");
     context().shell->add(wrapper_hub_set_key_l, "set_key_l", "derive and store channel C key from a password: <senha>", "hub");
     context().shell->add(wrapper_hub_key_status, "key_status", "show whether channel C key L is loaded (never prints the key)", "hub");
 

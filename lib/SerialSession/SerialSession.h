@@ -56,11 +56,17 @@ struct LocalLimits {
     // larger than what was negotiated is a protocol violation even if the
     // queues happen to hold it. Raised with that cap by topico 27 so the
     // dongle's own manifest (1440 octets) fits inside the negotiated limit.
-    std::uint32_t maxLogicalPayload = 1600U;
+    std::uint32_t maxLogicalPayload = 2048U;
     std::uint16_t maxInflightReassemblies = 1U;  // topico 13 does not reassemble serial fragments (see deviation note)
     std::uint16_t maxSubscriptions = 8U;         // matches SubscriptionRegistry::kMaxTopics (topico 17)
     std::uint32_t maxDedupEntries = 32U;         // declared; command dedup not implemented on this transport yet
-    std::uint32_t sessionTimeoutMs = 15000U;     // watchdog: no valid BTP frame in this window -> back to console
+    // Watchdog: no valid BTP frame in this window -> back to console. 30s, not
+    // the original 15s: the desktop keepalive (TraceView BtpBackend, topico 35
+    // B.1) sends every ~5s, so this is only the backstop for a desktop that
+    // died without closing -- and a slightly longer backstop costs nothing
+    // while making a brief stall (GC pause, a busy main loop) far less likely
+    // to drop a live session. Negotiated value is min(this, client's).
+    std::uint32_t sessionTimeoutMs = 30000U;
 };
 
 constexpr std::uint32_t kHelloDeadlineMs = 2000U; // session-and-terminal.md section 3

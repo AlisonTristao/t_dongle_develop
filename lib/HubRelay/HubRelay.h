@@ -7,7 +7,8 @@
 
 /**
  * @brief The two pure decisions the hub's relay is built from: what a radio
- * datagram is (consumed or passed through), and how a frame is put back on
+ * datagram is (a possible C-link message or an immediate pass-through), and
+ * how a frame is put back on
  * the wire without being re-originated.
  *
  * Neither function touches Arduino, FreeRTOS, a queue or a radio -- the glue
@@ -26,24 +27,19 @@ namespace HubRelay {
 /**
  * @brief What one raw radio datagram turned out to be.
  *
- * Only the 36-octet envelope is read. That is enough for every decision
- * below and stays true for a sealed frame, because BTP encrypts the payload
- * and never the header (docs/encryption.md section 5: the header is the AAD,
- * authenticated in the clear).
+ * Only the 36-octet envelope is read. It can nominate a possible C-link
+ * message, but final C/B classification requires logical reassembly followed
+ * by an L-key open; BTP encrypts the reference prefix in the payload.
  */
 struct RadioIngress {
     /** btp::decode()'s verdict. Anything other than Ok means the other fields
      * are meaningless and the datagram is a drop, not a relay. */
     btp::Error error;
     btp::Header header;
-    /** COMMAND_RESULT only: the source_id of the request being answered, read
-     * out of the result's own reference prefix. Zero for every other type,
-     * and zero as well for a COMMAND_RESULT that arrived as a non-first
-     * fragment (the prefix is not in this fragment) -- which resolves to
-     * "relay", the safe default under D6. */
-    std::uint32_t requestSourceId;
-    /** bally::dongle_consumes()' verdict. False means relay upstream. */
-    bool consume;
+    /** bally::dongle_may_consume()' header-only prefilter. True means defer
+     * the decision until reassembly and RadioSeal::open() have authenticated
+     * the plaintext; false can relay immediately. */
+    bool mayConsume;
 };
 
 /**
@@ -51,13 +47,11 @@ struct RadioIngress {
  * ingress rule of bally_channels.h.
  *
  * The rule is inverted from what a cable would do: EVERYTHING goes up to the
- * console except the short, explicit list in
- * bally::dongle_consumes(). This function never writes a second copy of that
- * list -- it only supplies the four arguments the one true list asks for.
+ * console except the short candidate list in bally::dongle_may_consume(). A
+ * candidate is never consumed here, because its reference field could be
+ * ciphertext or live in another fragment.
  */
-RadioIngress classifyRadio(const std::uint8_t* datagram,
-                           std::size_t size,
-                           std::uint32_t selfSourceId) noexcept;
+RadioIngress classifyRadio(const std::uint8_t* datagram, std::size_t size) noexcept;
 
 /**
  * @brief Serializes an already-decoded frame back onto a transport profile

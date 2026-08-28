@@ -222,7 +222,7 @@ void DatabaseStore::unlockDb() {
     }
 }
 
-bool DatabaseStore::begin(EspNowManager& espNow, Stream* io) {
+bool DatabaseStore::begin(Stream* io) {
     io_ = io;
     ready_ = false;
 
@@ -256,11 +256,11 @@ bool DatabaseStore::begin(EspNowManager& espNow, Stream* io) {
         logLine("[database] aviso: nao foi possivel garantir peer default 000");
     }
 
-    if (!loadPeersFromDatabase(espNow)) {
-        logLine("[database] banco aberto, mas falhou carga inicial de peers");
-    }
-
     return true;
+}
+
+bool DatabaseStore::loadPeers(EspNowManager& espNow) {
+    return loadPeersFromDatabase(espNow);
 }
 
 bool DatabaseStore::rebuild(EspNowManager& espNow) {
@@ -271,7 +271,17 @@ bool DatabaseStore::rebuild(EspNowManager& espNow) {
         return false;
     }
 
-    return begin(espNow, io_);
+    if (!begin(io_)) {
+        return false;
+    }
+
+    // rebuild() runs post-boot with ESP-NOW already up (unlike the split
+    // begin()/loadPeers() at startup), so reload peers in the same call.
+    if (!loadPeers(espNow)) {
+        logLine("[database] banco recriado, mas falhou carga inicial de peers");
+    }
+
+    return true;
 }
 
 bool DatabaseStore::backup(String& outText) {
@@ -1181,6 +1191,15 @@ bool DatabaseStore::openDatabase() {
         unlockDb();
         return false;
     }
+
+    // Sqlite3Esp32's config_ext.h bakes in SQLITE_DEFAULT_LOOKASIDE=512,64,
+    // a fixed 32KB-per-connection cache reserved up front. Disabling it here
+    // (must happen before any statement prepares, per the SQLite docs on
+    // SQLITE_DBCONFIG_LOOKASIDE) makes small internal allocations fall back
+    // to general malloc instead -- slower per-statement, irrelevant at this
+    // firmware's call volume, and worth 32KB back out of a boot sequence
+    // that was leaving only ~6KB free (topico 33 bench log).
+    sqlite3_db_config(db_, SQLITE_DBCONFIG_LOOKASIDE, nullptr, 0, 0);
 
     unlockDb();
 

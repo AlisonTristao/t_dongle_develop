@@ -103,6 +103,14 @@ constexpr FieldDesc kUsbFields[] = {
     // total would destroy the only thing it is for.
     {7U, 6U, "dropped_by_class", kTypeUint64, "1",
      static_cast<std::uint16_t>(kUsbDropClassCount), 0U, 0U},
+    // Downstream relay, one field per refusal reason. Separate fields rather
+    // than one "failed" total for the same reason dropped_by_class is an
+    // array and not a sum: each reason names a different thing to go fix.
+    {8U, 7U, "relay_down_ok", kTypeUint64, "1", 1U, 0U, 0U},
+    {9U, 8U, "relay_down_unbound", kTypeUint64, "1", 1U, 0U, 0U},
+    {10U, 9U, "relay_down_no_peer", kTypeUint64, "1", 1U, 0U, 0U},
+    {11U, 10U, "relay_down_oversized", kTypeUint64, "1", 1U, 0U, 0U},
+    {12U, 11U, "relay_down_send_failed", kTypeUint64, "1", 1U, 0U, 0U},
 };
 
 // hub.peers is a variable-length list, and PACKED_LE has no nested-record
@@ -143,11 +151,13 @@ constexpr TopicDesc kTopics[] = {
 
 constexpr std::size_t kTopicCount = sizeof(kTopics) / sizeof(kTopics[0]);
 
-// Measured need for the three tables above is 1364 octets (663 + 393 + 308).
-// Sized with headroom so a name change does not silently truncate the
-// catalog; a *new* hub topic must re-check both this and
-// SerialMux's kOutboundPayloadCap.
-constexpr std::size_t kRecordsCapacity = 1500U;
+// hub.usb grew in schema version 2 with five relay counters.  The old 1500
+// byte buffer then wrote hub.link + hub.usb and silently stopped before
+// hub.peers.  The manifest is the discovery path for the whole hub, so a
+// partial prefix is not an acceptable degraded result.  2048 leaves room for
+// all three current topic records and stays below SerialMux's matching
+// 2048-byte MANIFEST_DATA payload ceiling.
+constexpr std::size_t kRecordsCapacity = 2048U;
 
 // ---------------------------------------------------------------------------
 // Little-endian append cursor. Same shape as ManifestCache's Writer (reserve +
@@ -385,6 +395,9 @@ std::size_t packUsb(const UsbCounters& counters, std::uint8_t* output,
     for (std::size_t i = 0U; ok && i < kUsbDropClassCount; ++i) {
         ok = writer.u64(counters.droppedByClass[i]);
     }
+    ok = ok && writer.u64(counters.relayDownOk) && writer.u64(counters.relayDownUnbound) &&
+         writer.u64(counters.relayDownNoPeer) && writer.u64(counters.relayDownOversized) &&
+         writer.u64(counters.relayDownSendFailed);
     return ok ? writer.size() : 0U;
 }
 

@@ -115,6 +115,19 @@ std::vector<uint8_t> make_command_result_payload(uint32_t requestSourceId) {
     return payload;
 }
 
+// One MANIFEST_DATA reference prefix (BTP/docs/commands.md section 3.2): the
+// 12-octet prefix ManifestResponder::build_manifest_data / ManifestCache::
+// writeManifestData both write first, whose first field is the original
+// request's own source_id -- this dongle's own identity when it is the one
+// answered (primeManifestIfNeeded), same shape as COMMAND_RESULT above.
+std::vector<uint8_t> make_manifest_data_payload(uint32_t requestSourceId) {
+    std::vector<uint8_t> payload(12U, 0U);
+    write_u32(payload.data(), requestSourceId);  // request reference: source_id
+    write_u32(payload.data() + 4U, kSelfBootId);  // request reference: boot_id
+    write_u32(payload.data() + 8U, 3U);           // request reference: sequence
+    return payload;
+}
+
 }  // namespace
 
 void setUp() {}
@@ -207,13 +220,12 @@ void test_relay_up_passes_each_fragment_verbatim_and_reassembles_nothing() {
         const std::vector<uint8_t> datagram = read_vector(names[i]);
         TEST_ASSERT_TRUE_MESSAGE(!datagram.empty(), names[i]);
 
-        const HubRelay::RadioIngress ingress =
-            HubRelay::classifyRadio(datagram.data(), datagram.size(), kSelfSourceId);
+        const HubRelay::RadioIngress ingress = HubRelay::classifyRadio(datagram.data(), datagram.size());
         TEST_ASSERT_EQUAL(static_cast<int>(btp::Error::Ok), static_cast<int>(ingress.error));
 
-        // A sealed TELEMETRY fragment is not on the consume list, so it goes
+        // A sealed TELEMETRY fragment is not a C-link candidate, so it goes
         // up. The dongle holds no key for it and never needed one.
-        TEST_ASSERT_FALSE(ingress.consume);
+        TEST_ASSERT_FALSE(ingress.mayConsume);
         TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(btp::MessageType::Telemetry),
                                 static_cast<uint8_t>(ingress.header.type));
         TEST_ASSERT_TRUE((ingress.header.flags & btp::kFlagEncrypted) != 0U);
@@ -267,39 +279,44 @@ void test_relay_down_passes_each_fragment_verbatim() {
 // ---------------------------------------------------------------------------
 // The ingress rule
 // ---------------------------------------------------------------------------
-void test_heartbeat_status_is_consumed() {
+void test_heartbeat_status_is_a_link_candidate() {
     const btp::Header header = make_header(btp::MessageType::Control, kStatusObjectId);
     const std::vector<uint8_t> datagram = encode_espnow(header, nullptr, 0U);
     TEST_ASSERT_TRUE(!datagram.empty());
 
-    const HubRelay::RadioIngress ingress =
-        HubRelay::classifyRadio(datagram.data(), datagram.size(), kSelfSourceId);
+    const HubRelay::RadioIngress ingress = HubRelay::classifyRadio(datagram.data(), datagram.size());
     TEST_ASSERT_EQUAL(static_cast<int>(btp::Error::Ok), static_cast<int>(ingress.error));
-    TEST_ASSERT_TRUE(ingress.consume);
+    TEST_ASSERT_TRUE(ingress.mayConsume);
 }
 
-void test_command_result_answering_this_dongle_is_consumed() {
-    const std::vector<uint8_t> payload = make_command_result_payload(kSelfSourceId);
+// A command/manifest reference is payload data and therefore may be E-key
+// ciphertext. The envelope-only classifier must produce the same result for
+// both byte patterns; final ownership is decided after reassembly and L-key
+// authentication in EspNowConfig.
+void test_command_result_is_candidate_regardless_of_prefix_bytes() {
+    const std::vector<uint8_t> own = make_command_result_payload(kSelfSourceId);
+    const std::vector<uint8_t> other = make_command_result_payload(0x99887766U);
     const btp::Header header = make_header(btp::MessageType::Command, kCommandResultObjectId);
-    const std::vector<uint8_t> datagram = encode_espnow(header, payload.data(), payload.size());
-    TEST_ASSERT_TRUE(!datagram.empty());
 
-    const HubRelay::RadioIngress ingress =
-        HubRelay::classifyRadio(datagram.data(), datagram.size(), kSelfSourceId);
-    TEST_ASSERT_EQUAL_HEX32(kSelfSourceId, ingress.requestSourceId);
-    TEST_ASSERT_TRUE(ingress.consume);
+    for (const std::vector<uint8_t>* payload : {&own, &other}) {
+        const std::vector<uint8_t> datagram = encode_espnow(header, payload->data(), payload->size());
+        TEST_ASSERT_TRUE(!datagram.empty());
+        const HubRelay::RadioIngress ingress = HubRelay::classifyRadio(datagram.data(), datagram.size());
+        TEST_ASSERT_TRUE(ingress.mayConsume);
+    }
 }
 
-void test_command_result_answering_someone_else_goes_up() {
-    const std::vector<uint8_t> payload = make_command_result_payload(0x99887766U);
-    const btp::Header header = make_header(btp::MessageType::Command, kCommandResultObjectId);
-    const std::vector<uint8_t> datagram = encode_espnow(header, payload.data(), payload.size());
-    TEST_ASSERT_TRUE(!datagram.empty());
+void test_manifest_data_is_candidate_regardless_of_prefix_bytes() {
+    const std::vector<uint8_t> own = make_manifest_data_payload(kSelfSourceId);
+    const std::vector<uint8_t> other = make_manifest_data_payload(0x99887766U);
+    const btp::Header header = make_header(btp::MessageType::Control, kManifestDataObjectId);
 
-    const HubRelay::RadioIngress ingress =
-        HubRelay::classifyRadio(datagram.data(), datagram.size(), kSelfSourceId);
-    TEST_ASSERT_EQUAL_HEX32(0x99887766U, ingress.requestSourceId);
-    TEST_ASSERT_FALSE(ingress.consume);
+    for (const std::vector<uint8_t>* payload : {&own, &other}) {
+        const std::vector<uint8_t> datagram = encode_espnow(header, payload->data(), payload->size());
+        TEST_ASSERT_TRUE(!datagram.empty());
+        const HubRelay::RadioIngress ingress = HubRelay::classifyRadio(datagram.data(), datagram.size());
+        TEST_ASSERT_TRUE(ingress.mayConsume);
+    }
 }
 
 void test_everything_else_goes_up() {
@@ -312,9 +329,7 @@ void test_everything_else_goes_up() {
         {btp::MessageType::Telemetry, 0x0001U, "TELEMETRY"},
         {btp::MessageType::Log, 0x0000U, "LOG"},
         {btp::MessageType::Terminal, kTerminalOutObjectId, "TERMINAL_OUT"},
-        {btp::MessageType::Control, kManifestDataObjectId, "MANIFEST_DATA"},
         {btp::MessageType::Control, kSubscribeResultObjectId, "SUBSCRIBE_RESULT"},
-        {btp::MessageType::Command, kCommandRequestObjectId, "COMMAND_REQUEST"},
     };
 
     const uint8_t payload[8] = {1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U};
@@ -323,19 +338,18 @@ void test_everything_else_goes_up() {
         const std::vector<uint8_t> datagram = encode_espnow(header, payload, sizeof(payload));
         TEST_ASSERT_TRUE_MESSAGE(!datagram.empty(), testCase.label);
 
-        const HubRelay::RadioIngress ingress =
-            HubRelay::classifyRadio(datagram.data(), datagram.size(), kSelfSourceId);
+        const HubRelay::RadioIngress ingress = HubRelay::classifyRadio(datagram.data(), datagram.size());
         TEST_ASSERT_EQUAL_MESSAGE(static_cast<int>(btp::Error::Ok), static_cast<int>(ingress.error),
                                   testCase.label);
-        TEST_ASSERT_FALSE_MESSAGE(ingress.consume, testCase.label);
+        TEST_ASSERT_FALSE_MESSAGE(ingress.mayConsume, testCase.label);
     }
 }
 
 void test_a_malformed_datagram_is_a_drop_not_a_relay() {
     const uint8_t garbage[48] = {0};
-    const HubRelay::RadioIngress ingress = HubRelay::classifyRadio(garbage, sizeof(garbage), kSelfSourceId);
+    const HubRelay::RadioIngress ingress = HubRelay::classifyRadio(garbage, sizeof(garbage));
     TEST_ASSERT_NOT_EQUAL(static_cast<int>(btp::Error::Ok), static_cast<int>(ingress.error));
-    TEST_ASSERT_FALSE(ingress.consume);
+    TEST_ASSERT_FALSE(ingress.mayConsume);
 }
 
 // ---------------------------------------------------------------------------
@@ -407,9 +421,9 @@ int main(int, char**) {
     RUN_TEST(test_reoriginating_the_same_payload_would_change_the_nonce);
     RUN_TEST(test_relay_up_passes_each_fragment_verbatim_and_reassembles_nothing);
     RUN_TEST(test_relay_down_passes_each_fragment_verbatim);
-    RUN_TEST(test_heartbeat_status_is_consumed);
-    RUN_TEST(test_command_result_answering_this_dongle_is_consumed);
-    RUN_TEST(test_command_result_answering_someone_else_goes_up);
+    RUN_TEST(test_heartbeat_status_is_a_link_candidate);
+    RUN_TEST(test_command_result_is_candidate_regardless_of_prefix_bytes);
+    RUN_TEST(test_manifest_data_is_candidate_regardless_of_prefix_bytes);
     RUN_TEST(test_everything_else_goes_up);
     RUN_TEST(test_a_malformed_datagram_is_a_drop_not_a_relay);
     RUN_TEST(test_bind_then_lookup);

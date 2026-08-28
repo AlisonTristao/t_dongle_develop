@@ -115,11 +115,39 @@ bool isProtocolled() noexcept;
 struct TxCounters {
     std::uint64_t framesRx;
     std::uint64_t framesTx;
+    // Frames the mux built and tried to send but the port would not accept
+    // (host not asserting DTR on the CDC, cable pulled). Not a STATUS wire
+    // field -- "espnow -stats" is where this is read.
+    std::uint64_t framesTxStalled;
     std::uint64_t crcErrors;
     std::uint64_t decodeErrors;
     std::uint64_t reassemblyRejected;
     std::uint64_t telemetryDropped;
     std::uint64_t droppedByClass[static_cast<std::size_t>(SerialSession::PriorityClass::kCount)];
+
+    // Downstream relay outcomes, one counter per REASON. Split rather than
+    // summed because the three mean entirely different things to whoever is
+    // debugging, and the fix for each is somewhere else:
+    //
+    //   relayDownUnbound   the console child never ran "hub -bind" (or the
+    //                      dongle rebooted and forgot). Fix is on the desktop.
+    //   relayDownNoPeer    bound, but this dongle has never heard a BTP frame
+    //                      from that robot, so it has no MAC to send to. Fix
+    //                      is the robot being off, out of range, or on
+    //                      another channel.
+    //   relayDownOversized the frame does not fit an ESP-NOW datagram. Fix is
+    //                      the child encoding on the wrong transport profile
+    //                      (decision D4: children encode at EspNow size from
+    //                      the origin precisely so the hub never re-cuts).
+    //
+    // These exist because every one of those used to be a bare `return false`
+    // that all four call sites discarded: a child whose traffic went nowhere
+    // produced no log line, no counter and no error anywhere in the system.
+    std::uint64_t relayDownOk;
+    std::uint64_t relayDownUnbound;
+    std::uint64_t relayDownNoPeer;
+    std::uint64_t relayDownOversized;
+    std::uint64_t relayDownSendFailed;
 };
 
 void peekTxCounters(TxCounters& out) noexcept;

@@ -21,9 +21,21 @@ public:
     DatabaseStore();
 
     /**
-     * @brief Opens database, applies bootstrap SQL, and loads peers into EspNowManager.
+     * @brief Opens database and applies bootstrap SQL/migrations.
+     *
+     * Deliberately takes no EspNowManager: this runs before espNowManager's
+     * begin() in AppRuntime, while the internal heap is least fragmented by
+     * the WiFi/ESP-NOW driver, so SQLite's own allocations get first pick.
+     * Call loadPeers() separately once ESP-NOW is up.
      */
-    bool begin(EspNowManager& espNow, Stream* io = nullptr);
+    bool begin(Stream* io = nullptr);
+
+    /**
+     * @brief Loads persisted peers into EspNowManager. Requires ESP-NOW to
+     * already be initialized (esp_now_add_peer needs it); call after
+     * espNowManager.begin(), once begin() above has returned true.
+     */
+    bool loadPeers(EspNowManager& espNow);
 
     /**
      * @brief Deletes current DB file and recreates schema from bootstrap script.

@@ -9,6 +9,10 @@
 #include "SudoCommands.h"
 #include "error_codes.h"
 
+#include <Arduino.h>
+#include <Esp.h>
+#include <esp_heap_caps.h>
+
 #include <cstdio>
 #include <vector>
 
@@ -110,31 +114,50 @@ uint8_t registerDefaultModules() {
         return ShellCommandSupport::failWithCode(AppError::Code::SHELL_NOT_READY, "shell nao configurada para registrar modulos");
     }
 
+    // DIAG (boot-loop, topico 34/35): each module registers dozens of
+    // std::string command names/descriptions. If the panic is here it is
+    // heap -- the last "reg:" line printed names the module that could not
+    // allocate, and `largest` vs `free_heap` says exhaustion vs fragmentation.
+    // Compiled out unless -DDIAG_BOOT (platformio.ini) -- see topico 35 D.3.
+    #ifdef DIAG_BOOT
+    #define DIAG_REG(stage) Serial.printf("! reg:%s free_heap=%u largest=%u\r\n", (stage), \
+        (unsigned) ESP.getFreeHeap(), (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_8BIT))
+    #else
+    #define DIAG_REG(stage) ((void) 0)
+    #endif
+
+    DIAG_REG("start");
     uint8_t result = HelpCommands::registerAll();
     if (result != RESULT_OK) {
         return result;
     }
 
+    DIAG_REG("help");
     result = DongleCommands::registerAll();
     if (result != RESULT_OK) {
         return result;
     }
 
+    DIAG_REG("dongle");
     result = EspNowCommands::registerAll();
     if (result != RESULT_OK) {
         return result;
     }
 
+    DIAG_REG("espnow");
     result = DatabaseCommands::registerAll();
     if (result != RESULT_OK) {
         return result;
     }
 
+    DIAG_REG("database");
     result = SudoCommands::registerAll();
     if (result != RESULT_OK) {
         return result;
     }
 
+    DIAG_REG("sudo");
+    #undef DIAG_REG
     return RESULT_OK;
 }
 

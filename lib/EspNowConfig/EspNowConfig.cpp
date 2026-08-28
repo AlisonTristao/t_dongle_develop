@@ -7,6 +7,7 @@
 #include "ShellOutput.h"
 #include "BtpTransport.h"
 #include "RadioSeal.h"
+#include "bally_channels.h"
 
 #include <cstdio>
 #include <cstring>
@@ -24,6 +25,103 @@ DatabaseStore* g_database = nullptr;
 LcdDashboard* g_lcdDashboard = nullptr;
 
 ProtocolRouter::Router g_router;
+
+// COMMAND and MANIFEST_DATA can be either C-link traffic (key L) or endpoint
+// traffic (key E). Their wire header is enough to make them candidates, but
+// their reference prefix is ciphertext and a long message is fragmented. Keep
+// the raw candidate fragments until the reassembled payload either opens with
+// L (consume locally) or does not (relay the original E ciphertext verbatim).
+// The bounds intentionally mirror ProtocolRouter so retaining a candidate
+// cannot consume more concurrent-message capacity than the reassembler it
+// accompanies.
+constexpr std::size_t kPendingRelaySlots = ProtocolRouter::kSlotCount;
+constexpr std::size_t kPendingRelayMaxFragments =
+    (ProtocolRouter::kMaxPayloadSize + btp::kEspNowMaxPayloadSize - 1U) /
+    btp::kEspNowMaxPayloadSize;
+
+struct PendingRelay {
+    bool active;
+    std::uint32_t sourceId;
+    std::uint32_t bootId;
+    std::uint32_t sequence;
+    std::uint8_t fragmentCount;
+    std::uint32_t lastArrivalMs;
+    bool present[kPendingRelayMaxFragments];
+    std::uint16_t sizes[kPendingRelayMaxFragments];
+    std::uint8_t frames[kPendingRelayMaxFragments][btp::kEspNowMaxFrameSize];
+};
+
+PendingRelay g_pendingRelays[kPendingRelaySlots] = {};
+
+bool samePendingIdentity(const PendingRelay& pending, const btp::Header& header) {
+    return pending.active && pending.sourceId == header.source_id && pending.bootId == header.boot_id &&
+           pending.sequence == header.sequence;
+}
+
+void clearPendingRelay(const btp::Header& header) {
+    for (PendingRelay& pending : g_pendingRelays) {
+        if (samePendingIdentity(pending, header)) {
+            pending = {};
+            return;
+        }
+    }
+}
+
+void expirePendingRelays(std::uint32_t nowMs) {
+    for (PendingRelay& pending : g_pendingRelays) {
+        if (pending.active &&
+            static_cast<std::uint32_t>(nowMs - pending.lastArrivalMs) >= ProtocolRouter::kReassemblyTimeoutMs) {
+            pending = {};
+        }
+    }
+}
+
+// Stores the exact radio datagram, not a decoded/re-encoded representation.
+// Returning false makes the caller drop the candidate rather than risk
+// forwarding a real C-link message just because the side buffer was full.
+bool retainPendingRelay(const btp::Header& header, const std::uint8_t* data, std::size_t len,
+                        std::uint32_t nowMs) {
+    if ((header.flags & btp::kFlagFragmented) == 0U) {
+        return true;
+    }
+    if (data == nullptr || len > btp::kEspNowMaxFrameSize || header.fragment_count == 0U ||
+        header.fragment_count > kPendingRelayMaxFragments || header.fragment_index >= header.fragment_count) {
+        return false;
+    }
+
+    expirePendingRelays(nowMs);
+    PendingRelay* selected = nullptr;
+    for (PendingRelay& pending : g_pendingRelays) {
+        if (samePendingIdentity(pending, header)) {
+            selected = &pending;
+            break;
+        }
+        if (!pending.active && selected == nullptr) {
+            selected = &pending;
+        }
+    }
+    if (selected == nullptr) {
+        return false;
+    }
+
+    if (!selected->active) {
+        selected->active = true;
+        selected->sourceId = header.source_id;
+        selected->bootId = header.boot_id;
+        selected->sequence = header.sequence;
+        selected->fragmentCount = header.fragment_count;
+    } else if (selected->fragmentCount != header.fragment_count) {
+        *selected = {};
+        return false;
+    }
+
+    const std::size_t index = header.fragment_index;
+    std::memcpy(selected->frames[index], data, len);
+    selected->sizes[index] = static_cast<std::uint16_t>(len);
+    selected->present[index] = true;
+    selected->lastArrivalMs = nowMs;
+    return true;
+}
 
 QueueHandle_t g_rxQueue = nullptr;
 QueueHandle_t g_logQueue = nullptr;
@@ -46,14 +144,22 @@ volatile uint32_t g_droppedDecodeTotal = 0;     // ProtocolRouter: bad envelope
 volatile uint32_t g_droppedCrcTotal = 0;        // ProtocolRouter: CRC mismatch
 volatile uint32_t g_droppedReassemblyTotal = 0; // ProtocolRouter: reassembly conflict/timeout/etc
 volatile uint32_t g_droppedQueueFullTotal = 0;  // routed message, but its type queue was full
-// Topico 30: a consumed (channel C) message that did not open under key L --
-// no key configured, missing ENCRYPTED, wrong cipher, or a TagMismatch. This
-// is the counter "recusado e contado" (a forged frame is refused AND
-// counted) points at; unlike the five above it is not part of the wire
-// schema (RxCounters/hub.link) -- see the comment at
-// processRxDatagramInternal's open() call for why that scope stays out of
-// this topic.
+// An unequivocal C-link STATUS message that did not open under key L. COMMAND
+// and MANIFEST_DATA cannot use this counter: the same public headers are also
+// legal endpoint (E-key) traffic and a failed L open must be relayed, not
+// reported as an authentication failure. Unlike the five above it is not part
+// of the wire schema (RxCounters/hub.link).
 volatile uint32_t g_droppedAuthTotal = 0;
+
+// Radio datagrams thrown away because async RX never came up (the queues or
+// the worker task could not be allocated -- a heap-starved boot, topico 34/35
+// F2). onDataRecv() must NOT process them inline: that runs on the WiFi
+// task's small stack and processRxDatagramInternal now needs kilobytes for
+// RadioSeal::open + the routed/plaintext buffers (topicos 28-31), so inline
+// processing stack-overflows the moment a robot heartbeat lands. A dongle in
+// this state has a heap problem to fix and can only be fixed if it stays up,
+// so: drop, count, keep running. Bench-only (not a wire field).
+volatile uint32_t g_syncFallbackDropTotal = 0;
 
 // Watermarks for the takeDropped*Count() deltas. Unsigned subtraction against
 // the total stays correct across a 32-bit wrap.
@@ -345,6 +451,45 @@ void countRouted(btp::MessageType type) {
     }
 }
 
+bool relayPendingUp(const btp::Header& header) {
+    for (PendingRelay& pending : g_pendingRelays) {
+        if (!samePendingIdentity(pending, header)) {
+            continue;
+        }
+
+        bool complete = true;
+        for (std::size_t index = 0U; index < pending.fragmentCount; ++index) {
+            complete = complete && pending.present[index];
+        }
+        if (complete) {
+            for (std::size_t index = 0U; index < pending.fragmentCount; ++index) {
+                countRouted(header.type);
+                SerialMux::relayUp(header, pending.frames[index], pending.sizes[index]);
+            }
+        }
+        pending = {};
+        return complete;
+    }
+    return false;
+}
+
+std::uint32_t readU32Le(const std::uint8_t* data) {
+    return static_cast<std::uint32_t>(data[0]) |
+           (static_cast<std::uint32_t>(data[1]) << 8U) |
+           (static_cast<std::uint32_t>(data[2]) << 16U) |
+           (static_cast<std::uint32_t>(data[3]) << 24U);
+}
+
+std::uint32_t referenceSourceId(const btp::Header& header, const std::uint8_t* plaintext,
+                                std::size_t plaintextSize) {
+    const bool hasReference =
+        (header.type == btp::MessageType::Command &&
+         (header.object_id == bally::kCommandRequestObjectId ||
+          header.object_id == bally::kCommandResultObjectId)) ||
+        (header.type == btp::MessageType::Control && header.object_id == bally::kManifestDataObjectId);
+    return hasReference && plaintext != nullptr && plaintextSize >= 4U ? readU32Le(plaintext) : 0U;
+}
+
 void dispatchRouted(const uint8_t mac[6], const ProtocolRouter::RoutedMessage& routed) {
     countRouted(routed.header.type);
 
@@ -359,25 +504,12 @@ void dispatchRouted(const uint8_t mac[6], const ProtocolRouter::RoutedMessage& r
     enqueueRouted(queue, routed);
 }
 
-// Topico 28, upstream half: the radio's ingress rule, inverted.
-//
-// Before this, every datagram was decoded, reassembled and dispatched by
-// type, and only a couple of types found a consumer at the end of that -- so
-// a handler left empty swallowed a whole MessageType in silence
-// (handleTerminalItem was exactly that: the robot's terminal output never
-// arrived anywhere, and nobody noticed).
-//
-// The rule now is the hub's: EVERYTHING goes up to the console except the
-// short, explicit list in bally::dongle_consumes() (bally_channels.h, the one
-// place that list is written). Forgetting to add something to it makes the
-// message arrive at the console -- visible and harmless -- instead of
-// disappearing.
-//
-// Only the 36-octet envelope is read to decide, which is what lets this work
-// on traffic the dongle holds no key for: BTP encrypts the payload and never
-// the header (docs/encryption.md section 5 -- the header is the AAD).
-// ProtocolRouter is off the relay path entirely and stays only for what the
-// dongle actually consumes (D5).
+// Radio ingress has two paths. Frames which cannot be C-link traffic relay
+// immediately. COMMAND, MANIFEST_DATA and STATUS are held through logical
+// reassembly, then tried under key L: successful opens are consumed only when
+// their authenticated reference names this dongle; failed opens are channel B
+// and their original raw fragments relay upstream. No destination decision
+// ever reads a payload byte before that authentication.
 void processRxDatagramInternal(const uint8_t mac[6], const uint8_t* data, size_t len) {
     if (g_lcdDashboard != nullptr) {
         g_lcdDashboard->notifyRx();
@@ -385,7 +517,7 @@ void processRxDatagramInternal(const uint8_t mac[6], const uint8_t* data, size_t
 
     ++g_rxDatagramTotal;
 
-    const HubRelay::RadioIngress ingress = HubRelay::classifyRadio(data, len, BtpTransport::sourceId());
+    const HubRelay::RadioIngress ingress = HubRelay::classifyRadio(data, len);
     if (ingress.error != btp::Error::Ok) {
         if (ingress.error == btp::Error::CrcMismatch) {
             ++g_droppedCrcTotal;
@@ -410,24 +542,25 @@ void processRxDatagramInternal(const uint8_t mac[6], const uint8_t* data, size_t
         }
     }
 
-    // Counted by type here rather than after routing, because a relayed
-    // datagram never reaches countRouted(): this is one fragment, not one
-    // logical message, so `espnow -stats` now reads as radio ingress per
-    // type instead of completed messages per type.
-    if (!ingress.consume && SerialMux::isProtocolled()) {
+    // Non-candidates are necessarily endpoint traffic and remain on the fast
+    // blind-relay path. Candidates wait below because their payload may be
+    // ciphertext, including its destination/reference field.
+    if (!ingress.mayConsume && SerialMux::isProtocolled()) {
         countRouted(ingress.header.type);
         SerialMux::relayUp(ingress.header, data, len);
         return;
     }
 
-    // Consumed, or nobody upstream to relay to. With the port still
-    // console-owned the relay has no destination at all, so the pre-hub local
-    // path stays in charge -- that is what keeps LOG lines on the console,
-    // the LCD's robot-state tile alive and the manifest cache warm while a
-    // human is at the bench. It is what "relay" degrades to with no consumer,
-    // not a second consume list.
+    const std::uint32_t nowMs = millis();
+    if (ingress.mayConsume && !retainPendingRelay(ingress.header, data, len, nowMs)) {
+        ++g_droppedReassemblyTotal;
+        return;
+    }
+
+    // Candidates, and the console-owned fallback for ordinary endpoint
+    // traffic, enter the bounded reassembler.
     ProtocolRouter::RoutedMessage routed{};
-    const ProtocolRouter::Outcome outcome = g_router.submit(mac, data, len, millis(), &routed);
+    const ProtocolRouter::Outcome outcome = g_router.submit(mac, data, len, nowMs, &routed);
 
     switch (outcome) {
         case ProtocolRouter::Outcome::DroppedDecode:
@@ -437,6 +570,9 @@ void processRxDatagramInternal(const uint8_t mac[6], const uint8_t* data, size_t
             ++g_droppedCrcTotal;
             return;
         case ProtocolRouter::Outcome::DroppedReassembly:
+            if (ingress.mayConsume) {
+                clearPendingRelay(ingress.header);
+            }
             ++g_droppedReassemblyTotal;
             return;
         case ProtocolRouter::Outcome::FragmentAccepted:
@@ -452,40 +588,58 @@ void processRxDatagramInternal(const uint8_t mac[6], const uint8_t* data, size_t
             break;
     }
 
-    if (mac != nullptr) {
-        primeManifestIfNeeded(mac, routed.header);
-    }
-
-    // Topico 30: everything that reached here via `ingress.consume` is
-    // channel C (dongle<->robot, key L) -- heartbeat/presence STATUS, or a
-    // COMMAND addressed to this dongle. It must open under key L before any
-    // handler sees it; the "nobody to relay to" fallback below (a robot's
-    // LOG/TELEMETRY/etc routed locally only because no client is attached,
-    // topico 28's console-owned path) is channel B content this dongle
-    // never holds the key for, and stays untouched -- opening it here would
-    // both fail (wrong key) and be architecturally wrong (bally_channels.h:
-    // "the hub holds key L, never any robot's key E").
-    if (ingress.consume) {
+    if (ingress.mayConsume) {
         uint8_t plaintext[ProtocolRouter::kMaxPayloadSize];
         const bool opened = routed.payloadSize >= RadioSeal::kTagSize &&
             RadioSeal::open(routed.header, static_cast<uint16_t>(routed.payloadSize), routed.payload,
                             plaintext);
 
-        // Real, bidirectional evidence of who holds key L -- stronger than
-        // the heartbeat's own radio-layer ACK (EspNowConfig.h's heartbeatTick
-        // doc comment). A peer that cannot produce an openable frame is
-        // marked not-online even if its heartbeat replies keep ACKing.
-        if (mac != nullptr) {
-            BtpTransport::notePeerLinkResult(mac, opened);
+        if (!opened) {
+            // A failed L open is not automatically an authentication error:
+            // valid channel B traffic uses E and has the same public header.
+            // With a desktop session, pass the exact retained fragments on;
+            // without one, there is no endpoint consumer and it is dropped.
+            if (SerialMux::isProtocolled()) {
+                if ((ingress.header.flags & btp::kFlagFragmented) != 0U) {
+                    if (!relayPendingUp(routed.header)) {
+                        ++g_droppedReassemblyTotal;
+                    }
+                } else {
+                    countRouted(ingress.header.type);
+                    SerialMux::relayUp(ingress.header, data, len);
+                }
+            }
+            if (ingress.header.type == btp::MessageType::Control &&
+                ingress.header.object_id == bally::kStatusObjectId) {
+                ++g_droppedAuthTotal;
+            }
+            return;
         }
 
-        if (!opened) {
-            ++g_droppedAuthTotal;
-            return;
+        // A successful L open is real bidirectional evidence for the peer.
+        if (mac != nullptr) {
+            BtpTransport::notePeerLinkResult(mac, true);
         }
 
         routed.payloadSize -= RadioSeal::kTagSize;
         std::memcpy(routed.payload, plaintext, routed.payloadSize);
+
+        // A valid L frame that names another requester is neither channel B
+        // nor local work for this dongle. Do not leak authenticated link
+        // administration upstream.
+        const std::uint32_t referenceId =
+            referenceSourceId(routed.header, routed.payload, routed.payloadSize);
+        if (!bally::dongle_consumes(routed.header.type, routed.header.object_id, referenceId,
+                                    BtpTransport::sourceId())) {
+            clearPendingRelay(routed.header);
+            return;
+        }
+
+        clearPendingRelay(routed.header);
+    }
+
+    if (mac != nullptr) {
+        primeManifestIfNeeded(mac, routed.header);
     }
 
     dispatchRouted(mac, routed);
@@ -511,7 +665,13 @@ void onDataRecv(const uint8_t* mac, const uint8_t* data, size_t len) {
         return;
     }
 
-    processRxDatagramInternal(mac, data, len);
+    // Async RX is down (queues / worker task could not be allocated). Do NOT
+    // fall through to processRxDatagramInternal here: this callback runs on
+    // the WiFi task's ~3 KB stack, and that function needs several KB since
+    // the channel-C AEAD work -- it would overflow and panic on the first
+    // datagram, which is the "reboots on boot when a robot is nearby" loop.
+    // Drop and count so the dongle stays up long enough to diagnose the heap.
+    ++g_syncFallbackDropTotal;
 }
 
 void onDataSent(const uint8_t* mac_addr, esp_now_send_status_t status) {
@@ -743,6 +903,10 @@ uint32_t takeDroppedAuthCount() {
 
 uint32_t peekDroppedAuthCount() {
     return g_droppedAuthTotal;
+}
+
+uint32_t peekSyncFallbackDropCount() {
+    return g_syncFallbackDropTotal;
 }
 
 void peekRxCounters(RxCounters& out) {

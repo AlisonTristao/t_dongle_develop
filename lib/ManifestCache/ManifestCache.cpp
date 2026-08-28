@@ -22,13 +22,10 @@ constexpr std::uint8_t kFlagCatalogComplete = 0x02U;
 // uses for its own kConfigRevision.
 //
 // Bumped 1 -> 2 by topico 27: revision 1 described a dongle with zero topics.
-// A client that cached revision 1 and asks again with
-// known_config_revision = 1 would otherwise be answered NOT_MODIFIED and
-// never learn about hub.link/hub.usb/hub.peers -- commands.md section 3.3
-// requires the bump for exactly this reason ("a changed config_revision
-// invalidates cached descriptors"). Any future change to the hub.* schemas
-// must bump it again.
-constexpr std::uint32_t kSelfConfigRevision = 2U;
+// Bumped 2 -> 3 by the downstream-relay counters added to hub.usb in schema
+// version 2.  A client that cached revision 2 must not receive NOT_MODIFIED
+// and decode the older six-field layout as the new twelve-field layout.
+constexpr std::uint32_t kSelfConfigRevision = 3U;
 constexpr const char* kSelfName = "t_dongle_develop";
 
 struct Entry {

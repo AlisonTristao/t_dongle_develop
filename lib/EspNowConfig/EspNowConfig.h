@@ -11,12 +11,18 @@ class LcdDashboard;
 #define RX_ASYNC_QUEUE_DEPTH 24
 #endif
 
+// Each slot of these two queues is a ProtocolRouter::RoutedMessage, which
+// carries a payload[kMaxPayloadSize=616] buffer -- ~680 B/slot. 32 slots
+// each was ~44 KB of heap for the pair, reserved up front in
+// enableAsyncRx() during a boot sequence that was already running out of
+// internal RAM (topico 33 / topico 34 section 1B). 16 is still four beats
+// of burst headroom at the main loop's drain rate.
 #ifndef RX_LOG_QUEUE_DEPTH
-#define RX_LOG_QUEUE_DEPTH 32
+#define RX_LOG_QUEUE_DEPTH 16
 #endif
 
 #ifndef RX_TELEMETRY_QUEUE_DEPTH
-#define RX_TELEMETRY_QUEUE_DEPTH 32
+#define RX_TELEMETRY_QUEUE_DEPTH 16
 #endif
 
 #ifndef RX_TERMINAL_QUEUE_DEPTH
@@ -65,14 +71,16 @@ bool dequeueRxDatagram(RxDatagramEvent& outEvent, uint32_t timeoutMs = 0);
 /**
  * @brief Classifies one raw datagram and branches (topico 28).
  *
- * Reads only the BTP envelope, then applies bally::dongle_consumes()
- * (include/bally_channels.h -- the single copy of that list). Anything not on
- * it is relayed to the desktop client verbatim, fragment by fragment, with no
- * reassembly and no re-encoding (SerialMux::relayUp, D5).
+ * Reads the BTP envelope and relays non-candidates verbatim, fragment by
+ * fragment, with no reassembly and no re-encoding (SerialMux::relayUp, D5).
+ * COMMAND, MANIFEST_DATA and STATUS are candidates: they are reassembled and
+ * opened with key L before bally::dongle_consumes() reads their authenticated
+ * plaintext reference. A failed L open is endpoint traffic and its original
+ * raw fragments are relayed, so E-key ciphertext is never inspected.
  *
- * What the dongle does consume, and everything at all while the port is still
- * console-owned (no client to relay to), takes the pre-hub path: decode +
- * reassemble via ProtocolRouter, then dispatch -- COMMAND synchronously here
+ * Everything while the port is still console-owned (no client to relay to)
+ * also takes the pre-hub path: decode + reassemble via ProtocolRouter, then
+ * dispatch -- COMMAND synchronously here
  * (remote execution shouldn't wait for the next drainRoutedQueues() call),
  * LOG/TELEMETRY/TERMINAL/CONTROL into their own bounded queue.
  */
@@ -112,6 +120,12 @@ uint32_t takeDroppedAuthCount();
  * command (like the rest of StatsSnapshot) reports running totals a user
  * diffs across two calls, not a delta consumed by a single reader. */
 uint32_t peekDroppedAuthCount();
+
+/** Radio datagrams dropped because async RX never initialized (heap-starved
+ * boot -- see the .cpp comment on onDataRecv's fallback). Any nonzero value
+ * means the dongle booted degraded and is deaf to the radio; `espnow -stats`
+ * surfaces it. Not part of RxCounters/hub.link. */
+uint32_t peekSyncFallbackDropCount();
 
 /**
  * @brief Cumulative RX counters for the ESP-NOW hop, counted since the last

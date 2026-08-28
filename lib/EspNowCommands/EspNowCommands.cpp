@@ -385,9 +385,19 @@ uint8_t wrapper_espnow_stats() {
                   static_cast<unsigned>(s.droppedQueueFull), static_cast<unsigned>(s.droppedAuth));
     printLine(line);
 
-    std::snprintf(line, sizeof(line), "[usb] sessao=%s frames_tx=%llu",
+    if (s.syncFallbackDrops > 0U) {
+        std::snprintf(line, sizeof(line),
+                      "[espnow] ATENCAO async RX nao subiu no boot: %u datagramas descartados "
+                      "(heap? ver topico 34/35)",
+                      static_cast<unsigned>(s.syncFallbackDrops));
+        printLine(line);
+    }
+
+    std::snprintf(line, sizeof(line), "[usb] sessao=%s frames_rx=%llu frames_tx=%llu tx_travado=%llu",
                   s.protocolled ? "protocolada" : "console",
-                  static_cast<unsigned long long>(s.framesTx));
+                  static_cast<unsigned long long>(s.framesRx),
+                  static_cast<unsigned long long>(s.framesTx),
+                  static_cast<unsigned long long>(s.framesTxStalled));
     printLine(line);
 
     std::snprintf(line, sizeof(line),
