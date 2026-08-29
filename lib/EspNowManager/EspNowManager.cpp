@@ -3,8 +3,307 @@
 #include <WiFi.h>
 #include <cstring>
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
+
 // Active instance used by static C callbacks required by ESP-NOW API.
 EspNowManager* EspNowManager::activeInstance_ = nullptr;
+
+namespace {
+
+constexpr std::size_t kTxPriorityCount = RadioTxScheduler::kPriorityCount;
+constexpr UBaseType_t kTxQueueDepth[kTxPriorityCount] = {
+    6U,  // Critical: heartbeat, COMMAND, CONTROL
+    4U,  // Control: LOG/TERMINAL and ordinary management
+    12U, // Data: TELEMETRY burst absorption
+};
+constexpr std::uint8_t kNoCompletionSlot = 0xFFU;
+constexpr std::size_t kCompletionSlotCount = 4U;
+constexpr std::uint32_t kAsyncCallbackTimeoutMs = 250U;
+
+struct TxRequest {
+    std::uint8_t mac[6];
+    std::uint16_t len;
+    std::uint8_t data[EspNowManager::MAX_DATA_LEN];
+    std::uint8_t completionSlot;
+    std::uint32_t completionGeneration;
+    std::uint32_t enqueuedMs;
+    std::uint32_t timeoutMs;
+};
+
+struct DriverStatus {
+    std::uint8_t mac[6];
+    esp_now_send_status_t status;
+};
+
+struct CompletionSlot {
+    SemaphoreHandle_t signal = nullptr;
+    bool inUse = false;
+    std::uint32_t generation = 0U;
+    bool callbackReceived = false;
+    bool delivered = false;
+};
+
+QueueHandle_t g_txQueues[kTxPriorityCount] = {nullptr, nullptr, nullptr};
+QueueHandle_t g_driverStatusQueue = nullptr;
+TaskHandle_t g_txWorkerTask = nullptr;
+volatile bool g_txWorkerRunning = false;
+CompletionSlot g_completionSlots[kCompletionSlotCount];
+portMUX_TYPE g_completionMux = portMUX_INITIALIZER_UNLOCKED;
+volatile std::uint32_t g_txEnqueued[kTxPriorityCount] = {0U, 0U, 0U};
+volatile std::uint32_t g_txDroppedQueueFull[kTxPriorityCount] = {0U, 0U, 0U};
+volatile std::uint32_t g_txDriverRejected = 0U;
+volatile std::uint32_t g_txCallbackTimeouts = 0U;
+volatile std::uint32_t g_txCallbacksReceived = 0U;
+
+std::size_t priorityIndex(EspNowManager::TxPriority priority) noexcept {
+    const std::size_t index = static_cast<std::size_t>(priority);
+    return index < kTxPriorityCount ? index :
+        static_cast<std::size_t>(EspNowManager::TxPriority::Control);
+}
+
+bool completionStillActive(const TxRequest& request) noexcept {
+    if (request.completionSlot == kNoCompletionSlot ||
+        request.completionSlot >= kCompletionSlotCount) {
+        return true;
+    }
+    bool active = false;
+    portENTER_CRITICAL(&g_completionMux);
+    const CompletionSlot& slot = g_completionSlots[request.completionSlot];
+    active = slot.inUse && slot.generation == request.completionGeneration;
+    portEXIT_CRITICAL(&g_completionMux);
+    return active;
+}
+
+void completeRequest(const TxRequest& request, bool callbackReceived, bool delivered) noexcept {
+    if (request.completionSlot == kNoCompletionSlot ||
+        request.completionSlot >= kCompletionSlotCount) {
+        return;
+    }
+
+    SemaphoreHandle_t signal = nullptr;
+    portENTER_CRITICAL(&g_completionMux);
+    CompletionSlot& slot = g_completionSlots[request.completionSlot];
+    if (slot.inUse && slot.generation == request.completionGeneration) {
+        slot.callbackReceived = callbackReceived;
+        slot.delivered = delivered;
+        signal = slot.signal;
+    }
+    portEXIT_CRITICAL(&g_completionMux);
+
+    if (signal != nullptr) {
+        xSemaphoreGive(signal);
+    }
+}
+
+bool dequeueScheduled(TxRequest& out, std::size_t& scheduleCursor) noexcept {
+    bool available[kTxPriorityCount]{};
+    for (std::size_t i = 0U; i < kTxPriorityCount; ++i) {
+        available[i] = g_txQueues[i] != nullptr && uxQueueMessagesWaiting(g_txQueues[i]) > 0U;
+    }
+
+    const RadioTxScheduler::Selection selected =
+        RadioTxScheduler::choose(available, scheduleCursor);
+    scheduleCursor = selected.nextCursor;
+    if (!selected.found) {
+        return false;
+    }
+    return xQueueReceive(g_txQueues[priorityIndex(selected.priority)], &out, 0) == pdTRUE;
+}
+
+void txWorker(void*) {
+    std::size_t scheduleCursor = 0U;
+    while (g_txWorkerRunning) {
+        TxRequest request{};
+        if (!dequeueScheduled(request, scheduleCursor)) {
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            continue;
+        }
+
+        // A synchronous caller may have timed out while this request waited
+        // behind earlier frames. Cancel before touching the driver.
+        if (!completionStillActive(request)) {
+            continue;
+        }
+
+        std::uint32_t callbackBudgetMs = kAsyncCallbackTimeoutMs;
+        if (request.completionSlot != kNoCompletionSlot) {
+            const std::uint32_t elapsed = millis() - request.enqueuedMs;
+            if (elapsed >= request.timeoutMs) {
+                completeRequest(request, false, false);
+                continue;
+            }
+            callbackBudgetMs = request.timeoutMs - elapsed;
+        }
+
+        // There is exactly one in-flight driver send. Clearing stale status
+        // before it starts makes a callback unambiguously belong to this MAC.
+        xQueueReset(g_driverStatusQueue);
+        if (esp_now_send(request.mac, request.data, request.len) != ESP_OK) {
+            ++g_txDriverRejected;
+            completeRequest(request, false, false);
+            continue;
+        }
+
+        const std::uint32_t waitStartedMs = millis();
+        bool callbackReceived = false;
+        bool delivered = false;
+        while ((millis() - waitStartedMs) < callbackBudgetMs) {
+            const std::uint32_t elapsed = millis() - waitStartedMs;
+            const std::uint32_t remainingMs = callbackBudgetMs - elapsed;
+            DriverStatus status{};
+            const TickType_t waitTicks = pdMS_TO_TICKS(remainingMs > 0U ? remainingMs : 1U);
+            if (xQueueReceive(g_driverStatusQueue, &status, waitTicks) != pdTRUE) {
+                break;
+            }
+            if (std::memcmp(status.mac, request.mac, sizeof(request.mac)) != 0) {
+                continue; // defensive stale callback from a previous timeout
+            }
+            callbackReceived = true;
+            delivered = status.status == ESP_NOW_SEND_SUCCESS;
+            ++g_txCallbacksReceived;
+            break;
+        }
+        if (!callbackReceived) {
+            ++g_txCallbackTimeouts;
+            completeRequest(request, false, false);
+
+            // ESP-NOW does not carry an application token in its callback.
+            // Starting another send now would let this late callback satisfy
+            // a newer request to the same MAC. Keep only the TX worker
+            // quarantined until the outstanding callback arrives; producers
+            // and the main loop remain responsive and their bounded queues
+            // expose backpressure instead of corrupting correlation.
+            while (g_txWorkerRunning) {
+                DriverStatus late{};
+                if (xQueueReceive(g_driverStatusQueue, &late, pdMS_TO_TICKS(250U)) == pdTRUE &&
+                    std::memcmp(late.mac, request.mac, sizeof(request.mac)) == 0) {
+                    ++g_txCallbacksReceived;
+                    break;
+                }
+            }
+            continue;
+        }
+        completeRequest(request, callbackReceived, delivered);
+    }
+    vTaskDelete(nullptr);
+}
+
+void destroyTxSchedulerStorage() noexcept {
+    for (std::size_t i = 0U; i < kTxPriorityCount; ++i) {
+        if (g_txQueues[i] != nullptr) {
+            vQueueDelete(g_txQueues[i]);
+            g_txQueues[i] = nullptr;
+        }
+    }
+    if (g_driverStatusQueue != nullptr) {
+        vQueueDelete(g_driverStatusQueue);
+        g_driverStatusQueue = nullptr;
+    }
+    for (CompletionSlot& slot : g_completionSlots) {
+        if (slot.signal != nullptr) {
+            vSemaphoreDelete(slot.signal);
+        }
+        slot = {};
+    }
+}
+
+bool startTxScheduler() noexcept {
+    destroyTxSchedulerStorage();
+    for (std::size_t i = 0U; i < kTxPriorityCount; ++i) {
+        g_txQueues[i] = xQueueCreate(kTxQueueDepth[i], sizeof(TxRequest));
+        if (g_txQueues[i] == nullptr) {
+            destroyTxSchedulerStorage();
+            return false;
+        }
+        g_txEnqueued[i] = 0U;
+        g_txDroppedQueueFull[i] = 0U;
+    }
+    g_driverStatusQueue = xQueueCreate(4U, sizeof(DriverStatus));
+    if (g_driverStatusQueue == nullptr) {
+        destroyTxSchedulerStorage();
+        return false;
+    }
+    for (CompletionSlot& slot : g_completionSlots) {
+        slot.signal = xSemaphoreCreateBinary();
+        if (slot.signal == nullptr) {
+            destroyTxSchedulerStorage();
+            return false;
+        }
+    }
+
+    g_txDriverRejected = 0U;
+    g_txCallbackTimeouts = 0U;
+    g_txCallbacksReceived = 0U;
+    g_txWorkerRunning = true;
+    if (xTaskCreate(txWorker, "espnow_tx", 4096U, nullptr, 3U, &g_txWorkerTask) != pdPASS) {
+        g_txWorkerRunning = false;
+        g_txWorkerTask = nullptr;
+        destroyTxSchedulerStorage();
+        return false;
+    }
+    return true;
+}
+
+void stopTxScheduler() noexcept {
+    g_txWorkerRunning = false;
+    if (g_txWorkerTask != nullptr) {
+        vTaskDelete(g_txWorkerTask);
+        g_txWorkerTask = nullptr;
+    }
+}
+
+bool enqueueRequest(const TxRequest& request, EspNowManager::TxPriority priority) noexcept {
+    const std::size_t index = priorityIndex(priority);
+    if (!g_txWorkerRunning || g_txWorkerTask == nullptr || g_txQueues[index] == nullptr ||
+        xQueueSend(g_txQueues[index], &request, 0) != pdTRUE) {
+        ++g_txDroppedQueueFull[index];
+        return false;
+    }
+    ++g_txEnqueued[index];
+    xTaskNotifyGive(g_txWorkerTask);
+    return true;
+}
+
+int acquireCompletionSlot(std::uint32_t& outGeneration) noexcept {
+    int selected = -1;
+    portENTER_CRITICAL(&g_completionMux);
+    for (std::size_t i = 0U; i < kCompletionSlotCount; ++i) {
+        CompletionSlot& slot = g_completionSlots[i];
+        if (!slot.inUse && slot.signal != nullptr) {
+            slot.inUse = true;
+            ++slot.generation;
+            if (slot.generation == 0U) ++slot.generation;
+            slot.callbackReceived = false;
+            slot.delivered = false;
+            outGeneration = slot.generation;
+            selected = static_cast<int>(i);
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&g_completionMux);
+
+    if (selected >= 0) {
+        while (xSemaphoreTake(g_completionSlots[selected].signal, 0) == pdTRUE) {}
+    }
+    return selected;
+}
+
+void releaseCompletionSlot(std::size_t index, std::uint32_t generation) noexcept {
+    if (index >= kCompletionSlotCount) return;
+    portENTER_CRITICAL(&g_completionMux);
+    CompletionSlot& slot = g_completionSlots[index];
+    if (slot.inUse && slot.generation == generation) {
+        slot.inUse = false;
+        slot.callbackReceived = false;
+        slot.delivered = false;
+    }
+    portEXIT_CRITICAL(&g_completionMux);
+}
+
+} // namespace
 
 // Build empty manager state; runtime init happens in begin().
 EspNowManager::EspNowManager()
@@ -13,12 +312,7 @@ EspNowManager::EspNowManager()
       channel_(0),
       encrypt_(false),
       receiveCallback_(nullptr),
-    sendCallback_(nullptr),
-    sendWaitPending_(false),
-    sendWaitCompleted_(false),
-    sendWaitStatus_(ESP_NOW_SEND_FAIL),
-    sendWaitMac_{0, 0, 0, 0, 0, 0},
-    sendWaitHasMac_(false) {
+      sendCallback_(nullptr) {
 }
 
 // Initialize Wi-Fi station mode and register ESP-NOW callbacks.
@@ -41,8 +335,20 @@ bool EspNowManager::begin(uint8_t channel, bool encrypt) {
     esp_now_register_recv_cb(handleReceiveStatic);
     esp_now_register_send_cb(handleSendStatic);
 
+    if (!startTxScheduler()) {
+        esp_now_deinit();
+        initialized_ = false;
+        activeInstance_ = nullptr;
+        return false;
+    }
+
     for (size_t i = 0; i < deviceCount_; ++i) {
         if (!addPeerToEspNow(devices_[i].mac)) {
+            stopTxScheduler();
+            esp_now_deinit();
+            destroyTxSchedulerStorage();
+            initialized_ = false;
+            activeInstance_ = nullptr;
             return false;
         }
     }
@@ -52,9 +358,11 @@ bool EspNowManager::begin(uint8_t channel, bool encrypt) {
 
 // Deinitialize ESP-NOW and detach this instance from static callback dispatch.
 void EspNowManager::end() {
+    stopTxScheduler();
     if (initialized_) {
         esp_now_deinit();
     }
+    destroyTxSchedulerStorage();
 
     initialized_ = false;
     if (activeInstance_ == this) {
@@ -219,13 +527,22 @@ bool EspNowManager::sendToDevice(size_t index, const uint8_t* data, size_t len) 
     return sendToMac(devices_[index].mac, data, len);
 }
 
-// Send one datagram directly to target MAC.
-bool EspNowManager::sendToMac(const uint8_t mac[6], const uint8_t* data, size_t len) const {
+// Enqueue one copied datagram. Only txWorker() calls esp_now_send(), so driver
+// callbacks can never be consumed by another producer's wait slot.
+bool EspNowManager::sendToMac(const uint8_t mac[6], const uint8_t* data, size_t len,
+                              TxPriority priority) const {
     if (!initialized_ || mac == nullptr || data == nullptr || len == 0 || len > MAX_DATA_LEN) {
         return false;
     }
 
-    return esp_now_send(mac, data, len) == ESP_OK;
+    TxRequest request{};
+    std::memcpy(request.mac, mac, sizeof(request.mac));
+    request.len = static_cast<std::uint16_t>(len);
+    std::memcpy(request.data, data, len);
+    request.completionSlot = kNoCompletionSlot;
+    request.enqueuedMs = millis();
+    request.timeoutMs = kAsyncCallbackTimeoutMs;
+    return enqueueRequest(request, priority);
 }
 
 // Send to one index and wait for callback delivery status.
@@ -239,42 +556,60 @@ bool EspNowManager::sendToDeviceWithStatus(size_t index, const uint8_t* data, si
 }
 
 // Send to one MAC and wait for callback delivery status.
-bool EspNowManager::sendToMacWithStatus(const uint8_t mac[6], const uint8_t* data, size_t len, bool& outDelivered, uint32_t timeoutMs) const {
+bool EspNowManager::sendToMacWithStatus(const uint8_t mac[6], const uint8_t* data, size_t len,
+                                        bool& outDelivered, uint32_t timeoutMs,
+                                        TxPriority priority) const {
     outDelivered = false;
-    if (!initialized_ || mac == nullptr || data == nullptr || len == 0 || len > MAX_DATA_LEN) {
+    if (!initialized_ || mac == nullptr || data == nullptr || len == 0 ||
+        len > MAX_DATA_LEN || timeoutMs == 0U) {
         return false;
     }
 
-    sendWaitPending_ = true;
-    sendWaitCompleted_ = false;
-    sendWaitStatus_ = ESP_NOW_SEND_FAIL;
-    memcpy(sendWaitMac_, mac, sizeof(sendWaitMac_));
-    sendWaitHasMac_ = true;
-
-    if (esp_now_send(mac, data, len) != ESP_OK) {
-        sendWaitPending_ = false;
-        sendWaitHasMac_ = false;
+    std::uint32_t generation = 0U;
+    const int slotIndex = acquireCompletionSlot(generation);
+    if (slotIndex < 0) {
         return false;
     }
 
-    const uint32_t start = millis();
-    while (sendWaitPending_) {
-        if ((millis() - start) >= timeoutMs) {
-            sendWaitPending_ = false;
-            sendWaitHasMac_ = false;
-            return false;
-        }
-
-        delay(1);
-    }
-
-    sendWaitHasMac_ = false;
-    if (!sendWaitCompleted_) {
+    TxRequest request{};
+    std::memcpy(request.mac, mac, sizeof(request.mac));
+    request.len = static_cast<std::uint16_t>(len);
+    std::memcpy(request.data, data, len);
+    request.completionSlot = static_cast<std::uint8_t>(slotIndex);
+    request.completionGeneration = generation;
+    request.enqueuedMs = millis();
+    request.timeoutMs = timeoutMs;
+    if (!enqueueRequest(request, priority)) {
+        releaseCompletionSlot(static_cast<std::size_t>(slotIndex), generation);
         return false;
     }
 
-    outDelivered = (sendWaitStatus_ == ESP_NOW_SEND_SUCCESS);
-    return true;
+    const TickType_t waitTicks = pdMS_TO_TICKS(timeoutMs) > 0U ? pdMS_TO_TICKS(timeoutMs) : 1U;
+    if (xSemaphoreTake(g_completionSlots[slotIndex].signal, waitTicks) != pdTRUE) {
+        releaseCompletionSlot(static_cast<std::size_t>(slotIndex), generation);
+        return false;
+    }
+
+    bool callbackReceived = false;
+    portENTER_CRITICAL(&g_completionMux);
+    const CompletionSlot& slot = g_completionSlots[slotIndex];
+    if (slot.inUse && slot.generation == generation) {
+        callbackReceived = slot.callbackReceived;
+        outDelivered = slot.delivered;
+    }
+    portEXIT_CRITICAL(&g_completionMux);
+    releaseCompletionSlot(static_cast<std::size_t>(slotIndex), generation);
+    return callbackReceived;
+}
+
+void EspNowManager::peekTxSchedulerCounters(TxSchedulerCounters& out) const {
+    for (std::size_t i = 0U; i < kTxPriorityCount; ++i) {
+        out.enqueued[i] = g_txEnqueued[i];
+        out.droppedQueueFull[i] = g_txDroppedQueueFull[i];
+    }
+    out.driverRejected = g_txDriverRejected;
+    out.callbackTimeouts = g_txCallbackTimeouts;
+    out.callbacksReceived = g_txCallbacksReceived;
 }
 
 // Send to all peers and aggregate delivery status.
@@ -335,12 +670,11 @@ void EspNowManager::handleSendStatic(const uint8_t* mac, esp_now_send_status_t s
         return;
     }
 
-    if (activeInstance_->sendWaitPending_ && activeInstance_->sendWaitHasMac_ && mac != nullptr) {
-        if (memcmp(activeInstance_->sendWaitMac_, mac, 6) == 0) {
-            activeInstance_->sendWaitStatus_ = status;
-            activeInstance_->sendWaitCompleted_ = true;
-            activeInstance_->sendWaitPending_ = false;
-        }
+    if (g_driverStatusQueue != nullptr && mac != nullptr) {
+        DriverStatus driverStatus{};
+        std::memcpy(driverStatus.mac, mac, sizeof(driverStatus.mac));
+        driverStatus.status = status;
+        xQueueSend(g_driverStatusQueue, &driverStatus, 0);
     }
 
     if (activeInstance_->sendCallback_ == nullptr) {

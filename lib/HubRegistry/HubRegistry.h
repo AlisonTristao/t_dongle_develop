@@ -20,7 +20,8 @@
  * told, once, out of band. This is that "told".
  *
  * WHY IT IS NOT THE PEER TABLE. BtpTransport's peer cache
- * (rememberPeer/lookupPeerMacBySourceId) answers a different question --
+ * (rememberAuthenticatedPeer/lookupPeerMacBySourceId) answers a different
+ * question --
  * "which MAC did I last hear source_id X from" -- and it is learned from
  * traffic. This one is an operator's declaration of intent and is learned
  * from a command. Merging them would make a robot able to redirect another

@@ -164,6 +164,9 @@ struct RxCounters {
 
 void peekRxCounters(RxCounters& out);
 
+/** Cumulative counters from the single-owner radio TX scheduler. */
+void peekTxSchedulerCounters(EspNowManager::TxSchedulerCounters& out);
+
 /**
  * @brief Sends one heartbeat probe (BTP CONTROL/STATUS, object_id 0x0009,
  * empty payload -- "spontaneous and gets no response" per

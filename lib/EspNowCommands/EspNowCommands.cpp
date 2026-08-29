@@ -179,7 +179,8 @@ uint8_t wrapper_espnow_update(int32_t deviceNumber, string name, string descript
 }
 
 // Sends one BTP COMMAND_REQUEST (shell action) to a MAC whose boot_id we've
-// already learned from received traffic (see BtpTransport::rememberPeer --
+// already learned from authenticated channel-C traffic (see
+// BtpTransport::rememberAuthenticatedPeer --
 // there is no HELLO/MANIFEST handshake yet, topico 16). A peer we've never
 // heard from cannot be addressed: unlike the old CMDO, a COMMAND_REQUEST
 // needs a real target_boot_id, not just a MAC.
@@ -392,6 +393,24 @@ uint8_t wrapper_espnow_stats() {
                       static_cast<unsigned>(s.syncFallbackDrops));
         printLine(line);
     }
+
+    std::snprintf(line, sizeof(line),
+                  "[espnow tx] enfileirados: critico=%u controle=%u dados=%u callbacks=%u",
+                  static_cast<unsigned>(s.txEnqueued[0]),
+                  static_cast<unsigned>(s.txEnqueued[1]),
+                  static_cast<unsigned>(s.txEnqueued[2]),
+                  static_cast<unsigned>(s.txCallbacksReceived));
+    printLine(line);
+
+    std::snprintf(line, sizeof(line),
+                  "[espnow tx] descartes_fila: critico=%u controle=%u dados=%u "
+                  "driver_reject=%u callback_timeout=%u",
+                  static_cast<unsigned>(s.txDroppedQueueFull[0]),
+                  static_cast<unsigned>(s.txDroppedQueueFull[1]),
+                  static_cast<unsigned>(s.txDroppedQueueFull[2]),
+                  static_cast<unsigned>(s.txDriverRejected),
+                  static_cast<unsigned>(s.txCallbackTimeouts));
+    printLine(line);
 
     std::snprintf(line, sizeof(line), "[usb] sessao=%s frames_rx=%llu frames_tx=%llu tx_travado=%llu",
                   s.protocolled ? "protocolada" : "console",

@@ -1,6 +1,7 @@
 #include "DongleCommands.h"
 
 #include "HubRegistry.h"
+#include "ManifestCache.h"
 #include "SerialMux.h"
 #include "ShellCommandSupport.h"
 #include "SudoManager.h"
@@ -822,6 +823,72 @@ uint8_t wrapper_hub_key_status() {
     return RESULT_OK;
 }
 
+// Plano 36 fase 0a: diagnostico do caminho do catalogo do robo. Diz em qual
+// elo da cadeia prime -> resposta -> ingest -> serve a coisa quebra, sem
+// depender de log async (engolido quando uma sessao BTP e dona da porta) --
+// a saida sincrona do shell chega ao TraceView mesmo com a sessao protocolada.
+//
+// Leitura: rode 2x com ~10s de intervalo, com um robo publicando STATUS.
+//   prime=0                 -> shouldRequestManifest nunca da true
+//   prime>0, ingest_ok=0,
+//     ingest_fail=0, reject=0 -> o robo NAO responde ao prime (instrumentar o robo)
+//   reject>0                -> a MANIFEST_DATA chega mas o reference_source_id nao bate
+//   ingest_fail>0           -> a MANIFEST_DATA chega mas o payload nao valida
+//   ingest_ok>0, serve_miss subindo -> ingeriu mas a consulta do TraceView nao acha
+//   entradas listadas       -> a cache TEM o robo; o problema e do lado do TraceView
+uint8_t wrapper_hub_manifest() {
+    const ManifestCache::Diagnostics d = ManifestCache::diagnostics();
+
+    char line[160] = {0};
+    std::snprintf(line, sizeof(line),
+                  "[hub] manifest: prime=%lu ingest_ok=%lu ingest_fail=%lu reject=%lu",
+                  static_cast<unsigned long>(d.primeRequestsSent),
+                  static_cast<unsigned long>(d.ingestedOk),
+                  static_cast<unsigned long>(d.ingestFailed),
+                  static_cast<unsigned long>(d.consumeRejected));
+    printLine(line);
+
+    std::snprintf(line, sizeof(line),
+                  "[hub] manifest: serve_rx=%lu serve_hit=%lu serve_miss=%lu",
+                  static_cast<unsigned long>(d.targetedRequestsRx),
+                  static_cast<unsigned long>(d.targetedServedHit),
+                  static_cast<unsigned long>(d.targetedServedMiss));
+    printLine(line);
+
+    // Chases in flight: prime sent, no usable manifest back yet. A row with
+    // attempts climbing and no matching src= entry below is "the robot hears
+    // us but never answers" (fase 1).
+    for (size_t i = 0U; i < d.pendingCount; ++i) {
+        const ManifestCache::PendingDiagnostic& p = d.pending[i];
+        std::snprintf(line, sizeof(line),
+                      "[hub] manifest: pendente src=%08lX boot=%08lX tentativas=%lu",
+                      static_cast<unsigned long>(p.sourceId),
+                      static_cast<unsigned long>(p.bootId),
+                      static_cast<unsigned long>(p.attempts));
+        printLine(line);
+    }
+
+    if (d.entryCount == 0U) {
+        printLine("[hub] manifest: cache vazia (nenhum robo cacheado)");
+        return RESULT_OK;
+    }
+
+    for (size_t i = 0U; i < d.entryCount; ++i) {
+        const ManifestCache::DiagnosticEntry& e = d.entries[i];
+        std::snprintf(line, sizeof(line),
+                      "[hub] manifest: src=%08lX boot=%08lX rev=%lu topicos=%u acoes=%u bytes=%u online=%d",
+                      static_cast<unsigned long>(e.sourceId),
+                      static_cast<unsigned long>(e.bootId),
+                      static_cast<unsigned long>(e.configRevision),
+                      static_cast<unsigned>(e.topicCount),
+                      static_cast<unsigned>(e.actionCount),
+                      static_cast<unsigned>(e.recordsSize),
+                      e.online ? 1 : 0);
+        printLine(line);
+    }
+    return RESULT_OK;
+}
+
 } // namespace
 
 namespace DongleCommands {
@@ -871,6 +938,7 @@ uint8_t registerAll() {
     context().shell->add(wrapper_hub_list, "list", "show every child-to-robot binding in effect", "hub");
     context().shell->add(wrapper_hub_set_key_l, "set_key_l", "derive and store channel C key from a password: <senha>", "hub");
     context().shell->add(wrapper_hub_key_status, "key_status", "show whether channel C key L is loaded (never prints the key)", "hub");
+    context().shell->add(wrapper_hub_manifest, "manifest", "diagnose the robot-catalog path (prime/ingest/serve counters + cached entries)", "hub");
 
     return RESULT_OK;
 }

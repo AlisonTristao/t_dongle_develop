@@ -10,7 +10,8 @@
  * (BTP/docs/commands.md section 3), topico 16.
  *
  * One entry per robot source_id, keyed by the identity actually observed
- * over ESP-NOW (BtpTransport::rememberPeer already tracks (mac, source_id,
+ * over ESP-NOW (BtpTransport::rememberAuthenticatedPeer already tracks
+ * authenticated (mac, source_id,
  * boot_id); this cache adds "and what topics/actions does that source_id
  * publish"). Topic/action records are stored **verbatim** as the raw,
  * already-length-prefixed bytes the robot sent -- this dongle relays a
@@ -60,7 +61,18 @@ constexpr std::size_t kMaxNameLength = 64U;
 // Minimum time between two MANIFEST_REQUESTs this dongle sends to the same
 // (source_id, boot_id) while waiting for a reply, so a 50Hz TELEMETRY stream
 // from a not-yet-cached robot does not flood it with duplicate requests.
+//
+// The first kFastRequestAttempts go out at the faster kFastRequestCooldownMs
+// cadence: a robot that just powered on (or one the dongle evicted, or one a
+// hub child asked about before the dongle had heard it) should show its
+// catalog in a second or two, not wait out a full 3s cooldown per try. After
+// the fast burst it falls back to kRequestCooldownMs and keeps retrying at
+// that rate for as long as the robot stays uncached -- there is no attempt
+// cap: a robot whose ManifestResponder is wedged but whose STATUS still
+// arrives must not be given up on, only asked about less often.
 constexpr std::uint32_t kRequestCooldownMs = 3000U;
+constexpr std::uint32_t kFastRequestCooldownMs = 1000U;
+constexpr std::uint32_t kFastRequestAttempts = 3U;
 
 void configure(const std::uint8_t selfUuid[16]) noexcept;
 
@@ -68,7 +80,8 @@ void configure(const std::uint8_t selfUuid[16]) noexcept;
 // (never cached, or cached under a different boot_id -- i.e. the peer
 // rebooted) and the last request for it (if any) is old enough to retry.
 // Has the side effect of arming the cooldown, i.e. treat a `true` result as
-// "and I am about to send one now" -- matches BtpTransport::rememberPeer's
+// "and I am about to send one now" -- matches
+// BtpTransport::rememberAuthenticatedPeer's
 // "called once per routed frame" contract.
 bool shouldRequestManifest(std::uint32_t sourceId, std::uint32_t bootId, std::uint32_t nowMs) noexcept;
 
@@ -138,5 +151,64 @@ std::size_t buildTargetedResponse(std::uint32_t targetSourceId, std::uint32_t ta
 // SUBSCRIBE handler it uses for a robot topic.
 bool lookupTopicMaxRateMillihz(std::uint32_t sourceId, std::uint32_t topicId,
                                std::uint32_t* outMaxRateMillihz) noexcept;
+
+// --- Diagnostico do caminho do manifesto (plano 36, fase 0a) --------------
+// Contadores cumulativos desde o boot + um resumo das entradas em cache, para
+// o comando "hub -manifest" dizer em qual elo a cadeia
+// prime -> resposta -> ingest -> serve quebra, sem depender de log async (que
+// e engolido quando uma sessao BTP e dona da porta).
+
+struct DiagnosticEntry {
+    std::uint32_t sourceId;
+    std::uint32_t bootId;
+    std::uint32_t configRevision;
+    std::uint16_t topicCount;
+    std::uint16_t actionCount;
+    std::uint16_t recordsSize;
+    bool online;
+};
+
+// A (source_id, boot_id) this dongle is currently chasing a manifest for --
+// prime sent, no usable MANIFEST_DATA back yet. `attempts` is how many
+// MANIFEST_REQUESTs have gone out for this exact chase (resets to 1 when the
+// peer reboots). A row here with a climbing `attempts` and no matching entry
+// above is "the robot hears us but never answers".
+struct PendingDiagnostic {
+    std::uint32_t sourceId;
+    std::uint32_t bootId;
+    std::uint32_t attempts;
+};
+
+struct Diagnostics {
+    std::uint32_t primeRequestsSent;      // notePrimeSent() em EspNowConfig
+    std::uint32_t ingestedOk;             // ingestManifestData() -> true
+    std::uint32_t ingestFailed;           // ingestManifestData() -> false
+    std::uint32_t consumeRejected;        // noteConsumeRejected() em EspNowConfig
+    std::uint32_t targetedRequestsRx;     // buildTargetedResponse() chamado
+    std::uint32_t targetedServedHit;      // ... com a entrada em cache
+    std::uint32_t targetedServedMiss;     // ... sem a entrada (NOT_FOUND)
+    std::size_t entryCount;
+    DiagnosticEntry entries[kCapacity];
+    std::size_t pendingCount;
+    PendingDiagnostic pending[kCapacity];
+};
+
+Diagnostics diagnostics() noexcept;
+
+// Cheap cumulative-since-boot reads of the two manifest-path failure counters,
+// for a per-tick watcher (AppRuntime::processAsyncWarnings) that only wants
+// the delta and must not copy the whole Diagnostics struct every loop.
+std::uint32_t ingestFailedTotal() noexcept;
+std::uint32_t consumeRejectedTotal() noexcept;
+
+// Chamados de fora (EspNowConfig) para registrar eventos que a cache em si
+// nao ve.
+void notePrimeSent() noexcept;
+void noteConsumeRejected() noexcept;
+
+// Zera cache, pendencias, catalogRevision e todos os contadores de
+// diagnostico. So para o env:native (test_manifest_cache), mesmo padrao de
+// DonglePublisher::resetForTests().
+void resetForTests() noexcept;
 
 }  // namespace ManifestCache

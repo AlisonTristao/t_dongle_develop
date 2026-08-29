@@ -13,7 +13,8 @@
  * lib/BtpTransport (same wire layout, same source_id-from-MAC formula), so
  * both firmwares derive identical identity from a MAC with no handshake.
  * boot_id has no equivalent shortcut: a peer's boot_id can only be learned by
- * observing a BTP frame it actually sent (see rememberPeer/lookupPeer
+ * authenticating a channel-C BTP frame it actually sent (see
+ * rememberAuthenticatedPeer/lookupPeer
  * below), never invented locally. This is a deliberate stand-in for the
  * HELLO/MANIFEST handshake (topico 16, not implemented yet): commands can
  * only target a peer this dongle has already heard from at least once.
@@ -163,16 +164,14 @@ bool encodeSingleFrame(btp::MessageType type,
 /** Bounded cache of the last observed (source_id, boot_id) per peer MAC. */
 constexpr std::size_t kPeerIdentityCapacity = 16U;
 
-/** Records the identity carried by a frame actually received from this MAC,
- * and when it was heard. `nowMs` is a millis()-style monotonic clock; it is
- * stored verbatim and only ever consumed as a difference against a later
- * reading, so the ~49-day wrap is harmless (unsigned subtraction still yields
- * the right elapsed time). Called by the router's consumer for every
- * successfully routed message. */
-void rememberPeer(const std::uint8_t mac[6],
-                  std::uint32_t sourceId,
-                  std::uint32_t bootId,
-                  std::uint32_t nowMs) noexcept;
+/** Records an identity only after a channel-C frame from this MAC has passed
+ * AEAD-L authentication. Public BTP headers from opaque channel-B traffic are
+ * deliberately insufficient: they may still be relayed, but must never
+ * create a routing binding or renew the official online clock. */
+void rememberAuthenticatedPeer(const std::uint8_t mac[6],
+                               std::uint32_t sourceId,
+                               std::uint32_t bootId,
+                               std::uint32_t nowMs) noexcept;
 
 /** Records the outcome of the heartbeat probe this dongle last addressed to
  * this MAC (EspNowConfig::heartbeatTick). Until topico 27 that verdict only
@@ -187,9 +186,9 @@ struct PeerSnapshot {
     std::uint8_t mac[6];
     std::uint32_t sourceId;
     std::uint32_t bootId;
-    /** The `nowMs` of the last rememberPeer() call for this MAC (absolute, not
-     * an age -- the caller subtracts). */
-    std::uint32_t lastSeenMs;
+    /** The `nowMs` of the last authenticated channel-C frame from this MAC
+     * (absolute, not an age -- the caller subtracts). */
+    std::uint32_t lastAuthenticatedMs;
     /** Last notePeerLinkResult() verdict; false when never probed. */
     bool linkOk;
 };
@@ -198,8 +197,8 @@ struct PeerSnapshot {
  * @brief Copies every known peer into `out`, in slot order, and returns how
  * many were written.
  *
- * Slot order is *first-heard* order, because rememberPeer() fills the lowest
- * free slot -- which is what makes it usable as a display index. It is only
+ * Slot order is *first-authenticated* order: rememberAuthenticatedPeer()
+ * fills the lowest free slot. It is only
  * that: the order resets on every dongle boot, and once the table is full the
  * eviction path reuses slot 0, so the index of a given peer is not stable even
  * within one boot. `sourceId` is the identity; see
@@ -221,6 +220,10 @@ bool lookupPeer(const std::uint8_t mac[6],
 bool lookupPeerMacBySourceId(std::uint32_t sourceId,
                              std::uint8_t outMac[6],
                              std::uint32_t* outBootId) noexcept;
+
+/** Clears the bounded peer cache. Test isolation only; production identity
+ * discovery is intentionally retained for the whole dongle boot. */
+void resetPeerTableForTests() noexcept;
 
 namespace btp_command {
 

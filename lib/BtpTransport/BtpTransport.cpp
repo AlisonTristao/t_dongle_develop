@@ -6,6 +6,13 @@
 #include <cstring>
 #include <limits>
 
+#if defined(ARDUINO)
+#include <freertos/FreeRTOS.h>
+#include <freertos/portmacro.h>
+#else
+#include <mutex>
+#endif
+
 namespace BtpTransport {
 namespace {
 
@@ -18,11 +25,42 @@ struct PeerIdentity {
     std::uint8_t mac[6] = {0, 0, 0, 0, 0, 0};
     std::uint32_t sourceId = 0U;
     std::uint32_t bootId = 0U;
-    std::uint32_t lastSeenMs = 0U;
+    std::uint32_t lastAuthenticatedMs = 0U;
     bool linkOk = false;
 };
 
 PeerIdentity g_peers[kPeerIdentityCapacity];
+
+// rememberAuthenticatedPeer() runs on espnow_rx, notePeerLinkResult() on the
+// heartbeat task, and enumerate/lookup on the Arduino loop. A plain struct assignment
+// is not an atomic snapshot on either core, so every access to g_peers must
+// share one very short critical section.  The firmware path uses ESP-IDF's
+// cross-core spinlock; the native test path uses the standard mutex.
+#if defined(ARDUINO)
+portMUX_TYPE g_peerTableMux = portMUX_INITIALIZER_UNLOCKED;
+
+class PeerTableGuard {
+public:
+    PeerTableGuard() noexcept { portENTER_CRITICAL(&g_peerTableMux); }
+    ~PeerTableGuard() { portEXIT_CRITICAL(&g_peerTableMux); }
+
+    PeerTableGuard(const PeerTableGuard&) = delete;
+    PeerTableGuard& operator=(const PeerTableGuard&) = delete;
+};
+#else
+std::mutex g_peerTableMutex;
+
+class PeerTableGuard {
+public:
+    PeerTableGuard() noexcept : lock_(g_peerTableMutex) {}
+
+    PeerTableGuard(const PeerTableGuard&) = delete;
+    PeerTableGuard& operator=(const PeerTableGuard&) = delete;
+
+private:
+    std::lock_guard<std::mutex> lock_;
+};
+#endif
 
 bool sameMac(const std::uint8_t* lhs, const std::uint8_t* rhs) noexcept {
     return std::memcmp(lhs, rhs, 6U) == 0;
@@ -274,15 +312,17 @@ bool sendLogicalWithStatus(SendWithStatusFn sendWithStatus,
     return true;
 }
 
-void rememberPeer(const std::uint8_t mac[6], std::uint32_t sourceId, std::uint32_t bootId,
-                  std::uint32_t nowMs) noexcept {
+void rememberAuthenticatedPeer(const std::uint8_t mac[6], std::uint32_t sourceId,
+                               std::uint32_t bootId, std::uint32_t nowMs) noexcept {
     if (mac == nullptr || sourceId == 0U || bootId == 0U) return;
+
+    const PeerTableGuard guard;
 
     for (std::size_t index = 0U; index < kPeerIdentityCapacity; ++index) {
         if (g_peers[index].used && sameMac(g_peers[index].mac, mac)) {
             g_peers[index].sourceId = sourceId;
             g_peers[index].bootId = bootId;
-            g_peers[index].lastSeenMs = nowMs;
+            g_peers[index].lastAuthenticatedMs = nowMs;
             return;
         }
     }
@@ -293,7 +333,7 @@ void rememberPeer(const std::uint8_t mac[6], std::uint32_t sourceId, std::uint32
             std::memcpy(g_peers[index].mac, mac, 6U);
             g_peers[index].sourceId = sourceId;
             g_peers[index].bootId = bootId;
-            g_peers[index].lastSeenMs = nowMs;
+            g_peers[index].lastAuthenticatedMs = nowMs;
             // A recycled slot must not inherit the previous occupant's
             // heartbeat verdict: nothing has been probed at this MAC yet.
             g_peers[index].linkOk = false;
@@ -308,12 +348,14 @@ void rememberPeer(const std::uint8_t mac[6], std::uint32_t sourceId, std::uint32
     std::memcpy(g_peers[0].mac, mac, 6U);
     g_peers[0].sourceId = sourceId;
     g_peers[0].bootId = bootId;
-    g_peers[0].lastSeenMs = nowMs;
+    g_peers[0].lastAuthenticatedMs = nowMs;
     g_peers[0].linkOk = false;
 }
 
 void notePeerLinkResult(const std::uint8_t mac[6], bool delivered) noexcept {
     if (mac == nullptr) return;
+
+    const PeerTableGuard guard;
 
     for (std::size_t index = 0U; index < kPeerIdentityCapacity; ++index) {
         if (g_peers[index].used && sameMac(g_peers[index].mac, mac)) {
@@ -326,13 +368,15 @@ void notePeerLinkResult(const std::uint8_t mac[6], bool delivered) noexcept {
 std::size_t enumeratePeers(PeerSnapshot* out, std::size_t maxOut) noexcept {
     if (out == nullptr || maxOut == 0U) return 0U;
 
+    const PeerTableGuard guard;
+
     std::size_t written = 0U;
     for (std::size_t index = 0U; index < kPeerIdentityCapacity && written < maxOut; ++index) {
         if (!g_peers[index].used) continue;
         std::memcpy(out[written].mac, g_peers[index].mac, 6U);
         out[written].sourceId = g_peers[index].sourceId;
         out[written].bootId = g_peers[index].bootId;
-        out[written].lastSeenMs = g_peers[index].lastSeenMs;
+        out[written].lastAuthenticatedMs = g_peers[index].lastAuthenticatedMs;
         out[written].linkOk = g_peers[index].linkOk;
         ++written;
     }
@@ -341,6 +385,8 @@ std::size_t enumeratePeers(PeerSnapshot* out, std::size_t maxOut) noexcept {
 
 bool lookupPeer(const std::uint8_t mac[6], std::uint32_t* outSourceId, std::uint32_t* outBootId) noexcept {
     if (mac == nullptr) return false;
+
+    const PeerTableGuard guard;
 
     for (std::size_t index = 0U; index < kPeerIdentityCapacity; ++index) {
         if (g_peers[index].used && sameMac(g_peers[index].mac, mac)) {
@@ -355,6 +401,8 @@ bool lookupPeer(const std::uint8_t mac[6], std::uint32_t* outSourceId, std::uint
 bool lookupPeerMacBySourceId(std::uint32_t sourceId, std::uint8_t outMac[6], std::uint32_t* outBootId) noexcept {
     if (sourceId == 0U || outMac == nullptr) return false;
 
+    const PeerTableGuard guard;
+
     for (std::size_t index = 0U; index < kPeerIdentityCapacity; ++index) {
         if (g_peers[index].used && g_peers[index].sourceId == sourceId) {
             std::memcpy(outMac, g_peers[index].mac, 6U);
@@ -363,6 +411,11 @@ bool lookupPeerMacBySourceId(std::uint32_t sourceId, std::uint8_t outMac[6], std
         }
     }
     return false;
+}
+
+void resetPeerTableForTests() noexcept {
+    const PeerTableGuard guard;
+    std::memset(g_peers, 0, sizeof(g_peers));
 }
 
 namespace btp_command {

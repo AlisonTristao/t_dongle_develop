@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <esp_now.h>
+#include <RadioTxScheduler.h>
 
 /**
  * @brief EspNowManager wraps peer registration and raw-byte messaging over
@@ -19,6 +20,7 @@
  */
 class EspNowManager final {
 public:
+    using TxPriority = RadioTxScheduler::Priority;
     /** Maximum number of peers tracked by the manager. */
     static constexpr size_t MAX_DEVICES = 16;
     /** Maximum length for device display name, including terminator. */
@@ -136,9 +138,12 @@ public:
     bool sendToDevice(size_t index, const uint8_t* data, size_t len) const;
 
     /**
-     * @brief Sends one datagram directly to a MAC address.
+     * @brief Copies one datagram into the bounded scheduler queue.
+     * @return true when queued; delivery is reported later by SendCallback.
+     * Only the manager's TX worker calls the ESP-NOW driver.
      */
-    bool sendToMac(const uint8_t mac[6], const uint8_t* data, size_t len) const;
+    bool sendToMac(const uint8_t mac[6], const uint8_t* data, size_t len,
+                   TxPriority priority = TxPriority::Control) const;
 
     /**
      * @brief Sends datagram and waits for callback status for target index.
@@ -146,7 +151,7 @@ public:
      * @param data Datagram bytes.
      * @param len Datagram size.
      * @param outDelivered true when callback reports success.
-     * @param timeoutMs Max wait time for callback.
+     * @param timeoutMs Total queue + driver callback deadline.
      * @return true when send callback was received.
      */
     bool sendToDeviceWithStatus(size_t index, const uint8_t* data, size_t len, bool& outDelivered, uint32_t timeoutMs = 600) const;
@@ -160,7 +165,20 @@ public:
      * @param timeoutMs Max wait time for callback.
      * @return true when send callback was received.
      */
-    bool sendToMacWithStatus(const uint8_t mac[6], const uint8_t* data, size_t len, bool& outDelivered, uint32_t timeoutMs = 600) const;
+    bool sendToMacWithStatus(const uint8_t mac[6], const uint8_t* data, size_t len,
+                             bool& outDelivered, uint32_t timeoutMs = 600,
+                             TxPriority priority = TxPriority::Critical) const;
+
+    struct TxSchedulerCounters {
+        uint32_t enqueued[RadioTxScheduler::kPriorityCount];
+        uint32_t droppedQueueFull[RadioTxScheduler::kPriorityCount];
+        uint32_t driverRejected;
+        uint32_t callbackTimeouts;
+        uint32_t callbacksReceived;
+    };
+
+    /** Non-destructive cumulative counters since begin(). */
+    void peekTxSchedulerCounters(TxSchedulerCounters& out) const;
 
     /**
      * @brief Sends to all peers and aggregates callback delivery status.
@@ -200,12 +218,6 @@ private:
     bool encrypt_;
     ReceiveCallback receiveCallback_;
     SendCallback sendCallback_;
-
-    mutable volatile bool sendWaitPending_;
-    mutable volatile bool sendWaitCompleted_;
-    mutable esp_now_send_status_t sendWaitStatus_;
-    mutable uint8_t sendWaitMac_[6];
-    mutable bool sendWaitHasMac_;
 
     /** Static adapter for ESP-NOW receive callback. */
     static void handleReceiveStatic(const uint8_t* mac, const uint8_t* incomingData, int len);

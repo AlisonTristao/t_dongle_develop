@@ -191,7 +191,8 @@ struct PeerRecord {
     // which is why an unauthenticated peer could still show up here; it
     // cannot any more. False for a peer that has never been probed or
     // opened -- absence of evidence, not evidence of absence, which is why
-    // `lastSeenAgeMs` (unaffected by any of this -- see rememberPeer's own
+    // `lastSeenAgeMs` (unaffected by any of this -- see
+    // rememberAuthenticatedPeer's own
     // comment) is still the field to judge mere freshness by.
     bool online;
 };

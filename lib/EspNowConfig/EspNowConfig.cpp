@@ -184,14 +184,30 @@ volatile uint32_t g_routedTerminalTotal = 0;
 
 bool g_asyncRxEnabled = false;
 
-// Heartbeat target: last peer we received real data from.
-uint8_t g_heartbeatTargetMac[6] = {0};
-bool g_hasHeartbeatTarget = false;
+EspNowManager::TxPriority txPriorityForFrame(const uint8_t* data, size_t size) {
+    const HubRelay::RadioIngress ingress = HubRelay::classifyRadio(data, size);
+    if (ingress.error != btp::Error::Ok) {
+        return EspNowManager::TxPriority::Control;
+    }
+    switch (ingress.header.type) {
+        case btp::MessageType::Control:
+        case btp::MessageType::Command:
+            return EspNowManager::TxPriority::Critical;
+        case btp::MessageType::Log:
+        case btp::MessageType::Terminal:
+            return EspNowManager::TxPriority::Control;
+        case btp::MessageType::Telemetry:
+            return EspNowManager::TxPriority::Data;
+    }
+    return EspNowManager::TxPriority::Control;
+}
 
-// Adapter binding BtpTransport's transport-agnostic send callback to this
-// dongle's actual EspNowManager instance.
+// Adapter binding BtpTransport's transport-agnostic send callback to the
+// manager's bounded, single-owner scheduler. The frame is copied before this
+// returns, so callers may keep using stack buffers.
 bool sendViaManager(void* context, const uint8_t mac[6], const uint8_t* data, size_t size) {
-    return static_cast<EspNowManager*>(context)->sendToMac(mac, data, size);
+    return static_cast<EspNowManager*>(context)->sendToMac(
+        mac, data, size, txPriorityForFrame(data, size));
 }
 
 // Proactively asks a peer for its manifest the moment this dongle has no
@@ -223,6 +239,7 @@ void primeManifestIfNeeded(const uint8_t mac[6], const btp::Header& header) {
     BtpTransport::sendLogical(sendViaManager, g_manager, mac, btp::MessageType::Control,
                               ManifestCache::kManifestRequestObjectId, requestPayload, requestSize,
                               timestampUs, RadioSeal::seal, nullptr);
+    ManifestCache::notePrimeSent();  // plano 36 fase 0a
 }
 
 // "state changed: SETUP -> WAIT" style lines emitted by the robot's Logger.
@@ -527,21 +544,6 @@ void processRxDatagramInternal(const uint8_t mac[6], const uint8_t* data, size_t
         return;
     }
 
-    // Learned from every datagram, consumed or not: lookupPeerMacBySourceId
-    // is how the DOWNSTREAM relay finds a robot's MAC (SerialMux::relayDown),
-    // so a robot the dongle only ever relays for still has to be addressable.
-    if (mac != nullptr) {
-        std::memcpy(g_heartbeatTargetMac, mac, sizeof(g_heartbeatTargetMac));
-        g_hasHeartbeatTarget = true;
-        BtpTransport::rememberPeer(mac, ingress.header.source_id, ingress.header.boot_id, millis());
-
-        if (g_manager != nullptr && g_manager->deviceIndexByMac(mac) < 0) {
-            char autoName[24] = {0};
-            std::snprintf(autoName, sizeof(autoName), "peer-%02X%02X", mac[4], mac[5]);
-            g_manager->addDevice(mac, autoName, "adicionado automaticamente por RX ESP-NOW");
-        }
-    }
-
     // Non-candidates are necessarily endpoint traffic and remain on the fast
     // blind-relay path. Candidates wait below because their payload may be
     // ciphertext, including its destination/reference field.
@@ -616,9 +618,19 @@ void processRxDatagramInternal(const uint8_t mac[6], const uint8_t* data, size_t
             return;
         }
 
-        // A successful L open is real bidirectional evidence for the peer.
+        // Only an AEAD-L success may create/refresh the official peer
+        // identity. Public channel-B headers still relay byte-for-byte, but
+        // cannot spoof online or overwrite the source_id -> MAC route.
         if (mac != nullptr) {
+            BtpTransport::rememberAuthenticatedPeer(mac, routed.header.source_id,
+                                                    routed.header.boot_id, nowMs);
             BtpTransport::notePeerLinkResult(mac, true);
+
+            if (g_manager != nullptr && g_manager->deviceIndexByMac(mac) < 0) {
+                char autoName[24] = {0};
+                std::snprintf(autoName, sizeof(autoName), "peer-%02X%02X", mac[4], mac[5]);
+                g_manager->addDevice(mac, autoName, "adicionado automaticamente por RX ESP-NOW");
+            }
         }
 
         routed.payloadSize -= RadioSeal::kTagSize;
@@ -631,6 +643,14 @@ void processRxDatagramInternal(const uint8_t mac[6], const uint8_t* data, size_t
             referenceSourceId(routed.header, routed.payload, routed.payloadSize);
         if (!bally::dongle_consumes(routed.header.type, routed.header.object_id, referenceId,
                                     BtpTransport::sourceId())) {
+            // plano 36 fase 0a: uma MANIFEST_DATA que abriu com a chave L mas
+            // cujo reference_source_id nao e o deste dongle nao vira ingest --
+            // conta, para "hub -manifest" distinguir "o robo nao respondeu" de
+            // "respondeu mas a referencia nao bate".
+            if (routed.header.type == btp::MessageType::Control &&
+                routed.header.object_id == ManifestCache::kManifestDataObjectId) {
+                ManifestCache::noteConsumeRejected();
+            }
             clearPendingRelay(routed.header);
             return;
         }
@@ -924,10 +944,35 @@ void peekRxCounters(RxCounters& out) {
     out.droppedQueueFull = g_droppedQueueFullTotal;
 }
 
-void heartbeatTick() {
-    if (g_manager == nullptr || !g_hasHeartbeatTarget) {
+void peekTxSchedulerCounters(EspNowManager::TxSchedulerCounters& out) {
+    if (g_manager == nullptr) {
+        out = {};
         return;
     }
+    g_manager->peekTxSchedulerCounters(out);
+}
+
+void heartbeatTick() {
+    if (g_manager == nullptr) {
+        return;
+    }
+
+    // Snapshot while BtpTransport holds its peer-table lock, then release it
+    // before the blocking send. This removes the cross-task mutable target
+    // and probes every authenticated peer in round-robin order.
+    BtpTransport::PeerSnapshot peers[BtpTransport::kPeerIdentityCapacity]{};
+    const std::size_t peerCount =
+        BtpTransport::enumeratePeers(peers, BtpTransport::kPeerIdentityCapacity);
+    if (peerCount == 0U) {
+        return;
+    }
+    static std::size_t nextPeer = 0U;  // owned only by the heartbeat task
+    if (nextPeer >= peerCount) {
+        nextPeer = 0U;
+    }
+    std::uint8_t targetMac[6]{};
+    std::memcpy(targetMac, peers[nextPeer].mac, sizeof(targetMac));
+    nextPeer = (nextPeer + 1U) % peerCount;
 
     uint32_t sequence = 0;
     if (!BtpTransport::reserveSequence(&sequence)) {
@@ -951,7 +996,7 @@ void heartbeatTick() {
     }
 
     bool delivered = false;
-    const bool gotStatus = g_manager->sendToMacWithStatus(g_heartbeatTargetMac, frame, frameSize, delivered,
+    const bool gotStatus = g_manager->sendToMacWithStatus(targetMac, frame, frameSize, delivered,
                                                            HEARTBEAT_SEND_TIMEOUT_MS);
 
     const bool linkOk = gotStatus && delivered;
@@ -959,7 +1004,7 @@ void heartbeatTick() {
     // Topico 27: the same verdict, kept per peer as well. Until now it only
     // lit the LCD's LINK tile -- a single global bit on a screen nobody can
     // plot; hub.peers publishes it per peer as `online`.
-    BtpTransport::notePeerLinkResult(g_heartbeatTargetMac, linkOk);
+    BtpTransport::notePeerLinkResult(targetMac, linkOk);
 
     if (g_lcdDashboard != nullptr) {
         g_lcdDashboard->notifyHeartbeat(linkOk);
@@ -970,7 +1015,8 @@ bool sendRawToMac(const uint8_t mac[6], const uint8_t* frame, size_t frameSize) 
     if (g_manager == nullptr || mac == nullptr || frame == nullptr || frameSize == 0) {
         return false;
     }
-    return g_manager->sendToMac(mac, frame, frameSize);
+    return g_manager->sendToMac(mac, frame, frameSize,
+                                txPriorityForFrame(frame, frameSize));
 }
 
 } // namespace EspNowConfig

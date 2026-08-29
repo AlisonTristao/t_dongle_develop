@@ -2,6 +2,7 @@
 
 #include <ProtocolRouter.h>
 #include <BtpTransport.h>
+#include <RadioTxScheduler.h>
 #include <btp/codec.hpp>
 
 #include <cstdint>
@@ -50,8 +51,104 @@ void write_u32(std::uint8_t* output, std::uint32_t value) {
 
 }  // namespace
 
-void setUp() {}
+void setUp() {
+    BtpTransport::resetPeerTableForTests();
+}
 void tearDown() {}
+
+void test_peer_table_publishes_complete_snapshots_and_updates_in_place() {
+    BtpTransport::rememberAuthenticatedPeer(kMacA, 0x10203040U, 0x50607080U, 1234U);
+    BtpTransport::notePeerLinkResult(kMacA, true);
+
+    BtpTransport::PeerSnapshot peers[BtpTransport::kPeerIdentityCapacity]{};
+    TEST_ASSERT_EQUAL_UINT32(1U, BtpTransport::enumeratePeers(peers, BtpTransport::kPeerIdentityCapacity));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(kMacA, peers[0].mac, 6U);
+    TEST_ASSERT_EQUAL_HEX32(0x10203040U, peers[0].sourceId);
+    TEST_ASSERT_EQUAL_HEX32(0x50607080U, peers[0].bootId);
+    TEST_ASSERT_EQUAL_UINT32(1234U, peers[0].lastAuthenticatedMs);
+    TEST_ASSERT_TRUE(peers[0].linkOk);
+
+    // A reboot/source correction on the same radio is one row, not a second
+    // partially initialized row. The link verdict is retained until the next
+    // actual probe, matching the pre-existing contract.
+    BtpTransport::rememberAuthenticatedPeer(kMacA, 0x11223344U, 0x99AABBCCU, 5678U);
+    TEST_ASSERT_EQUAL_UINT32(1U, BtpTransport::enumeratePeers(peers, BtpTransport::kPeerIdentityCapacity));
+    TEST_ASSERT_EQUAL_HEX32(0x11223344U, peers[0].sourceId);
+    TEST_ASSERT_EQUAL_HEX32(0x99AABBCCU, peers[0].bootId);
+    TEST_ASSERT_EQUAL_UINT32(5678U, peers[0].lastAuthenticatedMs);
+    TEST_ASSERT_TRUE(peers[0].linkOk);
+}
+
+void test_peer_table_lookup_is_bidirectional_and_rejects_invalid_identity() {
+    BtpTransport::rememberAuthenticatedPeer(nullptr, 1U, 2U, 3U);
+    BtpTransport::rememberAuthenticatedPeer(kMacA, 0U, 2U, 3U);
+    BtpTransport::rememberAuthenticatedPeer(kMacA, 1U, 0U, 3U);
+    BtpTransport::PeerSnapshot peers[1]{};
+    TEST_ASSERT_EQUAL_UINT32(0U, BtpTransport::enumeratePeers(peers, 1U));
+
+    BtpTransport::rememberAuthenticatedPeer(kMacA, 0x10203040U, 0x50607080U, 1234U);
+    std::uint32_t sourceId = 0U;
+    std::uint32_t bootId = 0U;
+    TEST_ASSERT_TRUE(BtpTransport::lookupPeer(kMacA, &sourceId, &bootId));
+    TEST_ASSERT_EQUAL_HEX32(0x10203040U, sourceId);
+    TEST_ASSERT_EQUAL_HEX32(0x50607080U, bootId);
+
+    std::uint8_t mac[6]{};
+    bootId = 0U;
+    TEST_ASSERT_TRUE(BtpTransport::lookupPeerMacBySourceId(sourceId, mac, &bootId));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(kMacA, mac, 6U);
+    TEST_ASSERT_EQUAL_HEX32(0x50607080U, bootId);
+    TEST_ASSERT_FALSE(BtpTransport::lookupPeer(kMacB, nullptr, nullptr));
+}
+
+void test_peer_table_stays_bounded_and_replaces_slot_zero_when_full() {
+    for (std::size_t i = 0U; i < BtpTransport::kPeerIdentityCapacity; ++i) {
+        const std::uint8_t mac[6] = {0xA0U, 0U, 0U, 0U, 0U, static_cast<std::uint8_t>(i + 1U)};
+        BtpTransport::rememberAuthenticatedPeer(mac, static_cast<std::uint32_t>(0x1000U + i),
+                                                static_cast<std::uint32_t>(0x2000U + i),
+                                                static_cast<std::uint32_t>(3000U + i));
+    }
+
+    const std::uint8_t replacement[6] = {0xB0U, 0U, 0U, 0U, 0U, 0xEEU};
+    BtpTransport::rememberAuthenticatedPeer(replacement, 0xDEADBEEFU, 0xCAFEBABEU, 9000U);
+
+    BtpTransport::PeerSnapshot peers[BtpTransport::kPeerIdentityCapacity]{};
+    TEST_ASSERT_EQUAL_UINT32(BtpTransport::kPeerIdentityCapacity,
+                             BtpTransport::enumeratePeers(peers, BtpTransport::kPeerIdentityCapacity));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(replacement, peers[0].mac, 6U);
+    TEST_ASSERT_EQUAL_HEX32(0xDEADBEEFU, peers[0].sourceId);
+    TEST_ASSERT_EQUAL_HEX32(0xCAFEBABEU, peers[0].bootId);
+    TEST_ASSERT_EQUAL_UINT32(9000U, peers[0].lastAuthenticatedMs);
+    TEST_ASSERT_FALSE(peers[0].linkOk);
+}
+
+void test_radio_tx_policy_is_weighted_fair_under_full_load() {
+    const bool available[RadioTxScheduler::kPriorityCount] = {true, true, true};
+    std::size_t cursor = 0U;
+    std::size_t selected[RadioTxScheduler::kPriorityCount] = {0U, 0U, 0U};
+    for (std::size_t i = 0U; i < RadioTxScheduler::kScheduleLength; ++i) {
+        const RadioTxScheduler::Selection choice = RadioTxScheduler::choose(available, cursor);
+        TEST_ASSERT_TRUE(choice.found);
+        ++selected[static_cast<std::size_t>(choice.priority)];
+        cursor = choice.nextCursor;
+    }
+    TEST_ASSERT_EQUAL_UINT32(4U, selected[static_cast<std::size_t>(RadioTxScheduler::Priority::Critical)]);
+    TEST_ASSERT_EQUAL_UINT32(2U, selected[static_cast<std::size_t>(RadioTxScheduler::Priority::Control)]);
+    TEST_ASSERT_EQUAL_UINT32(1U, selected[static_cast<std::size_t>(RadioTxScheduler::Priority::Data)]);
+}
+
+void test_radio_tx_policy_uses_lower_priority_immediately_when_it_is_the_only_work() {
+    const bool dataOnly[RadioTxScheduler::kPriorityCount] = {false, false, true};
+    for (std::size_t cursor = 0U; cursor < RadioTxScheduler::kScheduleLength; ++cursor) {
+        const RadioTxScheduler::Selection choice = RadioTxScheduler::choose(dataOnly, cursor);
+        TEST_ASSERT_TRUE(choice.found);
+        TEST_ASSERT_EQUAL(static_cast<int>(RadioTxScheduler::Priority::Data),
+                          static_cast<int>(choice.priority));
+    }
+
+    const bool empty[RadioTxScheduler::kPriorityCount] = {false, false, false};
+    TEST_ASSERT_FALSE(RadioTxScheduler::choose(empty, 0U).found);
+}
 
 void test_router_routes_every_unfragmented_valid_vector() {
     const char* names[] = {"hello", "log_utf8", "telemetry_packed_le", "protocol_test", "command_request"};
@@ -497,6 +594,11 @@ void test_encodeSingleFrame_seals_and_respects_the_espnow_ceiling() {
 
 int main(int, char**) {
     UNITY_BEGIN();
+    RUN_TEST(test_peer_table_publishes_complete_snapshots_and_updates_in_place);
+    RUN_TEST(test_peer_table_lookup_is_bidirectional_and_rejects_invalid_identity);
+    RUN_TEST(test_peer_table_stays_bounded_and_replaces_slot_zero_when_full);
+    RUN_TEST(test_radio_tx_policy_is_weighted_fair_under_full_load);
+    RUN_TEST(test_radio_tx_policy_uses_lower_priority_immediately_when_it_is_the_only_work);
     RUN_TEST(test_router_routes_every_unfragmented_valid_vector);
     RUN_TEST(test_router_preserves_header_fields_and_payload_bytes);
     RUN_TEST(test_router_holds_a_full_size_sealed_channel_c_message);

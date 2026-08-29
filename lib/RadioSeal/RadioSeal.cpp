@@ -8,8 +8,20 @@ bool seal(void* /*context*/, const btp::Header& header, std::uint16_t payloadSiz
         return false;
     }
 
+    // BTP permits a null input when payloadSize is zero, which is exactly
+    // how the heartbeat is encoded. The ESP32 classic mbedTLS backend,
+    // however, forwards that null pointer to the hardware AES-GCM driver;
+    // even for a zero-byte operation the driver rejects it and logs
+    // "esp-aes-gcm: No input supplied" on every heartbeat. Give the backend
+    // a valid address from which it will read zero bytes. This does not add a
+    // byte to the plaintext or change the authenticated frame/tag.
+    static constexpr std::uint8_t kEmptyPlaintext = 0U;
+    const std::uint8_t* backendPlaintext =
+        (payloadSize == 0U && plaintext == nullptr) ? &kEmptyPlaintext : plaintext;
+
     const btp::AeadKey key{DongleKeyStore::keyL(), DongleKeyStore::kKeyLength};
-    return btp::aead_seal_aes_gcm(key, header, payloadSize, plaintext, out) == btp::AeadError::Ok;
+    return btp::aead_seal_aes_gcm(key, header, payloadSize, backendPlaintext, out) ==
+           btp::AeadError::Ok;
 }
 
 bool open(const btp::Header& header, std::uint16_t ciphertextSize,

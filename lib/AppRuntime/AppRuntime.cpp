@@ -29,6 +29,22 @@ namespace {
 
 constexpr size_t kRxDisplayFlushBurst = 48;
 
+// processAsyncWarnings: min gap between two console lines of the SAME warning
+// category, so a sustained loss (a robot stuck on the wrong key spraying
+// STATUS at 1Hz) is one line every few seconds, not a flood.
+constexpr uint32_t kWarnThrottleMs = 5000U;
+
+// hub.peers "online" (plano 36 fase 5.3): a peer conta como online somente se
+// o dongle autenticou um frame de administracao canal C/AEAD-L nos ultimos
+// kPeerOnlineWindowMs. Trafego endpoint B continua sendo relayado opaco, mas
+// nao cria identidade nem renova presenca. Um robo vivo manda STATUS C a cada
+// ~500ms (bally_OS kStatusPeriodUs); 4s tolera varias perdas seguidas de
+// STATUS (a RF perto dos motores derruba frames) sem deixar a bolinha piscar,
+// e ainda respeita o criterio "offline <=4s" da fase 5. A transicao para
+// offline e publicada sozinha: peersFingerprint() inclui "online", e
+// DonglePublisher publica hub.peers on-change (fase 2.C, sem codigo extra).
+constexpr uint32_t kPeerOnlineWindowMs = 4000U;
+
 // Same POSIX timezone used by bally_OS's default RobotSettings. The system
 // clock itself is Unix epoch/UTC; this only defines how manual set_clock
 // calendar input and every localtime_r() presentation (LCD, database, shell)
@@ -267,8 +283,94 @@ void AppRuntime::startHeartbeatWorker() {
     }
 }
 
+// Turns the drop counters the RX worker accumulates into per-category console
+// lines, so "the robot is connected but nothing works" has a visible cause
+// (plano 36 fase 4.4). SOLE consumer of the takeDropped*Count() family: each
+// call advances a watermark, so a second reader elsewhere would steal half
+// the deltas -- flushPendingEspNowOutput used to report a lump `rx_dropped=`
+// sum here and no longer does.
+//
+// Console-owned only, same constraint as every other diagnostic line this
+// firmware prints: a BTP-protocolled session owns the port exclusively
+// (PASSO 11), and the counters that matter most while protocolled
+// (droppedDecode/Reassembly/Crc/QueueFull) are already in the hub.link topic
+// a desktop can plot. droppedAuth and the manifest-reject counters are not on
+// the wire yet -- `hub -manifest` and `espnow -stats` are where a protocolled
+// session reads those.
 void AppRuntime::processAsyncWarnings(bool& needPromptRefresh) {
-    (void) needPromptRefresh;
+    // Delta since last tick for the five wire-schema drop counters + the
+    // auth-fail counter. Drained here unconditionally (watermark must keep
+    // moving even while protocolled) and fed to the LCD's ERR tile.
+    const uint32_t rxq    = EspNowConfig::takeDroppedRxCount();
+    const uint32_t decode = EspNowConfig::takeDroppedDecodeCount();
+    const uint32_t crc    = EspNowConfig::takeDroppedCrcCount();
+    const uint32_t reasm  = EspNowConfig::takeDroppedReassemblyCount();
+    const uint32_t queue  = EspNowConfig::takeDroppedQueueFullCount();
+    const uint32_t auth   = EspNowConfig::takeDroppedAuthCount();
+
+    const uint32_t lcdTotal = rxq + decode + crc + reasm + queue + auth;
+    if (lcdTotal > 0) {
+        lcdDashboard_.notifyDropped(lcdTotal);
+    }
+
+    // Manifest-path rejections and the heap-starved-RX drop are cumulative
+    // totals with no delta accessor -- keep our own watermarks.
+    const uint32_t consumeRejTotal = ManifestCache::consumeRejectedTotal();
+    const uint32_t ingestFailTotal = ManifestCache::ingestFailedTotal();
+    const uint32_t syncFb = EspNowConfig::peekSyncFallbackDropCount();
+    static uint32_t lastConsumeRejected = 0;
+    static uint32_t lastIngestFailed = 0;
+    static uint32_t lastSyncFallback = 0;
+    const uint32_t consumeRej = consumeRejTotal - lastConsumeRejected;
+    const uint32_t ingestFail = ingestFailTotal - lastIngestFailed;
+    const uint32_t syncFbDelta = syncFb - lastSyncFallback;
+    lastConsumeRejected = consumeRejTotal;
+    lastIngestFailed = ingestFailTotal;
+    lastSyncFallback = syncFb;
+
+    if (!SerialMux::isConsoleOwned()) {
+        return;
+    }
+
+    EspNowConfig::RxCounters rx{};
+    EspNowConfig::peekRxCounters(rx);
+    const uint32_t nowMs = millis();
+
+    struct WarnCategory {
+        const char* label;
+        uint32_t delta;
+        uint32_t total;
+        uint32_t* lastEmitMs;
+    };
+    static uint32_t emitAuth = 0, emitReasm = 0, emitDecode = 0, emitQueue = 0,
+                    emitConsume = 0, emitIngest = 0, emitSync = 0;
+    // rxq is deliberately absent: a full raw-datagram queue is a burst event
+    // the LCD tile and "queue_full" (routed) already cover, and itemizing it
+    // adds noise without a distinct fix.
+    const WarnCategory cats[] = {
+        {"auth_drop chave-L", auth, EspNowConfig::peekDroppedAuthCount(), &emitAuth},
+        {"reassembly_drop", reasm, rx.droppedReassembly, &emitReasm},
+        {"decode_drop", decode, rx.droppedDecode, &emitDecode},
+        {"queue_full", queue, rx.droppedQueueFull, &emitQueue},
+        {"manifest_reject ref", consumeRej, consumeRejTotal, &emitConsume},
+        {"manifest_ingest_fail", ingestFail, ingestFailTotal, &emitIngest},
+        {"rx_async_down heap", syncFbDelta, syncFb, &emitSync},
+    };
+
+    for (const WarnCategory& c : cats) {
+        if (c.delta == 0) {
+            continue;
+        }
+        if (*c.lastEmitMs != 0 && (nowMs - *c.lastEmitMs) < kWarnThrottleMs) {
+            continue;
+        }
+        *c.lastEmitMs = (nowMs == 0) ? 1U : nowMs;
+        char line[96] = {0};
+        std::snprintf(line, sizeof(line), "%s +%lu total=%lu", c.label,
+                      static_cast<unsigned long>(c.delta), static_cast<unsigned long>(c.total));
+        ShellOutput::printTagged(Serial, "hub warn", line);
+        needPromptRefresh = true;
+    }
 }
 
 void AppRuntime::flushPendingEspNowOutput(bool& needPromptRefresh) {
@@ -276,26 +378,9 @@ void AppRuntime::flushPendingEspNowOutput(bool& needPromptRefresh) {
     if (flushed > 0 && SerialMux::isConsoleOwned()) {
         needPromptRefresh = true;
     }
-
-    uint32_t dropped = EspNowConfig::takeDroppedRxCount();
-    dropped += EspNowConfig::takeDroppedDecodeCount();
-    dropped += EspNowConfig::takeDroppedCrcCount();
-    dropped += EspNowConfig::takeDroppedReassemblyCount();
-    dropped += EspNowConfig::takeDroppedQueueFullCount();
-    dropped += EspNowConfig::takeDroppedAuthCount();
-    if (dropped > 0) {
-        lcdDashboard_.notifyDropped(dropped);
-
-        // A BTP-protocolled session owns the port exclusively (PASSO 11):
-        // this diagnostic line is console-only and simply not emitted while
-        // protocolled, same choice as ShellCommandSupport::printLine.
-        if (SerialMux::isConsoleOwned()) {
-            char line[64] = {0};
-            std::snprintf(line, sizeof(line), "rx_dropped=%lu", static_cast<unsigned long>(dropped));
-            ShellOutput::printTagged(Serial, "espnow", line);
-            needPromptRefresh = true;
-        }
-    }
+    // The drop counters (and the LCD ERR tile + per-category console lines
+    // they feed) moved to processAsyncWarnings() -- it is the single reader of
+    // the takeDropped*Count() watermarks now.
 }
 
 void AppRuntime::handleShellInput() {
@@ -467,6 +552,16 @@ void AppRuntime::begin() {
         out.droppedAuth = EspNowConfig::peekDroppedAuthCount();
         out.syncFallbackDrops = EspNowConfig::peekSyncFallbackDropCount();
 
+        EspNowManager::TxSchedulerCounters radioTx{};
+        EspNowConfig::peekTxSchedulerCounters(radioTx);
+        for (size_t i = 0U; i < 3U; ++i) {
+            out.txEnqueued[i] = radioTx.enqueued[i];
+            out.txDroppedQueueFull[i] = radioTx.droppedQueueFull[i];
+        }
+        out.txDriverRejected = radioTx.driverRejected;
+        out.txCallbackTimeouts = radioTx.callbackTimeouts;
+        out.txCallbacksReceived = radioTx.callbacksReceived;
+
         SerialMux::TxCounters tx{};
         SerialMux::peekTxCounters(tx);
         out.framesRx = tx.framesRx;
@@ -529,8 +624,11 @@ void AppRuntime::begin() {
             std::memcpy(out.peers[i].mac, peers[i].mac, sizeof(out.peers[i].mac));
             // Unsigned wrap makes this the correct elapsed time even across
             // the ~49-day millis() rollover.
-            out.peers[i].lastSeenAgeMs = nowMs - peers[i].lastSeenMs;
-            out.peers[i].online = peers[i].linkOk;
+            const uint32_t ageMs = nowMs - peers[i].lastAuthenticatedMs;
+            out.peers[i].lastSeenAgeMs = ageMs;
+            // plano 36 fase 2.A: "ouvi algo dele ha pouco", nao o linkOk do
+            // heartbeat (que so vale para o ultimo peer). Ver kPeerOnlineWindowMs.
+            out.peers[i].online = (ageMs < kPeerOnlineWindowMs);
         }
         out.peerCount = peerCount;
     });

@@ -48,6 +48,13 @@ struct StatsSnapshot {
     // "robot offline". Bench-only, like droppedAuth.
     uint32_t syncFallbackDrops;
 
+    // ESP-NOW TX scheduler (Critical, Control, Data in that order).
+    uint32_t txEnqueued[3];
+    uint32_t txDroppedQueueFull[3];
+    uint32_t txDriverRejected;
+    uint32_t txCallbackTimeouts;
+    uint32_t txCallbacksReceived;
+
     // USB-Serial hop (dongle -> desktop).
     uint64_t framesRx;
     uint64_t framesTx;

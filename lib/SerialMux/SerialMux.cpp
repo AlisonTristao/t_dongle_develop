@@ -128,6 +128,18 @@ ShellSerial g_terminalShell;
 
 QueueHandle_t g_queues[kPriorityClassCount] = {nullptr, nullptr, nullptr, nullptr};
 
+// One COBS-wrapped frame may be only partially accepted by USB-CDC. Keep its
+// exact wire bytes and cursor across loop ticks; dequeuing another frame
+// before this one completes would interleave two COBS blocks and corrupt both.
+struct PendingWireFrame {
+    std::uint8_t bytes[kMaxCobsBytes + 2U]; // leading/trailing 0x00 included
+    std::size_t size = 0U;
+    std::size_t offset = 0U;
+    bool stalledCounted = false;
+};
+
+PendingWireFrame g_pendingWire;
+
 std::uint32_t g_lastStatusMs = 0U;
 
 // STATUS counters (BTP/docs/commands.md section 5).
@@ -156,51 +168,120 @@ std::size_t classIndex(SerialSession::PriorityClass cls) noexcept {
     return static_cast<std::size_t>(cls);
 }
 
-// Returns true only if every byte was accepted by the port. A USB-CDC with no
-// host asserting DTR makes write() return 0 forever, so the caller needs to
-// know the bytes went nowhere rather than assume a frame left the building.
+// Bounded immediate path used only for the human-console handshake/teardown.
+// Protocolled traffic uses g_pendingWire below. Never retry a zero write: the
+// old 2000-iteration busy loop could monopolize AppRuntime::tick when the host
+// kept DTR high but stopped draining USB-CDC.
 bool writeAll(const std::uint8_t* data, std::size_t len) noexcept {
-    if (g_io == nullptr) {
+    if (g_io == nullptr || (data == nullptr && len != 0U)) {
         return false;
     }
     std::size_t remaining = len;
     const std::uint8_t* cursor = data;
-    std::uint32_t idleRetries = 0U;
-    while (remaining > 0U) {
+    constexpr std::size_t kMaxImmediateWriteCalls = 4U;
+    for (std::size_t call = 0U; remaining > 0U && call < kMaxImmediateWriteCalls; ++call) {
         const std::size_t sent = g_io->write(cursor, remaining);
         if (sent == 0U) {
-            if (++idleRetries > 2000U) {
-                return false; // port vanished / host not reading; give up rather than spin forever
-            }
-            continue;
+            return false;
         }
-        cursor += sent;
-        remaining -= sent;
-        idleRetries = 0U;
+        const std::size_t accepted = sent < remaining ? sent : remaining;
+        cursor += accepted;
+        remaining -= accepted;
     }
-    return true;
+    return remaining == 0U;
 }
 
-// The only place that ever writes a BTP frame's bytes to the wire. Called
-// exclusively from tick()/finalizeToConsole(), both driven from the main
-// loop -- never from a FreeRTOS task -- so this is the whole firmware's
-// single writer while protocolled (PASSO 11).
+// Immediate, bounded BTP write used only while closing/rejecting a session.
+// Normal protocolled traffic is staged in g_pendingWire and pumped from
+// drainTx(); both paths still run exclusively on the main loop, so SerialMux
+// remains the single USB writer while it owns the port (PASSO 11).
 void writeFrameCobs(const std::uint8_t* frame, std::size_t frameSize) noexcept {
-    static std::uint8_t encoded[kMaxCobsBytes];
-    std::size_t written = 0U;
-    if (btp::cobs_encode(frame, frameSize, encoded, sizeof(encoded), &written) != btp::CobsError::Ok) {
+    static std::uint8_t wire[kMaxCobsBytes + 2U];
+    std::size_t encodedSize = 0U;
+    if (btp::cobs_encode(frame, frameSize, wire + 1U, sizeof(wire) - 2U,
+                         &encodedSize) != btp::CobsError::Ok) {
         return;
     }
-    // Short-circuit on the first failed write: if the leading delimiter did
-    // not go out the payload will not either (same dead port), and stopping
-    // there avoids both the wasted 2000-spin retries and pushing a headless
-    // partial frame onto the wire if the port flickers back mid-sequence.
-    const std::uint8_t zero = 0U;
-    if (writeAll(&zero, 1U) && writeAll(encoded, written) && writeAll(&zero, 1U)) {
+    wire[0] = 0U;
+    wire[encodedSize + 1U] = 0U;
+    if (writeAll(wire, encodedSize + 2U)) {
         ++g_framesTx;
     } else {
         ++g_framesTxStalled;
     }
+}
+
+bool hasPendingWireFrame() noexcept {
+    return g_pendingWire.offset < g_pendingWire.size;
+}
+
+void resetPendingWireFrame() noexcept {
+    g_pendingWire.size = 0U;
+    g_pendingWire.offset = 0U;
+    g_pendingWire.stalledCounted = false;
+}
+
+// Encodes one queue item directly into stable storage. Returns false rather
+// than replacing an incomplete frame; preserving COBS block boundaries is
+// more important than accepting newer traffic under backpressure.
+bool stageFrameCobs(const std::uint8_t* frame, std::size_t frameSize) noexcept {
+    if (hasPendingWireFrame() || frame == nullptr || frameSize == 0U) {
+        return false;
+    }
+
+    std::size_t encodedSize = 0U;
+    if (btp::cobs_encode(frame, frameSize, g_pendingWire.bytes + 1U,
+                         sizeof(g_pendingWire.bytes) - 2U, &encodedSize) != btp::CobsError::Ok) {
+        resetPendingWireFrame();
+        return false;
+    }
+    g_pendingWire.bytes[0] = 0U;
+    g_pendingWire.bytes[encodedSize + 1U] = 0U;
+    g_pendingWire.size = encodedSize + 2U;
+    g_pendingWire.offset = 0U;
+    g_pendingWire.stalledCounted = false;
+    return true;
+}
+
+enum class WirePumpResult : std::uint8_t {
+    Idle,
+    Pending,
+    Completed,
+};
+
+// At most one Stream::write per call. A partial write is not a loss: the
+// cursor remains live for the next tick. A zero write counts this frame once
+// as stalled and immediately returns control to the main loop.
+WirePumpResult pumpPendingWireFrame() noexcept {
+    if (!hasPendingWireFrame()) {
+        return WirePumpResult::Idle;
+    }
+    if (g_io == nullptr) {
+        if (!g_pendingWire.stalledCounted) {
+            ++g_framesTxStalled;
+            g_pendingWire.stalledCounted = true;
+        }
+        return WirePumpResult::Pending;
+    }
+
+    const std::size_t remaining = g_pendingWire.size - g_pendingWire.offset;
+    const std::size_t sent = g_io->write(g_pendingWire.bytes + g_pendingWire.offset, remaining);
+    if (sent == 0U) {
+        if (!g_pendingWire.stalledCounted) {
+            ++g_framesTxStalled;
+            g_pendingWire.stalledCounted = true;
+        }
+        return WirePumpResult::Pending;
+    }
+
+    g_pendingWire.offset += sent < remaining ? sent : remaining;
+    if (hasPendingWireFrame()) {
+        return WirePumpResult::Pending;
+    }
+
+    ++g_framesTx;
+    resetPendingWireFrame();
+    return WirePumpResult::Completed;
 }
 
 void writeConsoleText(const char* text) noexcept {
@@ -212,6 +293,7 @@ void writeConsoleText(const char* text) noexcept {
 }
 
 void resetQueues() noexcept {
+    resetPendingWireFrame();
     for (std::size_t i = 0U; i < kPriorityClassCount; ++i) {
         if (g_queues[i] != nullptr) {
             xQueueReset(g_queues[i]);
@@ -219,16 +301,24 @@ void resetQueues() noexcept {
     }
 }
 
+// frameSourceId: 0 = stamp this dongle's own source_id (the default, for the
+// dongle's self-description, session STATUS, HELLO_RESULT, ...). A non-zero
+// value stamps that source_id instead -- used when the dongle answers a hub
+// CHILD's targeted MANIFEST_REQUEST from its ManifestCache: the child's
+// HubTransport demuxes purely by header source_id (== its robot's), so a
+// MANIFEST_DATA wearing the dongle's id would never reach the child and its
+// catalog would stay empty even with everything else correct (plano 36).
 bool encodeOwnFrame(btp::MessageType type, std::uint16_t objectId, const std::uint8_t* payload,
                     std::size_t payloadSize, std::uint8_t* outFrame, std::size_t outFrameCapacity,
-                    std::size_t* outFrameSize) noexcept {
+                    std::size_t* outFrameSize, std::uint32_t frameSourceId = 0U) noexcept {
     std::uint32_t sequence = 0U;
     if (!BtpTransport::reserveSequence(&sequence)) {
         return false;
     }
 
     const btp::Header header{
-        type, 0U, BtpTransport::sourceId(), BtpTransport::bootId(), sequence,
+        type, 0U, frameSourceId != 0U ? frameSourceId : BtpTransport::sourceId(),
+        BtpTransport::bootId(), sequence,
         static_cast<std::uint64_t>(millis()) * 1000ULL, objectId, 0U, 1U
     };
     const btp::Frame frame{header, {payload, payloadSize}};
@@ -275,14 +365,15 @@ bool enqueueFrameBytes(SerialSession::PriorityClass cls, const std::uint8_t* fra
 }
 
 bool enqueueOwn(btp::MessageType type, std::uint16_t objectId, const std::uint8_t* payload,
-                std::size_t payloadSize) noexcept {
+                std::size_t payloadSize, std::uint32_t frameSourceId = 0U) noexcept {
     // static, not a local: kMaxFrameBytes is 1.6 KB since topico 27 and every
-    // caller runs on the main loop task (see writeFrameCobs' comment -- one
+    // caller runs on the main loop task (see g_pendingWire's comment -- one
     // writer, never a FreeRTOS task, never re-entrant), so this belongs in BSS
     // rather than on a stack shared with TinyShell and std::string.
     static std::uint8_t frameBytes[kMaxFrameBytes];
     std::size_t frameSize = 0U;
-    if (!encodeOwnFrame(type, objectId, payload, payloadSize, frameBytes, sizeof(frameBytes), &frameSize)) {
+    if (!encodeOwnFrame(type, objectId, payload, payloadSize, frameBytes, sizeof(frameBytes), &frameSize,
+                        frameSourceId)) {
         return false;
     }
     return enqueueFrameBytes(SerialSession::classify(type, objectId), frameBytes, frameSize);
@@ -558,7 +649,14 @@ void handleManifestRequest(const btp::DecodedFrame& decoded) noexcept {
     const std::size_t size = ManifestCache::buildTargetedResponse(targetSourceId, targetBootId, knownRevision,
                                                                    decoded.header, payload, sizeof(payload));
     if (size > 0U) {
-        enqueueOwn(btp::MessageType::Control, ManifestCache::kManifestDataObjectId, payload, size);
+        // Stamp the response with the robot it describes, not this dongle:
+        // a hub child demuxes inbound frames purely by header source_id
+        // (== its own robot's), so a MANIFEST_DATA wearing the dongle's id
+        // never reaches the child that asked for it (plano 36). Self and
+        // enumeration (target 0, console only) keep the dongle's id.
+        const std::uint32_t stampAs =
+            (targetSourceId != 0U && targetSourceId != BtpTransport::sourceId()) ? targetSourceId : 0U;
+        enqueueOwn(btp::MessageType::Control, ManifestCache::kManifestDataObjectId, payload, size, stampAs);
     }
 }
 
@@ -712,6 +810,10 @@ void handleSubscribeRequest(const btp::DecodedFrame& decoded) noexcept {
     writeU32(responsePayload + 16U, subscriptionId);
     writeU32(responsePayload + 20U, effectiveRateMillihz);
     writeU32(responsePayload + 24U, grantedLeaseMs);
+    // No source_id stamp here (unlike handleManifestRequest): a bound child's
+    // SUBSCRIBE is relayed to the robot above and answered by the robot,
+    // sealed; this enqueueOwn path only runs for the unbound console, which
+    // sees every frame regardless of header source_id.
     enqueueOwn(btp::MessageType::Control, SerialSession::kSubscribeResultObjectId, responsePayload,
               sizeof(responsePayload));
 }
@@ -967,27 +1069,41 @@ bool emitOwnTelemetry(std::uint16_t topicId, const std::uint8_t* payload, std::s
     return enqueueOwn(btp::MessageType::Telemetry, topicId, payload, size);
 }
 
-void drainQueueClass(SerialSession::PriorityClass cls, std::size_t maxItems) noexcept {
+// Returns false when USB accepted only part (or none) of the current frame;
+// the caller must stop this tick so no lower-priority COBS block can interleave.
+bool drainQueueClass(SerialSession::PriorityClass cls, std::size_t maxItems) noexcept {
     QueueHandle_t queue = g_queues[classIndex(cls)];
     if (queue == nullptr) {
-        return;
+        return true;
     }
 
     QueuedFrame item{};
     std::size_t drained = 0U;
     while (drained < maxItems && xQueueReceive(queue, &item, 0) == pdTRUE) {
-        writeFrameCobs(item.bytes, item.size);
+        if (!stageFrameCobs(item.bytes, item.size)) {
+            ++g_framesTxStalled;
+            return false;
+        }
         ++drained;
+        if (pumpPendingWireFrame() != WirePumpResult::Completed) {
+            return false;
+        }
     }
+    return true;
 }
 
 // Strict priority order (model.md section 6), with a small
 // per-class burst cap per tick() so telemetry still makes progress instead
 // of starving outright under a steady stream of session/terminal traffic.
 void drainTx() noexcept {
-    drainQueueClass(SerialSession::PriorityClass::kSession, 8U);
-    drainQueueClass(SerialSession::PriorityClass::kTerminal, 4U);
-    drainQueueClass(SerialSession::PriorityClass::kLogStatus, 4U);
+    // Resume yesterday's partial frame before touching any queue. One zero
+    // write returns immediately, so a deaf host cannot freeze the main loop.
+    if (hasPendingWireFrame() && pumpPendingWireFrame() != WirePumpResult::Completed) {
+        return;
+    }
+    if (!drainQueueClass(SerialSession::PriorityClass::kSession, 8U)) return;
+    if (!drainQueueClass(SerialSession::PriorityClass::kTerminal, 4U)) return;
+    if (!drainQueueClass(SerialSession::PriorityClass::kLogStatus, 4U)) return;
     drainQueueClass(SerialSession::PriorityClass::kTelemetry, 4U);
 }
 
@@ -1257,7 +1373,7 @@ bool relayUp(const btp::Header& header, const std::uint8_t* frame, std::size_t f
     }
 
     // Verbatim: the datagram goes into the queue exactly as the radio
-    // delivered it, and writeFrameCobs() only wraps it in COBS on the way
+    // delivered it, and the serial drain only wraps it in COBS on the way
     // out. Nothing is decoded, reassembled or re-encoded on this path (D5),
     // so the producer's identity triple -- the AEAD nonce -- cannot be
     // touched here even by accident.

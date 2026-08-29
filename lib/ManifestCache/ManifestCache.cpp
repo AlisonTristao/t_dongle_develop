@@ -49,12 +49,26 @@ struct PendingRequest {
     std::uint32_t sourceId = 0U;
     std::uint32_t bootId = 0U;
     std::uint32_t lastRequestedMs = 0U;
+    // MANIFEST_REQUESTs sent for this exact (sourceId, bootId) chase. Drives
+    // the fast->steady cadence in shouldRequestManifest and is surfaced by
+    // `hub -manifest`. Reset to 1 on the first request of a fresh chase.
+    std::uint32_t attempts = 0U;
 };
 
 Entry g_entries[kCapacity];
 PendingRequest g_pending[kCapacity];
 std::uint32_t g_catalogRevision = 1U;
 std::uint8_t g_selfUuid[16] = {};
+
+// Diagnostico (plano 36 fase 0a). volatile, mesmo estilo dos contadores de
+// EspNowConfig -- RX roda na task WiFi, o shell le na main.
+volatile std::uint32_t g_diagPrimeSent = 0U;
+volatile std::uint32_t g_diagIngestOk = 0U;
+volatile std::uint32_t g_diagIngestFail = 0U;
+volatile std::uint32_t g_diagConsumeRejected = 0U;
+volatile std::uint32_t g_diagTargetedRx = 0U;
+volatile std::uint32_t g_diagTargetedHit = 0U;
+volatile std::uint32_t g_diagTargetedMiss = 0U;
 
 std::uint16_t read_u16_le(const std::uint8_t* data) noexcept {
     return static_cast<std::uint16_t>(data[0]) | (static_cast<std::uint16_t>(data[1]) << 8U);
@@ -284,16 +298,30 @@ bool shouldRequestManifest(std::uint32_t sourceId, std::uint32_t bootId, std::ui
         return false;  // already have a manifest for this exact boot
     }
 
+    // `attempts` counts requests sent for this source since the last one that
+    // got a usable answer (ingestManifestData clears the pending, which frees
+    // the slot and resets the count). It deliberately does NOT reset on a
+    // boot_id change: a robot that answers normally never accumulates, so the
+    // fast cadence still covers first contact and a genuine reboot; a robot
+    // that ignores every request -- or whose boot_id flaps because of a bug
+    // -- accumulates and drops to the slow cadence instead of being polled
+    // every second forever (which is what stalled the link).
     PendingRequest* pending = findPending(sourceId);
-    if (pending != nullptr && pending->bootId == bootId && (nowMs - pending->lastRequestedMs) < kRequestCooldownMs) {
-        return false;  // asked recently, still waiting
+    if (pending != nullptr) {
+        const std::uint32_t cooldown =
+            (pending->attempts <= kFastRequestAttempts) ? kFastRequestCooldownMs : kRequestCooldownMs;
+        if ((nowMs - pending->lastRequestedMs) < cooldown) {
+            return false;  // asked recently, still waiting
+        }
     }
 
     PendingRequest* slot = findOrAllocatePending(sourceId);
+    const bool sameSource = (slot->used && slot->sourceId == sourceId);
     slot->used = true;
     slot->sourceId = sourceId;
     slot->bootId = bootId;
     slot->lastRequestedMs = nowMs;
+    slot->attempts = sameSource ? (slot->attempts + 1U) : 1U;
     return true;
 }
 
@@ -304,7 +332,7 @@ std::size_t buildRequest(std::uint32_t targetSourceId, std::uint32_t targetBootI
     return writer.size();
 }
 
-bool ingestManifestData(btp::ByteView payload, std::uint32_t nowMs) noexcept {
+static bool ingestManifestDataImpl(btp::ByteView payload, std::uint32_t nowMs) noexcept {
     if (payload.data == nullptr || payload.size < 60U) return false;
 
     const std::uint8_t status = payload.data[12];
@@ -386,6 +414,69 @@ bool ingestManifestData(btp::ByteView payload, std::uint32_t nowMs) noexcept {
     return true;
 }
 
+bool ingestManifestData(btp::ByteView payload, std::uint32_t nowMs) noexcept {
+    const bool ok = ingestManifestDataImpl(payload, nowMs);
+    if (ok) {
+        ++g_diagIngestOk;
+    } else {
+        ++g_diagIngestFail;
+    }
+    return ok;
+}
+
+void notePrimeSent() noexcept { ++g_diagPrimeSent; }
+void noteConsumeRejected() noexcept { ++g_diagConsumeRejected; }
+
+std::uint32_t ingestFailedTotal() noexcept { return g_diagIngestFail; }
+std::uint32_t consumeRejectedTotal() noexcept { return g_diagConsumeRejected; }
+
+void resetForTests() noexcept {
+    for (Entry& entry : g_entries) entry = Entry{};
+    for (PendingRequest& pending : g_pending) pending = PendingRequest{};
+    g_catalogRevision = 1U;
+    std::memset(g_selfUuid, 0, sizeof(g_selfUuid));
+    g_diagPrimeSent = 0U;
+    g_diagIngestOk = 0U;
+    g_diagIngestFail = 0U;
+    g_diagConsumeRejected = 0U;
+    g_diagTargetedRx = 0U;
+    g_diagTargetedHit = 0U;
+    g_diagTargetedMiss = 0U;
+}
+
+Diagnostics diagnostics() noexcept {
+    Diagnostics out{};
+    out.primeRequestsSent = g_diagPrimeSent;
+    out.ingestedOk = g_diagIngestOk;
+    out.ingestFailed = g_diagIngestFail;
+    out.consumeRejected = g_diagConsumeRejected;
+    out.targetedRequestsRx = g_diagTargetedRx;
+    out.targetedServedHit = g_diagTargetedHit;
+    out.targetedServedMiss = g_diagTargetedMiss;
+    out.entryCount = 0U;
+    for (const Entry& entry : g_entries) {
+        if (!entry.used) continue;
+        DiagnosticEntry& e = out.entries[out.entryCount++];
+        e.sourceId = entry.sourceId;
+        e.bootId = entry.bootId;
+        e.configRevision = entry.configRevision;
+        e.topicCount = entry.topicCount;
+        e.actionCount = entry.actionCount;
+        e.recordsSize = static_cast<std::uint16_t>(entry.recordsSize);
+        e.online = entry.online;
+    }
+
+    out.pendingCount = 0U;
+    for (const PendingRequest& pending : g_pending) {
+        if (!pending.used) continue;
+        PendingDiagnostic& p = out.pending[out.pendingCount++];
+        p.sourceId = pending.sourceId;
+        p.bootId = pending.bootId;
+        p.attempts = pending.attempts;
+    }
+    return out;
+}
+
 std::uint32_t catalogRevision() noexcept { return g_catalogRevision; }
 
 std::size_t enumerationCount() noexcept {
@@ -437,6 +528,15 @@ std::size_t buildTargetedResponse(std::uint32_t targetSourceId, std::uint32_t ta
                                   std::size_t outputCapacity) noexcept {
     const bool isSelf = (targetSourceId == BtpTransport::sourceId());
     const Entry* entry = isSelf ? nullptr : findEntry(targetSourceId);
+
+    // Diagnostico (plano 36 fase 0a): so as consultas direcionadas a um robo
+    // contam -- "self" e enumeracao passam por outros caminhos.
+    ++g_diagTargetedRx;
+    if (isSelf || entry != nullptr) {
+        ++g_diagTargetedHit;
+    } else {
+        ++g_diagTargetedMiss;
+    }
 
     if (!isSelf && entry == nullptr) {
         return writeManifestData(requestHeader, kStatusRejected, kFlagCatalogComplete, kErrorNotFound, 0U, 1U, 0U,
