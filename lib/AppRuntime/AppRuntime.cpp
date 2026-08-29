@@ -4,6 +4,12 @@
 #include <Esp.h>
 #include <esp_random.h>
 #include <esp_system.h>
+// This is arduino-esp32 on IDF 4.4: the app descriptor lives in
+// esp_app_format.h (esp_app_desc_t) + esp_ota_ops.h (the accessor is
+// esp_ota_get_app_description(), not IDF 5.x's esp_app_get_description()).
+#include <esp_app_format.h>
+#include <esp_chip_info.h>
+#include <esp_ota_ops.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -50,6 +56,60 @@ constexpr uint32_t kPeerOnlineWindowMs = 4000U;
 // calendar input and every localtime_r() presentation (LCD, database, shell)
 // map that epoch to Bally's local wall clock.
 constexpr char kDongleTimezone[] = "BRT3";
+
+// This dongle's own MANIFEST_DATA source_info block (BTP/docs/commands.md
+// 3.12), serialized once at boot and handed to ManifestCache::configure().
+// Static so its bytes outlive begin(); ManifestCache only borrows the
+// pointer. buildDongleSourceInfo() fills it from esp_app_get_description(),
+// esp_chip_info() and the running OTA partition -- all boot-stable, so a
+// fixed snapshot is enough (unlike a robot's name/description, this dongle
+// has no runtime-editable identity yet).
+std::uint8_t g_dongleSourceInfo[256];
+std::size_t g_dongleSourceInfoSize = 0U;
+
+void buildDongleSourceInfo() {
+    const esp_app_desc_t* app = esp_ota_get_app_description();
+    esp_chip_info_t chip{};
+    esp_chip_info(&chip);
+    const esp_partition_t* running = esp_ota_get_running_partition();
+
+    static char scratch[48];
+    char* cursor = scratch;
+    char* const end = scratch + sizeof(scratch);
+    const char* built = "";
+    const char* chipRev = "";
+    if (app != nullptr) {
+        const int n = std::snprintf(cursor, static_cast<size_t>(end - cursor),
+                                    "%s %s", app->date, app->time);
+        if (n > 0 && cursor + n + 1 <= end) { built = cursor; cursor += n + 1; }
+    }
+    {
+        const int n = std::snprintf(cursor, static_cast<size_t>(end - cursor),
+                                    "%u.%u", chip.revision / 100U, chip.revision % 100U);
+        if (n > 0 && cursor + n + 1 <= end) { chipRev = cursor; cursor += n + 1; }
+    }
+
+    // Arduino-ESP32 leaves esp_app_desc.version a placeholder ("1"); a real
+    // git rev is injected as -DDONGLE_GIT_REV by scripts/inject_git_rev.py.
+#ifdef DONGLE_GIT_REV
+    const char* fwVersion = DONGLE_GIT_REV;
+#else
+    const char* fwVersion = (app != nullptr) ? app->version : "";
+#endif
+
+    const ManifestCache::SourceInfoEntry entries[] = {
+        {"description", "Description", "Bally hub dongle"},
+        {"model", "Model", "T-Dongle-S3"},
+        {"fw_version", "Firmware", fwVersion},
+        {"fw_build", "Built", built},
+        {"idf_version", "ESP-IDF", (app != nullptr) ? app->idf_ver : ""},
+        {"chip", "Chip", "ESP32-S3"},
+        {"chip_revision", "Chip revision", chipRev},
+        {"ota_partition", "Running partition", (running != nullptr) ? running->label : ""},
+    };
+    g_dongleSourceInfoSize = ManifestCache::serializeSourceInfo(
+        entries, sizeof(entries) / sizeof(entries[0]), g_dongleSourceInfo, sizeof(g_dongleSourceInfo));
+}
 
 // Deferred SQLite open (topico 35 C.3): first try this many ms into uptime
 // (let begin()'s allocations settle), then retry at this cadence, at most
@@ -130,7 +190,7 @@ void AppRuntime::restoreShellHistoryFromDatabase() {
     }
 
     String historyText;
-    if (!databaseStore_.readRecentCommands(ShellSerial::DEFAULT_LOG_CAPACITY, historyText)) {
+    if (!databaseStore_.readRecentCommands(ShellLineEditor::DEFAULT_HISTORY_CAPACITY, historyText)) {
         return;
     }
 
@@ -151,8 +211,8 @@ void AppRuntime::restoreShellHistoryFromDatabase() {
 
         line.trim();
         if (!line.isEmpty()) {
-            serialShell_.addLog(line);
-            // Topico 19: the BTP terminal channel has its own ShellSerial
+            serialShell_.addHistory(std::string(line.c_str()));
+            // Topico 19: the BTP terminal channel has its own ShellLineEditor
             // instance (SerialMux.cpp), so persisted history has to be
             // replayed into it explicitly too.
             SerialMux::addTerminalHistory(line.c_str());
@@ -383,38 +443,63 @@ void AppRuntime::flushPendingEspNowOutput(bool& needPromptRefresh) {
     // the takeDropped*Count() watermarks now.
 }
 
+void AppRuntime::flushEditorOutput() {
+    if (editorOut_.empty()) {
+        return;
+    }
+    Serial.write(reinterpret_cast<const uint8_t*>(editorOut_.data()), editorOut_.size());
+    editorOut_.clear();
+}
+
 void AppRuntime::handleShellInput() {
-    // SerialMux (topico 13) owns the port instead of ShellSerial once a BTP
-    // v1 session is negotiating/protocolled -- its own tick() call below
+    // SerialMux (topico 13) owns the port instead of the line editor once a
+    // BTP v1 session is negotiating/protocolled -- its own tick() call below
     // does the reading/dispatch in that case.
     if (!SerialMux::isConsoleOwned()) {
         return;
     }
 
-    String command;
-    if (!serialShell_.readInputLine(command)) {
-        return;
+    // Hand every byte the host typed to the editor. It buffers them and
+    // echoes into editorOut_ (drained by flushEditorOutput); poll() then
+    // yields whole command lines as they complete.
+    while (Serial.available() > 0) {
+        const int value = Serial.read();
+        if (value < 0) {
+            break;
+        }
+        const uint8_t byte = static_cast<uint8_t>(value);
+        serialShell_.feed(&byte, 1);
     }
 
-    const std::string commandText(command.c_str());
+    std::string command;
+    while (serialShell_.poll(editorOut_, &command)) {
+        flushEditorOutput();
 
-    // "BTP/1 ENTER <16 hex>" is recognized as a reserved control line, not a
-    // TinyShell command: on match, SerialMux already wrote "BTP/1 READY
-    // ...\r\n" and took over the port.
-    if (SerialMux::tryEnterFromConsoleLine(commandText.c_str(), millis())) {
-        return;
+        // "BTP/1 ENTER <16 hex>" is a reserved control line, not a TinyShell
+        // command: on match, SerialMux already wrote "BTP/1 READY ...\r\n" and
+        // took over the port.
+        if (SerialMux::tryEnterFromConsoleLine(command.c_str(), millis())) {
+            return;
+        }
+
+        const std::string response = ShellConfig::runLine(command);
+
+        // A command itself may have entered protocol mode (e.g. "dongle
+        // -btp_v1"): do not print a stray response/prompt into the middle of
+        // a handshake, and stop draining -- SerialMux owns the port now.
+        if (!SerialMux::isConsoleOwned()) {
+            return;
+        }
+
+        if (!response.empty()) {
+            ShellOutput::printResponse(Serial, response);
+        }
+        serialShell_.refreshLine(editorOut_);
+        flushEditorOutput();
     }
 
-    const std::string response = ShellConfig::runLine(commandText);
-    if (!response.empty() && SerialMux::isConsoleOwned()) {
-        ShellOutput::printResponse(Serial, response);
-    }
-
-    // A command itself may have entered protocol mode (e.g. "dongle
-    // -btp_v1"): do not print a stray prompt into the middle of a handshake.
-    if (SerialMux::isConsoleOwned()) {
-        serialShell_.refreshLine();
-    }
+    // Echo of characters that did not complete a line this tick.
+    flushEditorOutput();
 }
 
 void AppRuntime::begin() {
@@ -432,17 +517,18 @@ void AppRuntime::begin() {
     // The host can pile up several "BTP/1 ENTER" retry lines (~30 B each)
     // while begin() runs, before the shell loop starts reading -- and a HELLO
     // frame on top of that. The CDC's default 256-byte RX queue is tight for
-    // that; 1 KB gives margin. Must precede serialShell_.begin(), which calls
-    // Serial.begin() (topico 35 C.5).
+    // that; 1 KB gives margin. Must precede Serial.begin() (topico 35 C.5).
     Serial.setRxBufferSize(1024);
 
     #ifdef BAUDRATE
-        serialShell_.begin(Serial, BAUDRATE);
+        Serial.begin(BAUDRATE);
     #else
-        serialShell_.begin(Serial);
+        Serial.begin();
     #endif
 
-    serialShell_.setPrompt(ShellOutput::commandPrompt());
+    // Seed the prompt text without painting -- the boot log below and the
+    // refreshLine() at the end of begin() do the first repaint.
+    serialShell_.setPrompt(std::string(ShellOutput::commandPrompt().c_str()));
 
     // Opt-in hardening for the field: with USB auto-reset off, no DTR/RTS
     // dance a host driver happens to perform -- deliberately or not -- can
@@ -522,7 +608,8 @@ void AppRuntime::begin() {
     for (size_t i = 6; i < sizeof(selfUuid); ++i) {
         selfUuid[i] = static_cast<uint8_t>(0xB0 + i);
     }
-    ManifestCache::configure(selfUuid);
+    buildDongleSourceInfo();
+    ManifestCache::configure(selfUuid, g_dongleSourceInfo, g_dongleSourceInfoSize);
     SerialMux::begin(Serial, [](const char* cmd, const char* source, const char* userId, std::string* out) {
         ShellConfig::runLine(std::string(cmd), source, out, userId);
     }, selfUuid, ShellOutput::commandPrompt().c_str(), EspNowConfig::sendRawToMac);
@@ -696,20 +783,20 @@ void AppRuntime::begin() {
 
     logFreeHeap("after_register_modules");
 
-    const ShellSerial::CompletionProvider completionProvider =
-        [this](const String& input, String* outSuggestions, size_t maxSuggestions) -> size_t {
+    const ShellLineEditor::CompletionProvider completionProvider =
+        [this](const std::string& input, std::string* outSuggestions, size_t maxSuggestions) -> size_t {
         if (outSuggestions == nullptr || maxSuggestions == 0) {
             return 0;
         }
 
-        const std::vector<std::string> matches = tinyShell_.complete_line(std::string(input.c_str()), maxSuggestions);
+        const std::vector<std::string> matches = tinyShell_.complete_line(input, maxSuggestions);
         size_t written = 0;
         for (const std::string& candidate : matches) {
             if (written >= maxSuggestions) {
                 break;
             }
 
-            outSuggestions[written++] = String(candidate.c_str());
+            outSuggestions[written++] = candidate;
         }
 
         return written;
@@ -730,7 +817,8 @@ void AppRuntime::begin() {
 
     logFreeHeap("after_shell_ready");
 
-    serialShell_.refreshLine();
+    serialShell_.refreshLine(editorOut_);
+    flushEditorOutput();
 }
 
 void AppRuntime::tick() {
@@ -757,7 +845,7 @@ void AppRuntime::tick() {
 
     // SerialMux (topico 13): pumps RX decode/dispatch, the watchdog and TX
     // queue draining while a BTP v1 session is negotiating/protocolled; a
-    // fast no-op otherwise (ShellSerial owns the port instead, above).
+    // fast no-op otherwise (the line editor owns the port instead, above).
     SerialMux::tick(millis());
 
     // UsbHidMux (topico 20, hardware bring-up spike): drains the HID vendor
@@ -776,7 +864,8 @@ void AppRuntime::tick() {
     // porta (PASSO 11).
     if (pendingPromptRefresh && SerialMux::isConsoleOwned() && (millis() - lastAsyncOutputTime > 150)) {
         Serial.println(); // Garante que o prompt inicie em uma linha limpa
-        serialShell_.refreshLine();
+        serialShell_.refreshLine(editorOut_);
+        flushEditorOutput();
         pendingPromptRefresh = false;
     }
 

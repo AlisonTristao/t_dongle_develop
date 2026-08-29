@@ -116,7 +116,7 @@ também mantém `BtpTransport`/`ProtocolRouter` portáveis pro `env:native` (sem
 Camadas atuais (de cima pra baixo, cada uma só depende das de baixo):
 
 1. **`AppRuntime`** — único dono dos objetos runtime (`EspNowManager`, `DatabaseStore`,
-   `DonglePeripherals`, `LcdDashboard`, `TinyShell`, `ShellSerial`); monta tudo no `begin()`.
+   `DonglePeripherals`, `LcdDashboard`, `TinyShell`, `ShellLineEditor`); monta tudo no `begin()`.
 2. **`ShellConfig`** — recebe os objetos via `bind()`, registra os módulos de comando,
    implementa `runLine()` (chaining por `;`, alias, dedup de histórico, persistência).
 3. **Módulos de comando** (`DongleCommands`, `EspNowCommands`, `DatabaseCommands`,

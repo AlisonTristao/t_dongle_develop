@@ -2,9 +2,11 @@
 
 #include <BtpTransport.h>
 #include <SerialSession.h>
-#include <TerminalPtyBuffer.h>
+#include <ShellLineEditor.h>
 #include <btp/codec.hpp>
 #include <btp/stream.hpp>
+
+#include <algorithm>
 
 #include <cstdint>
 #include <cstring>
@@ -499,112 +501,95 @@ void test_stress_interleaved_telemetry_and_terminal_never_cross_classes() {
     TEST_ASSERT_EQUAL(kIterations / 2, telemetryOutcomes);
 }
 
-// ---- topico 19: TerminalPtyBuffer (portable RX/TX FIFO pair) -------------
+// ---- topico 19: ShellLineEditor (server-side line editor, shared with the
+//      USB console -- lives in the TinyShell package now) -----------------
+//
+// The behaviour of the editor itself is covered in the TinyShell repo
+// (test/test_shell_line_editor.cpp). What matters here is the shape SerialMux
+// drives it with: feed(TERMINAL_IN bytes) -> poll() out echo + completed
+// lines -> chunk the echoed std::string into TERMINAL_OUT-sized frames.
 
-void test_terminal_pty_buffer_input_round_trips_in_order() {
-    SerialSession::TerminalPtyBuffer pty;
-    const std::vector<std::uint8_t> keystrokes = {'l', 's', ' ', '-', 'l', '\r'};
+void test_shell_line_editor_feed_poll_echoes_and_completes_a_line() {
+    ShellLineEditor editor;
+    std::string out;
+    editor.setPrompt("$ ", out);
 
-    TEST_ASSERT_EQUAL(keystrokes.size(), pty.feedInput(keystrokes.data(), keystrokes.size()));
-    TEST_ASSERT_EQUAL(keystrokes.size(), pty.availableInput());
+    const std::string keystrokes = "ls -l\r";
+    editor.feed(reinterpret_cast<const std::uint8_t*>(keystrokes.data()), keystrokes.size());
 
-    for (const std::uint8_t expected : keystrokes) {
-        TEST_ASSERT_EQUAL(static_cast<int>(expected), pty.peekInput());
-        TEST_ASSERT_EQUAL(static_cast<int>(expected), pty.readInput());
-    }
-    TEST_ASSERT_EQUAL(0U, pty.availableInput());
-    TEST_ASSERT_EQUAL(-1, pty.readInput());
-}
-
-void test_terminal_pty_buffer_output_chunks_respect_caller_cap() {
-    SerialSession::TerminalPtyBuffer pty;
-    std::vector<std::uint8_t> written(1500U);
-    for (std::size_t i = 0U; i < written.size(); ++i) {
-        written[i] = static_cast<std::uint8_t>(i & 0xFFU);
-    }
-
-    TEST_ASSERT_EQUAL(written.size(), pty.writeOutput(written.data(), written.size()));
-    TEST_ASSERT_TRUE(pty.hasOutput());
-
-    // Mirrors SerialMux::flushTerminalPtyOutput() chunking at
-    // kOutboundPayloadCap (700): every chunk respects the caller's cap and
-    // the concatenation of all chunks reproduces the original bytes with no
-    // loss, duplication or reordering.
-    constexpr std::size_t kChunkCap = 700U;
-    std::vector<std::uint8_t> reassembled;
-    std::uint8_t chunk[kChunkCap];
-    std::size_t chunkSize = 0U;
-    while (pty.hasOutput() && (chunkSize = pty.takeOutput(chunk, sizeof(chunk))) > 0U) {
-        TEST_ASSERT_TRUE(chunkSize <= kChunkCap);
-        reassembled.insert(reassembled.end(), chunk, chunk + chunkSize);
+    std::string line;
+    std::vector<std::string> lines;
+    out.clear();
+    while (editor.poll(out, &line)) {
+        lines.push_back(line);
     }
 
-    TEST_ASSERT_FALSE(pty.hasOutput());
-    TEST_ASSERT_TRUE(reassembled == written);
+    TEST_ASSERT_EQUAL(1U, lines.size());
+    TEST_ASSERT_EQUAL_STRING("ls -l", lines[0].c_str());
+    // Every typed character was echoed back before the CRLF.
+    TEST_ASSERT_TRUE(out.find("ls -l") != std::string::npos);
+    TEST_ASSERT_TRUE(out.find("\r\n") != std::string::npos);
 }
 
-void test_terminal_pty_buffer_input_and_output_are_independent_fifos() {
-    // Interleaves feeding input (as if TERMINAL_IN frames kept arriving)
-    // with partially draining output (as if a tick()'s TERMINAL_OUT queue
-    // were momentarily full/slow) and checks neither direction reorders or
-    // drops anything -- CRITERIO 1, "texto digitado nao e perdido ou
-    // deslocado por mensagens assincronas".
-    SerialSession::TerminalPtyBuffer pty;
+void test_shell_line_editor_output_chunks_respect_outbound_cap() {
+    // Mirrors SerialMux::flushTerminalPtyOutput(): the editor's echoed
+    // std::string is chopped into <= kOutboundPayloadCap pieces and their
+    // concatenation reproduces the original with no loss or reordering.
+    constexpr std::size_t kOutboundPayloadCap = 2048U;
 
-    const std::vector<std::uint8_t> firstKeystroke = {'a'};
-    const std::vector<std::uint8_t> echoOfFirst = {'a'};
-    const std::vector<std::uint8_t> secondKeystroke = {'b', 'c'};
-    const std::vector<std::uint8_t> echoOfSecond = {'b', 'c'};
+    ShellLineEditor editor;
+    std::string out;
+    editor.setPrompt("$ ", out);
 
-    TEST_ASSERT_EQUAL(1U, pty.feedInput(firstKeystroke.data(), firstKeystroke.size()));
-    TEST_ASSERT_EQUAL(1U, pty.writeOutput(echoOfFirst.data(), echoOfFirst.size()));
+    // A long response the editor lays out onto the line.
+    std::string big;
+    big.reserve(5000U);
+    for (std::size_t i = 0U; i < 5000U; ++i) {
+        big += static_cast<char>('a' + (i % 26U));
+    }
+    out.clear();
+    editor.writeResponse(big, out);
+    TEST_ASSERT_TRUE(out.size() > kOutboundPayloadCap);
 
-    TEST_ASSERT_EQUAL(static_cast<int>('a'), pty.readInput());
-    TEST_ASSERT_EQUAL(0U, pty.availableInput());
-
-    TEST_ASSERT_EQUAL(2U, pty.feedInput(secondKeystroke.data(), secondKeystroke.size()));
-    TEST_ASSERT_EQUAL(2U, pty.writeOutput(echoOfSecond.data(), echoOfSecond.size()));
-
-    TEST_ASSERT_EQUAL(static_cast<int>('b'), pty.readInput());
-    TEST_ASSERT_EQUAL(static_cast<int>('c'), pty.readInput());
-    TEST_ASSERT_EQUAL(-1, pty.readInput());
-
-    std::uint8_t out[8];
-    const std::size_t outSize = pty.takeOutput(out, sizeof(out));
-    TEST_ASSERT_EQUAL(3U, outSize); // "a" + "bc", still in original order
-    TEST_ASSERT_EQUAL('a', out[0]);
-    TEST_ASSERT_EQUAL('b', out[1]);
-    TEST_ASSERT_EQUAL('c', out[2]);
+    std::string reassembled;
+    std::size_t offset = 0U;
+    while (offset < out.size()) {
+        const std::size_t chunkSize = std::min(kOutboundPayloadCap, out.size() - offset);
+        TEST_ASSERT_TRUE(chunkSize <= kOutboundPayloadCap);
+        reassembled.append(out, offset, chunkSize);
+        offset += chunkSize;
+    }
+    TEST_ASSERT_TRUE(reassembled == out);
 }
 
-void test_terminal_pty_buffer_reset_clears_both_directions() {
-    SerialSession::TerminalPtyBuffer pty;
-    const std::vector<std::uint8_t> bytes = {'x', 'y', 'z'};
-    pty.feedInput(bytes.data(), bytes.size());
-    pty.writeOutput(bytes.data(), bytes.size());
-    TEST_ASSERT_TRUE(pty.availableInput() > 0U);
-    TEST_ASSERT_TRUE(pty.hasOutput());
+void test_shell_line_editor_reset_drops_pending_and_input() {
+    ShellLineEditor editor;
+    std::string out;
+    editor.setPrompt("$ ", out);
 
-    pty.reset();
+    const std::string partial = "half a comm";
+    editor.feed(reinterpret_cast<const std::uint8_t*>(partial.data()), partial.size());
 
-    TEST_ASSERT_EQUAL(0U, pty.availableInput());
-    TEST_ASSERT_EQUAL(-1, pty.peekInput());
-    TEST_ASSERT_FALSE(pty.hasOutput());
-    std::uint8_t scratch[4];
-    TEST_ASSERT_EQUAL(0U, pty.takeOutput(scratch, sizeof(scratch)));
+    editor.reset();  // same discard-pending-work rule SerialMux applies on session teardown
+
+    std::string line;
+    out.clear();
+    TEST_ASSERT_FALSE(editor.poll(out, &line));
+    TEST_ASSERT_EQUAL(0U, out.size());
 }
 
-void test_terminal_pty_buffer_input_overflow_is_bounded_not_corrupting() {
-    // Defensive-only: normal traffic (ShellSerial::MAX_INPUT_LENGTH=512,
-    // kOutboundPayloadCap=700) never gets close to kTerminalPtyRxCapacity
-    // (1024). A pathological oversized push just gets truncated, not
-    // silently overrunning into other state.
-    SerialSession::TerminalPtyBuffer pty;
-    std::vector<std::uint8_t> huge(SerialSession::kTerminalPtyRxCapacity + 100U, 'Z');
+void test_shell_line_editor_history_survives_reset() {
+    ShellLineEditor editor;
+    std::string out;
+    editor.setPrompt("$ ", out);
+    editor.addHistory("link -stats");
 
-    const std::size_t accepted = pty.feedInput(huge.data(), huge.size());
-    TEST_ASSERT_EQUAL(SerialSession::kTerminalPtyRxCapacity, accepted);
-    TEST_ASSERT_EQUAL(SerialSession::kTerminalPtyRxCapacity, pty.availableInput());
+    editor.reset();
+
+    TEST_ASSERT_EQUAL(1U, editor.historyCount());
+    std::string h;
+    TEST_ASSERT_TRUE(editor.historyAt(0, h));
+    TEST_ASSERT_EQUAL_STRING("link -stats", h.c_str());
 }
 
 int main(int, char**) {
@@ -623,10 +608,9 @@ int main(int, char**) {
     RUN_TEST(test_recovers_after_truncated_frame_followed_by_valid_one);
     RUN_TEST(test_consecutive_delimiters_produce_no_empty_frame);
     RUN_TEST(test_stress_interleaved_telemetry_and_terminal_never_cross_classes);
-    RUN_TEST(test_terminal_pty_buffer_input_round_trips_in_order);
-    RUN_TEST(test_terminal_pty_buffer_output_chunks_respect_caller_cap);
-    RUN_TEST(test_terminal_pty_buffer_input_and_output_are_independent_fifos);
-    RUN_TEST(test_terminal_pty_buffer_reset_clears_both_directions);
-    RUN_TEST(test_terminal_pty_buffer_input_overflow_is_bounded_not_corrupting);
+    RUN_TEST(test_shell_line_editor_feed_poll_echoes_and_completes_a_line);
+    RUN_TEST(test_shell_line_editor_output_chunks_respect_outbound_cap);
+    RUN_TEST(test_shell_line_editor_reset_drops_pending_and_input);
+    RUN_TEST(test_shell_line_editor_history_survives_reset);
     return UNITY_END();
 }

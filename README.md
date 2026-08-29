@@ -96,7 +96,7 @@ Serviços/domínio
                      incremental, filas FreeRTOS priorizadas por classe, encode COBS + write
 
 Plataforma
-  ShellSerial (input não bloqueante) / ShellOutput (formatação) / StartupConfig (boot)
+  ShellLineEditor (editor de linha, no pacote TinyShell) / ShellOutput (formatação) / StartupConfig (boot)
   Arduino/ESP-IDF: WiFi, esp_now, FreeRTOS, SD_MMC, time
   BTP (lib externa via git, lib_deps fixado em v1.1.0-beta): codec/fragmentação BTP v1
 ```
@@ -185,7 +185,7 @@ a regra de quando um módulo novo deve entrar em `Context` ou pode ser incluído
 
 1. `BoardConfig::initBoardPins(false)` — pinos em estado seguro (LCD apagado)
 2. `Serial.setRxBufferSize(1024)` (margem para as linhas `BTP/1 ENTER` que o
-   host empilha durante o boot, o default da CDC é 256 B) e inicia `ShellSerial`
+   host empilha durante o boot, o default da CDC é 256 B) e `Serial.begin()`
    na baudrate de `platformio.ini` (`BAUDRATE`, cosmético na CDC nativa)
 3. inicializa LED/LCD e anuncia o boot (`StartupConfig::announceBoot`) — não aguarda mais um
    monitor serial conectar (esse gate dependia de `Serial` refletir DTR asserted pelo host, o
@@ -491,7 +491,7 @@ do dongle.
 A mesma porta USB do console humano também serve BTP v1 para um cliente automático (ex.:
 TraceView), seguindo `BTP/docs/session-and-terminal.md`:
 
-- **Entrada**: a porta começa em modo console (`ShellSerial`). Uma linha completa
+- **Entrada**: a porta começa em modo console (`ShellLineEditor`). Uma linha completa
   `BTP/1 ENTER <16 hex>\r\n` é reconhecida como controle reservado (não é um comando
   TinyShell) e responde `BTP/1 READY <hex minúsculo>\r\n`; a partir daí a sessão fica
   `AwaitingHello` aguardando um frame `HELLO` por até 2s. Alternativamente, um humano num
@@ -534,7 +534,7 @@ TraceView), seguindo `BTP/docs/session-and-terminal.md`:
   tópico 17 com `status_version=2` sempre que houver pelo menos um tópico rastreado (ver 7.7).
 - **Saída**: `SESSION_CLOSE` do cliente ou o watchdog (`session_timeout_ms` negociado, sem
   frame BTP válido) fecham a sessão: o dongle descarta o que ainda não foi enviado nas filas,
-  escreve exatamente `BTP/1 CONSOLE\r\n` e devolve a porta para `ShellSerial`.
+  escreve exatamente `BTP/1 CONSOLE\r\n` e devolve a porta para `ShellLineEditor`.
 - **Fora de escopo deste tópico** (ver RESULTADO em
   `BTP/topicos/13_dongle_serial_mux_sessao.txt`): fragmentação/reassembly de
   mensagens lógicas maiores que um frame serial (4096 octetos já é folgado para os payloads
@@ -599,8 +599,10 @@ Substitui o antigo terminal de rolagem (o texto já existe na serial e no banco)
 
 ## 9. Serial e UX
 
-- `ShellSerial`: input não bloqueante, edição in-line (setas, backspace), histórico
-  navegável (`ESC[A`/`ESC[B`), restaurado do banco no boot
+- `ShellLineEditor` (no pacote TinyShell, compartilhado com o terminal BTP e com
+  o robô): edição de linha server-side (echo, setas, backspace, `ESC[A`/`ESC[B`,
+  Tab, Ctrl+R), histórico restaurado do banco no boot. `feed()`/`poll()` em vez
+  de `Stream`; o que ecoaria vai para um `std::string`.
 - `ShellOutput`: prefixa linhas (`! ` erro, `> ` resposta comum)
 - `ShellCommandSupport::printLine()` manda a mesma linha para: serial, buffer de
   persistência (`command_log_output`) e banner do LCD (com cor por heurística de texto)
@@ -685,8 +687,9 @@ lib/
   DatabaseStore/                 # schema SQLite e leituras/gravações
   DonglePeripherals/ LcdDashboard/  # LED/LCD/SD e dashboard em grade
   SudoManager/                   # elevação de permissão por identidade
-  ShellSerial/ ShellOutput/      # input/format de terminal
+  ShellOutput/                   # formatação de saída do terminal
   StartupConfig/                 # sequência de boot
+  (o editor de linha é ShellLineEditor, no pacote TinyShell)
 src/
   main.cpp
 scripts/

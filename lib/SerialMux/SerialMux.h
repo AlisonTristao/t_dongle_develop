@@ -2,7 +2,7 @@
 
 #include <Arduino.h>
 #include <SerialSession.h>
-#include <ShellSerial.h>
+#include <ShellLineEditor.h>
 #include <btp/codec.hpp>
 
 #include <cstddef>
@@ -27,12 +27,13 @@
  * begin(), exactly the same callback-injection pattern topico 12 used for
  * BtpTransport::SendFn vs. EspNowManager.
  *
- * Topico 19 adds a second, private ShellSerial instance here (the "BTP
+ * Topico 19 adds a second, private ShellLineEditor instance here (the "BTP
  * terminal shell"), fed by TERMINAL_IN and drained into TERMINAL_OUT
- * (SerialMux.cpp's g_terminalShell/g_terminalPty) -- see PASSO 1/2 in this
- * file's RESULTADO in bally_protocol/topicos/19_terminal_protocolado.txt.
- * Including <ShellSerial.h> here does not reopen the cycle above: ShellSerial
- * is a leaf lib (Arduino.h + <functional> only, no ShellConfig/
+ * (SerialMux.cpp's g_terminalShell) -- see PASSO 1/2 in this file's RESULTADO
+ * in bally_protocol/topicos/19_terminal_protocolado.txt. ShellLineEditor is
+ * the framework-free line editor shared with the USB console (it lives in the
+ * TinyShell package now); including it here does not reopen the cycle above:
+ * it is a leaf (<string>/<vector>/<functional> only, no ShellConfig/
  * ShellCommandSupport dependency of its own).
  */
 namespace SerialMux {
@@ -67,9 +68,9 @@ using RelayToRadioFn = bool (*)(const std::uint8_t mac[6], const std::uint8_t* f
 // this field -- topico 16 may formalize one). Caller derives it (e.g. from
 // the MAC) and owns its storage only for the duration of this call.
 // terminalPrompt is copied (not aliased) into the private BTP terminal
-// ShellSerial's prompt text -- callers may pass a temporary's c_str() (e.g.
-// ShellOutput::commandPrompt().c_str()); the pointer only needs to remain
-// valid for the duration of this call.
+// ShellLineEditor's prompt text -- callers may pass a temporary's c_str()
+// (e.g. ShellOutput::commandPrompt().c_str()); the pointer only needs to
+// remain valid for the duration of this call.
 // relayToRadio may be nullptr in a context with no radio at all (e.g. a
 // future test harness), in which case every downstream relay is refused
 // instead of being silently re-originated; production callers (AppRuntime)
@@ -81,16 +82,16 @@ void begin(Stream& io, RunShellLineFn runShellLine, const std::uint8_t selfUuid[
 // caller (AppRuntime) passes the same provider it gives serialShell_
 // (TinyShell::complete_line) so "dongle -bt<TAB>" behaves identically
 // whether typed on the real console or through TraceView's terminal widget.
-void setTerminalCompletionProvider(ShellSerial::CompletionProvider provider) noexcept;
+void setTerminalCompletionProvider(ShellLineEditor::CompletionProvider provider) noexcept;
 
 // Seeds the BTP terminal shell's arrow-up/down history. AppRuntime calls
-// this alongside serialShell_.addLog() when replaying persisted history
+// this alongside serialShell_.addHistory() when replaying persisted history
 // (restoreShellHistoryFromDatabase) so both shells recall the same past
-// commands -- the two ShellSerial instances otherwise keep independent
+// commands -- the two ShellLineEditor instances otherwise keep independent
 // history storage (see topico 19 RESULTADO).
 void addTerminalHistory(const char* line) noexcept;
 
-// True while a plain human console (ShellSerial) owns the port: PASSO 11
+// True while a plain human console (ShellLineEditor) owns the port: PASSO 11
 // callers use this to decide whether a direct Serial print is still allowed.
 bool isConsoleOwned() noexcept;
 bool isProtocolled() noexcept;

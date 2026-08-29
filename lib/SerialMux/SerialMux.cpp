@@ -1,7 +1,5 @@
 #include "SerialMux.h"
 
-#include "TerminalPtyStream.h"
-
 #include <BtpTransport.h>
 #include <DonglePublisher.h>
 #include <HubRegistry.h>
@@ -16,8 +14,10 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstring>
+#include <string>
 
 namespace SerialMux {
 namespace {
@@ -112,19 +112,19 @@ btp::SerialDecoder g_decoder(g_encodedBuffer, sizeof(g_encodedBuffer), g_decoded
 
 SerialSession::Session g_session(SerialSession::LocalLimits{});
 
-// Topico 19: private ShellSerial instance for the BTP terminal channel,
-// bound to a pty-style Stream fed by TERMINAL_IN and drained into
-// TERMINAL_OUT (PASSO 1/2 -- line editing stays server-side, see this
-// file's header comment and the topico's RESULTADO). Kept separate from
-// AppRuntime's own serialShell_ (real console) rather than re-pointing one
-// shared instance at different Streams: console and BTP-terminal modes are
-// mutually exclusive but SerialMux must not reach back into AppRuntime to
-// flip anything, matching the existing callback-injection boundary. The two
-// instances keep independent input-line/cursor state; command history is
-// synced explicitly (addTerminalHistory), Tab completion via
-// setTerminalCompletionProvider.
-TerminalPtyStream g_terminalPty;
-ShellSerial g_terminalShell;
+// Topico 19: private ShellLineEditor instance for the BTP terminal channel.
+// TERMINAL_IN payload bytes are feed()'d into it; whatever it would echo is
+// polled into g_terminalOut and chunked into TERMINAL_OUT frames (PASSO 1/2
+// -- line editing stays server-side, see this file's header comment and the
+// topico's RESULTADO). Kept separate from AppRuntime's own serialShell_ (real
+// console) rather than re-pointing one shared instance: console and
+// BTP-terminal modes are mutually exclusive but SerialMux must not reach back
+// into AppRuntime to flip anything, matching the existing callback-injection
+// boundary. The two instances keep independent input-line/cursor state;
+// command history is synced explicitly (addTerminalHistory), Tab completion
+// via setTerminalCompletionProvider.
+ShellLineEditor g_terminalShell;
+std::string g_terminalOut;  // bytes the editor echoed, awaiting TERMINAL_OUT chunking
 
 QueueHandle_t g_queues[kPriorityClassCount] = {nullptr, nullptr, nullptr, nullptr};
 
@@ -479,7 +479,8 @@ void finalizeToConsole(std::uint16_t objectId, const std::uint8_t* payload, std:
     // session-and-terminal.md section 4: discard partial/pending work before
     // handing the port back -- a half-typed BTP terminal line is exactly
     // that, same as a partial serial block or an incomplete reassembly.
-    g_terminalPty.reset();
+    g_terminalShell.reset();
+    g_terminalOut.clear();
 }
 
 void replyCommandResult(const btp::Header& requestHeader, std::uint16_t actionId, std::uint16_t actionVersion,
@@ -561,8 +562,8 @@ void handleCommandRequest(const btp::DecodedFrame& decoded) noexcept {
 // keystrokes, occasionally a larger pasted/typed chunk -- straight from the
 // desktop's terminal widget. PASSO 1/2 (topico 19 RESULTADO): line editing
 // (echo, backspace, arrows, history, Tab, Ctrl+R) stays entirely
-// server-side, so these bytes are fed byte-for-byte into g_terminalPty,
-// exactly the role the real UART plays for ShellSerial in console mode.
+// server-side, so these bytes are fed byte-for-byte into g_terminalShell,
+// exactly the role the real UART plays for the console line editor.
 // pumpTerminalShell() (tick()) is what actually reads/interprets them; this
 // replaces topico 13's one-message-equals-one-shell-line MVP.
 void handleTerminalIn(const btp::DecodedFrame& decoded) noexcept {
@@ -592,7 +593,7 @@ void handleTerminalIn(const btp::DecodedFrame& decoded) noexcept {
         return;
     }
 
-    g_terminalPty.feedInput(decoded.payload.data, decoded.payload.size);
+    g_terminalShell.feed(decoded.payload.data, decoded.payload.size);
 }
 
 std::uint32_t readU32Le(const std::uint8_t* data) noexcept {
@@ -860,41 +861,41 @@ void handleUnsubscribeRequest(const btp::DecodedFrame& decoded) noexcept {
               sizeof(responsePayload));
 }
 
-// Drains whatever g_terminalShell wrote back (echo/prompt/redraw) since the
-// last call and chunks it into TERMINAL_OUT frame(s) of at most
-// kOutboundPayloadCap bytes each -- unlike topico 13's MVP, a long command
-// result is no longer truncated to a single frame's worth, just split
-// across several kTerminal-priority frames.
+// Drains whatever g_terminalShell echoed into g_terminalOut and chunks it
+// into TERMINAL_OUT frame(s) of at most kOutboundPayloadCap bytes each --
+// unlike topico 13's MVP, a long command result is no longer truncated to a
+// single frame's worth, just split across several kTerminal-priority frames.
 void flushTerminalPtyOutput() noexcept {
-    static std::uint8_t chunk[kOutboundPayloadCap];  // main-loop only, see enqueueOwn
-    std::size_t chunkSize = 0U;
-    while (g_terminalPty.hasOutput() &&
-          (chunkSize = g_terminalPty.takeOutput(chunk, sizeof(chunk))) > 0U) {
-        enqueueOwn(btp::MessageType::Terminal, SerialSession::kTerminalOutObjectId, chunk, chunkSize);
+    std::size_t offset = 0U;
+    while (offset < g_terminalOut.size()) {
+        const std::size_t chunkSize = std::min(kOutboundPayloadCap, g_terminalOut.size() - offset);
+        enqueueOwn(btp::MessageType::Terminal, SerialSession::kTerminalOutObjectId,
+                   reinterpret_cast<const std::uint8_t*>(g_terminalOut.data()) + offset, chunkSize);
+        offset += chunkSize;
     }
+    g_terminalOut.clear();
 }
 
-// Drives g_terminalShell against g_terminalPty once per tick(), mirroring
-// AppRuntime::handleShellInput()'s console pattern exactly (one
-// readInputLine() call, response + refreshLine() only when a full command
-// line came back) so the BTP terminal and the real console behave
-// identically from a user's point of view (CRITERIO 3: no duplicate
-// prompt/echo). readInputLine() itself drains every byte currently
-// buffered in g_terminalPty, echoing as it goes, whether or not a full
-// line completes -- that per-keystroke echo is what flushTerminalPtyOutput
-// below picks up even when no command runs this tick.
+// Drives g_terminalShell once per tick(), mirroring
+// AppRuntime::handleShellInput()'s console pattern (feed the buffered bytes,
+// poll() out each completed line, write the response + repaint the prompt)
+// so the BTP terminal and the real console behave identically from a user's
+// point of view (CRITERIO 3: no duplicate prompt/echo). poll() drains every
+// byte handleTerminalIn() fed, echoing as it goes whether or not a line
+// completes -- that per-keystroke echo lands in g_terminalOut and is picked
+// up by flushTerminalPtyOutput() below even when no command runs this tick.
 void pumpTerminalShell() noexcept {
-    String line;
-    if (g_terminalShell.readInputLine(line)) {
-        const std::string commandText(line.c_str());
+    std::string line;
+    while (g_terminalShell.poll(g_terminalOut, &line)) {
         std::string fullOutput;
         if (g_runShellLine != nullptr) {
-            g_runShellLine(commandText.c_str(), "serial", "serial", &fullOutput);
+            g_runShellLine(line.c_str(), "serial", "serial", &fullOutput);
         }
         if (!fullOutput.empty()) {
-            ShellOutput::printResponse(g_terminalPty, fullOutput);
+            g_terminalShell.writeResponse(ShellOutput::renderResponse(fullOutput), g_terminalOut);
+        } else {
+            g_terminalShell.refreshLine(g_terminalOut);
         }
-        g_terminalShell.refreshLine();
     }
     flushTerminalPtyOutput();
 }
@@ -920,12 +921,13 @@ void dispatchFrame(const btp::DecodedFrame& decoded, std::uint32_t nowMs) noexce
                       result.outPayloadSize);
             g_lastStatusMs = nowMs; // first heartbeat kStatusIntervalMs from now, not immediately
             // Fresh BTP terminal session (topico 19): drop any half-typed
-            // line/pending bytes from a previous session and re-arm
-            // ShellSerial's input/cursor/escape state. History and prompt
-            // text survive (ShellSerial::begin() never touches either).
-            g_terminalPty.reset();
-            g_terminalShell.begin(g_terminalPty);
-            g_terminalShell.refreshLine(); // queue the initial prompt now
+            // line/pending bytes from a previous session and re-arm the line
+            // editor's input/cursor/escape state. History and prompt text
+            // survive (ShellLineEditor::reset() never touches either).
+            g_terminalShell.reset();
+            g_terminalOut.clear();
+            g_terminalShell.refreshLine(g_terminalOut); // queue the initial prompt now
+            flushTerminalPtyOutput();
             break;
         case SerialSession::Session::FrameOutcome::HelloRejected:
             finalizeToConsole(SerialSession::kHelloResultObjectId, replyPayload, result.outPayloadSize,
@@ -1125,14 +1127,14 @@ void begin(Stream& io, RunShellLineFn runShellLine, const std::uint8_t selfUuid[
     g_decoder.reset();
     g_lastStatusMs = millis();
 
-    g_terminalPty.reset();
-    g_terminalShell.begin(g_terminalPty);
-    // ShellSerial::begin() never touches prompt_, so this only needs to run
-    // once here, not on every session (see HelloAccepted in dispatchFrame).
-    g_terminalShell.setPrompt(String(terminalPrompt != nullptr ? terminalPrompt : ""));
+    g_terminalShell.reset();
+    g_terminalOut.clear();
+    // reset() never touches prompt_, so this only needs to run once here, not
+    // on every session (see HelloAccepted in dispatchFrame).
+    g_terminalShell.setPrompt(std::string(terminalPrompt != nullptr ? terminalPrompt : ""));
 }
 
-void setTerminalCompletionProvider(ShellSerial::CompletionProvider provider) noexcept {
+void setTerminalCompletionProvider(ShellLineEditor::CompletionProvider provider) noexcept {
     g_terminalShell.setCompletionProvider(provider);
 }
 
@@ -1140,7 +1142,7 @@ void addTerminalHistory(const char* line) noexcept {
     if (line == nullptr) {
         return;
     }
-    g_terminalShell.addLog(String(line));
+    g_terminalShell.addHistory(std::string(line));
 }
 
 bool isConsoleOwned() noexcept {
@@ -1216,12 +1218,13 @@ void onTransportLost(std::uint32_t nowMs) noexcept {
     dispatchUpstreamActions(actions, count);
     resetQueues();
     g_decoder.reset();
-    g_terminalPty.reset();
+    g_terminalShell.reset();
+    g_terminalOut.clear();
 }
 
 void tick(std::uint32_t nowMs) noexcept {
     if (g_session.isConsole()) {
-        return; // ShellSerial owns the port; nothing for the mux to do.
+        return; // the console line editor owns the port; nothing for the mux to do.
     }
 
     // Refreshed every tick (cheap: a global read + one field write) so
@@ -1262,7 +1265,8 @@ void tick(std::uint32_t nowMs) noexcept {
                                : "HELLO nao chegou a tempo -> console");
         }
         g_decoder.reset();
-        g_terminalPty.reset(); // same discard-pending-work rule as finalizeToConsole()
+        g_terminalShell.reset(); // same discard-pending-work rule as finalizeToConsole()
+        g_terminalOut.clear();
         return;
     }
 

@@ -110,6 +110,18 @@ String normalizeNewlines(const char* text) {
     return normalized;
 }
 
+// String counterpart of the per-line half of writeLine()/writeRawLine():
+// appends `line` to `out` with the given prefix and a CR+LF terminator. Only
+// the single-line, non-empty case renderResponse() needs.
+void appendLineWithPrefix(std::string& out, const char* prefix, const String& line) {
+    out += '\r';
+    if (prefix != nullptr) {
+        out += prefix;
+    }
+    out += line.c_str();
+    out += "\r\n";
+}
+
 void writeTextWithPrefix(Stream& io, const char* prefix, const char* text, bool prefixEmptyLine) {
     const char* safeText = (text != nullptr) ? text : "";
     const char* safePrefix = (prefix != nullptr) ? prefix : "";
@@ -320,6 +332,49 @@ void printResponse(Stream& io, const std::string& response) {
         }
         start = newline + 1;
     }
+}
+
+std::string renderResponse(const std::string& response) {
+    String text = String(response.c_str());
+    text.replace("\r\n", "\n");
+    text.replace('\r', '\n');
+    text.trim();
+
+    std::string out;
+    if (text.length() == 0) {
+        return out;
+    }
+
+    int32_t start = 0;
+    while (start <= static_cast<int32_t>(text.length())) {
+        const int32_t newline = text.indexOf('\n', start);
+        String line;
+        if (newline < 0) {
+            line = text.substring(start);
+        } else {
+            line = text.substring(start, newline);
+        }
+
+        line.trim();
+        if (line.length() > 0) {
+            if (isEspNowStructuredLine(line)) {
+                appendLineWithPrefix(out, nullptr, line);
+            } else {
+                const String cleanLine = stripLeadingBracketTags(line);
+                if (cleanLine.length() > 0) {
+                    appendLineWithPrefix(out, hasVisualPrefix(cleanLine.c_str()) ? nullptr : kOutputPrefix,
+                                         cleanLine);
+                }
+            }
+        }
+
+        if (newline < 0) {
+            break;
+        }
+        start = newline + 1;
+    }
+
+    return out;
 }
 
 } // namespace ShellOutput

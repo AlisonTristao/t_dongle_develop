@@ -631,8 +631,9 @@ uint8_t wrapper_dongle_info() {
 // session on this same port, for a human at a terminal emulator who does not
 // want to hand-type the raw "BTP/1 ENTER <16 hex>\r\n" wire line -- an
 // automatic client (TraceView) still uses that raw line directly, recognized
-// straight off ShellSerial's input (see SerialMux::tryEnterFromConsoleLine,
-// called from AppRuntime::handleShellInput). Prints its confirmation BEFORE
+// straight off the console line editor's input (see
+// SerialMux::tryEnterFromConsoleLine, called from AppRuntime::handleShellInput).
+// Prints its confirmation BEFORE
 // calling SerialMux::enterFromCommand(), never after: once that call
 // succeeds, "BTP/1 READY ...\r\n" is already on the wire and no further
 // plain-text output may follow it (BTP/docs/session-and-terminal.md

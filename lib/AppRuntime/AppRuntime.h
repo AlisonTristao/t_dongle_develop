@@ -4,7 +4,9 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
-#include <ShellSerial.h>
+#include <string>
+
+#include <ShellLineEditor.h>
 #include <EspNowManager.h>
 #include <DonglePeripherals.h>
 #include <LcdDashboard.h>
@@ -31,8 +33,16 @@ private:
     void processAsyncWarnings(bool& needPromptRefresh);
     void flushPendingEspNowOutput(bool& needPromptRefresh);
     void handleShellInput();
+    // Drain whatever the line editor echoed into `editorOut_` to the USB
+    // console. No-op while SerialMux owns the port. Clears the buffer.
+    void flushEditorOutput();
 
-    ShellSerial serialShell_;
+    // The USB console's line editor. Reads bytes fed from Serial, appends
+    // everything it would echo to editorOut_ (drained by flushEditorOutput);
+    // ShellLineEditor is the shared, framework-free port of the old
+    // lib/ShellSerial (now in the TinyShell package).
+    ShellLineEditor serialShell_;
+    std::string editorOut_;
     EspNowManager espNowManager_;
     DonglePeripherals donglePeripherals_;
     LcdDashboard lcdDashboard_;
