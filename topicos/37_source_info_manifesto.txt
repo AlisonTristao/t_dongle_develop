@@ -1,0 +1,327 @@
+PLANO 37 - SOURCE_INFO NO MANIFESTO (BTP 2.1.0)
+Gerado 2026-08-29. Continua 36. Foco: cada source (dongle e robo) anuncia
+informacoes uteis sobre si -- nome legivel, descricao, versao de firmware,
+data de build, chip, particao OTA, endpoint OTA -- pela MANIFEST_DATA, de
+forma OPCIONAL (nao rigida).
+
+LEGENDA: [ ] a fazer   [x] feito   [~] em andamento   [-] descartado/pulado
+
+
+====================================================================
+DECISOES DE DESIGN (travadas com o usuario 2026-08-29)
+====================================================================
+
+1. HELLO nao muda. A informacao vai na MANIFEST_DATA (CONTROL 0x0004), que
+   ja "descreve o source" e ja tem manifest_format_version para crescer.
+   Ver topico 36 -- o caminho prime->cache->serve->parse ja funciona.
+
+2. O BTP nao tem codigo de manifesto: e spec (docs/) + vetores. A lib C++
+   (codec/fragmentation/stream/aead) para no frame. O layout da MANIFEST_DATA
+   vive so em docs/commands.md secao 3 e e implementado a mao em 3 lugares:
+     - bally_OS  lib/ManifestResponder/ManifestResponder.cpp  (escreve)
+     - bally_dongle lib/ManifestCache/ManifestCache.cpp        (guarda/serve)
+     - TraceView lib/protocol/manifestclient.cpp               (le)
+   Entao "implementar no BTP" = editar docs + adicionar 1 vetor + bump 2.1.0.
+   NENHUM .cpp/.hpp da lib BTP e tocado.
+
+3. Formato da entrada: LABEL NA WIRE, SEM REGISTRO.
+     info_entry = { key:utf8_u16, label:utf8_u16, value:utf8_u16 }
+   - key    = identificador estavel de maquina  ("fw_version")
+   - label  = nome legivel para exibir           ("Firmware"); pode ser vazio
+   - value  = o dado, sempre texto               ("2.1.0-rc1", "2", "16777216")
+   O BTP define so a mecanica (info_count + formato da entrada) e uma lista
+   de key RECOMENDADOS (nao obrigatorios, nao exaustivos). Consumidor que
+   nao conhece a key exibe label/value mesmo assim.
+
+4. config_revision NAO cobre source_info. config_revision continua sendo
+   "o catalogo de topicos/acoes mudou". Uma resposta NOT_MODIFIED ainda
+   carrega o source_info fresco (ele e informativo, nao e descriptor).
+   Isso evita que editar o friendly_name invalide o cache do catalogo, e
+   resolve a tensao ja documentada em bally_OS RobotSettings.h:180.
+
+5. Valores sempre utf8_u16 (string). Sem value_type tipado.
+
+6. Opcionalidade em 3 camadas:
+   (a) manifest_format_version = 1 -> sem bloco (comportamento atual).
+       = 2 -> tem o bloco source_info logo apos source_name.
+   (b) info_count pode ser 0 -> source em formato 2 que nao quer publicar
+       nada manda lista vazia. Valido.
+   (c) por entrada -> o responder inclui so as key que ele tem. Nada e
+       obrigatorio. Ordem nao importa.
+
+7. FICA DE FORA de proposito: senha OTA (nunca num anuncio de descoberta;
+   endpoint sim, segredo nao), qualquer coisa que muda a cada segundo
+   (uptime, heap -- isso e STATUS).
+
+
+====================================================================
+LAYOUT NA WIRE (MANIFEST_DATA, manifest_format_version = 2)
+====================================================================
+
+  offset 0..57   identico ao formato 1
+  offset 58      source_name              utf8_u16
+  --- novo, so em formato 2 ---
+  var            info_count               uint16_le
+  var            entries    info_count x  { key:utf8_u16, label:utf8_u16, value:utf8_u16 }
+  --- fim ---
+  var            topic records            (topic_count deles)
+  var            action records           (action_count deles)
+
+Formato 1: sem info_count, payload termina apos os records (como hoje).
+Um parser so-formato-1 REJEITA um payload formato 2 (ja faz: formatVersion != 1).
+Um parser formato-2 aceita os dois (formato 1 -> info_count tratado como 0).
+Deploy move as duas pontas juntas (nao ha negociacao no MANIFEST_REQUEST).
+
+key RECOMENDADOS (quando o source tem o dado):
+  name           nome humano configurado
+  description    texto livre
+  model          modelo de hardware
+  fw_version     string de versao de firmware
+  fw_build       timestamp de build
+  chip           modelo do chip
+  chip_revision  revisao de silicio
+  ota_partition  particao de firmware rodando
+  ota_endpoint   onde um update e servido (NUNCA um segredo)
+
+Limites novos (commands.md secao 6):
+  Source info entries              32
+  Source info key                  64 octetos
+  Source info label ou value      256 octetos
+
+
+====================================================================
+FASE A - BTP (spec + vetor + versao)   [repo c:\git\BTP, branch main]
+====================================================================
+
+[x] A.1  docs/commands.md
+         - 3.2: linha `source_info` na tabela; manifest_format_version "1 ou 2"
+           + paragrafos explicando formato 2 e a nao-negociacao.
+         - 3.3 NOT_MODIFIED: "no topic or action records follow" + source_info
+           ainda segue source_name, nao coberto por config_revision.
+         - nova 3.12 "Source info" (apos 3.11): tabela info_count + entry,
+           semantica key/label/value, "sem registro", subsecoes "Purpose and
+           scope" e "Recommended keys" (9 keys).
+         - 6 Limits: entries=32, key=64, label/value=256.
+[x] A.2  docs/session-and-terminal.md 1.2: config_revision rastreia o
+         catalogo de objetos, nao o source_info (sempre entregue inteiro).
+[x] A.3  test-vectors/v2/valid/manifest_data.{json,bin}: MANIFEST_DATA
+         formato 2, alvo unico, CATALOG_COMPLETE, topic_count=0,
+         action_count=0, 3 entradas (fw_version/chip/name; a ultima com
+         label vazio). payload_model completo. Registrado em manifest.json.
+         python tools/test_vectors_v2.py --check -> 11 files verified.
+         + adicionado ao tests/test_conformance_v2.cpp (valid_vectors):
+           C++ prova encode/decode byte-exato do frame.
+[x] A.4  Bump 2.0.0 -> 2.1.0:
+           CMakeLists.txt project(btp VERSION 2.1.0)
+           library.json "version": "2.1.0"
+           include/btp/codec.hpp kLibraryVersionMinor 0 -> 1
+           README.md banner + tabela "four things" + nota do 1.x
+[x] A.5  cmake --build build && ctest -> 8/8 PASSED.
+         python -m mkdocs build --strict -> OK (anchors #312-source-info,
+         #5-status resolvem).
+[ ] A.6  commit + tag v2.1.0 em main. (PENDENTE -- revisar com o co-dev antes.)
+
+
+====================================================================
+FASE B - bally_OS (responder escreve)   [repo c:\git\bally_OS]
+====================================================================
+
+[x] B.1  ManifestResponder: kManifestFormatVersion 1 -> 2.
+         - SourceInfoEntry {key,label,value} no .h; configure() ganha
+           (source_info*, count) opcionais; membros source_info_/count_.
+         - build_manifest_data: apos source_name escreve info_count +
+           entries. Two-pass: conta as nao-vazias, escreve o count, pula
+           entrada de value vazio (== opcionalidade dinamica de
+           name/description). Erro (REJECTED) -> info_count 0.
+         - kMaxManifestPayloadSize 512 -> 600 (teto do send_logical).
+         - kMaxSourceInfoEntries = 16 (spec permite 32).
+[x] B.2  BallyRobot: buildSourceInfo() novo, chamado antes do
+         manifest_responder.configure() em configureProtocolIdentity().
+         9 entradas: name/description (settings.data(), lidas vivas),
+         model="BallyRobot", fw_version/fw_build/idf_version
+         (esp_app_get_description()), chip="ESP32-S3"/chip_revision
+         (esp_chip_info + slice de source_info_scratch_), ota_partition
+         (esp_ota_get_running_partition). Ponteiros estaveis; conteudo
+         de settings atualiza in-place -> "settings -set identity ..."
+         reflete sem reboot (decisao 4).
+         RobotSettings: modulo "identity" novo com name[32]/description[64]
+         (SettingsData + kTable). Default vazio -> nao aparece na wire.
+[ ] B.3  Bump BTP.git -> #v2.1.0 (idf_component.yml / lib_deps). PENDENTE
+         (junto com Fase E, apos bancada).
+[x] B.4  test_manifest_responder: +test_source_info_block_round_trips_and_
+         skips_empty_values (resposta cheia E NOT_MODIFIED, pula value
+         vazio). Testes existentes ajustados p/ ler info_count.
+[x] B.5  pio test -e native: 74/74 PASSED. Firmware esp32-s3: SUCCESS
+         (RAM 47.4%, flash 17.1%).
+
+
+====================================================================
+FASE C - bally_dongle (cache guarda/serve + self)   [repo c:\git\bally_dongle]
+====================================================================
+
+[x] C.1  ManifestCache: kManifestFormatVersion 1 -> 2.
+         - Entry ganha sourceInfo[512]/sourceInfoSize (verbatim, com o
+           info_count na frente, como records).
+         - ingestManifestDataImpl: aceita formato 1 OU 2. Formato 2 -> anda o
+           bloco (info_count + count x 3 utf8_u16) pra achar onde comecam os
+           records; valida; guarda verbatim. Formato 1 -> bloco vazio "00 00".
+           Bloco > kMaxSourceInfoBytes -> ingest inteiro falha (bounded).
+           source_info atualiza SEMPRE (fora do if !notModified), como
+           uuid/online -- nao e gated por config_revision (decisao 4).
+         - writeManifestData: escreve o bloco (verbatim ou "00 00") logo
+           apos source_name, em toda resposta (cheia, NOT_MODIFIED, erro).
+         - serializeSourceInfo() novo (publico): SourceInfoEntry[] -> blob,
+           pula value vazio. Usado so pra montar o bloco do PROPRIO dongle.
+         - configure() ganha (selfSourceInfo*, size) opcionais.
+[x] C.2  AppRuntime: buildDongleSourceInfo() monta o blob do dongle uma vez
+         no boot (esp_app_get_description/esp_chip_info/esp_ota_get_running_
+         partition) e passa pro configure(). 8 entradas: description,
+         model=T-Dongle-S3, fw_version, fw_build, idf_version, chip,
+         chip_revision, ota_partition. Snapshot fixo (o dongle nao tem
+         identidade editavel em runtime ainda -- DongleSettings fica p/ outro
+         topico).
+[x] C.3  scripts/inject_git_rev.py novo + platformio.ini [env:tdongle-s3].
+         `git describe --always --dirty --tags` -> -DDONGLE_GIT_REV.
+         AppRuntime usa DONGLE_GIT_REV se definido, senao app->version.
+[ ] C.4  Bump BTP.git#v2.0.0 -> #v2.1.0. PENDENTE (Fase E).
+[x] C.5  test_manifest_cache: +test_source_info_block_round_trips_ingest_and_
+         serve (ingest fmt2 -> cache -> serve -> walk; label vazio preservado;
+         record apos o bloco) +test_oversized_source_info_block_rejects_the_
+         ingest. Testes existentes ajustados (serve agora e fmt 2).
+[-] C.6  `dongle -info` -- pulado por ora (nao bloqueia; ganho pequeno).
+[x] C.7  pio test -e native: 104/104 PASSED. Firmware tdongle-s3: SUCCESS
+         (RAM 39.9%, flash 44.0%). 1a tentativa falhou: esp_app_desc.h nao
+         existe no arduino-esp32/IDF 4.4 do dongle (bally_OS e IDF 5.x).
+         Trocado p/ esp_app_format.h + esp_ota_ops.h e
+         esp_ota_get_app_description() (nome IDF 4.x).
+         inject_git_rev.py testado: `git describe` -> 8c1fa20-dirty.
+
+
+====================================================================
+FASE D - TraceView (le + exibe)   [repo c:\git\TraceView]
+====================================================================
+
+[x] D.1  Tipo novo lib/telemetry/deviceinforecord.h (DeviceInfoRecord
+         {key,label,value} + Q_DECLARE_METATYPE), no traceview_telemetry
+         (mesma camada do CatalogTopicInfo, pra devices/backend usarem sem
+         depender de traceview_protocol).
+         manifestclient.cpp parseManifestData: aceita formato 1 OU 2; le
+         info_count + entries logo apos source_name, SEMPRE (nao gated por
+         NOT_MODIFIED). ParsedManifestData.sourceInfo. Sinal novo
+         ManifestClient::sourceInfoReported(sourceId, QVector<DeviceInfoRecord>)
+         emitido quando o bloco tem entradas (resposta cheia E NOT_MODIFIED).
+[x] D.2  backend.h: sinal Backend::deviceInfoReported.
+         btpbackend: m_sessionPeerSourceId (do sessionEstablished) + connect
+         de sourceInfoReported -> forward quando sourceId == "meu device"
+         (robo p/ filho, dongle p/ console).
+         deviceconnection: sinal espelhado.
+         device.h: Device::reportedInfo (mirror, nao persistido).
+         devicesgrid: setDeviceReportedInfo (padrao setDevicePeerState -- sem
+         deviceUpdated) + sinal deviceReportedInfoChanged p/ o dialog aberto.
+         mainwindow: connect no createDeviceConnection; limpa no
+         onDeviceConnectionStateChanged(disconnect).
+[x] D.3  deviceconfigdialog: QLabel "Info:" multi-linha "label: value" na
+         secao "Reported by device", placeholder quando vazio, label cai pra
+         key se vazio. setReportedInfo() + sync via deviceReportedInfoChanged.
+[ ] D.4  Bump BTP tag GIT_TAG v2.0.0 -> v2.1.0 no CMakeLists.txt. PENDENTE
+         (Fase E).
+[x] D.5  test_manifestclient: +sourceInfoIsParsedAndReportedOnFullAndNotModified.
+         anUnsupportedFormatVersionIsRejected agora usa formatVersion=3.
+         ManifestOptions.sourceInfo + escrita do bloco no helper.
+[x] D.6  cmake --build OK (92 alvos). ctest 39/39 PASSED
+         (test_manifestclient, test_device, test_devicesgrid,
+         test_deviceconnection, test_hubendpoint todos verdes).
+
+
+====================================================================
+FASE E - TAG + BUMP DOS PINS + HOMOLOGACAO
+====================================================================
+
+Ordem: rodar a bancada PRIMEIRO contra o codigo atual (BTP local sem tag,
+apps ainda em #v2.0.0 -- funciona, o formato 2 nao precisa de API nova da
+lib). Se a bancada passar, ai sim: tag BTP v2.1.0 + bump dos 3 pins + commits.
+
+[ ] E.0  Revisar a spec (commands.md 3.12) e o vetor com o co-dev.
+[ ] E.1  Reflashar OS + dongle, rebuild TraceView. Abrir projeto, conectar
+         o filho do hub.
+[ ] E.2  Card do robo (gear -> "Reported by device" -> Info:) mostra
+         fw_version, fw_build, chip, particao OTA, name/description.
+[ ] E.3  Self do dongle (device direto / enumeracao target=0) mostra a
+         tabela tambem (description, model, fw_version=git rev, chip, ...).
+[ ] E.4  `hub -manifest` no dongle: ingest_ok sobe, ingest_fail fica 0
+         (formato 2 do robo aceito).
+[ ] E.5  Editar `settings -set identity name "..."` no robo em runtime.
+         ESPERADO: aparece na conexao DIRETA B do TraceView na hora; na
+         visao do HUB so apos o robo reiniciar (limitacao conhecida -- o
+         dongle re-prima 1x por boot). Confirmar os dois comportamentos.
+[ ] E.6  Se E.1..E.5 ok:
+           - BTP: commit + `git tag v2.1.0` em main (c:\git\BTP).
+           - bally_OS: BTP.git -> #v2.1.0 (idf_component.yml/lib_deps).
+           - bally_dongle: platformio.ini BTP.git#v2.0.0 -> #v2.1.0.
+           - TraceView: CMakeLists.txt GIT_TAG v2.0.0 -> v2.1.0.
+           - commits nos 4 repos citando este plano.
+[ ] E.7  Registrar bancada aqui.
+
+
+====================================================================
+LOG DE EXECUCAO
+====================================================================
+
+2026-08-29  Plano criado. Decisoes 1-7 travadas.
+2026-08-29  FASE D (TraceView) implementada -- D.1/D.2/D.3/D.5/D.6 [x],
+            D.4 (pin) fica p/ a bancada. NAO commitado.
+            Repo c:\git\TraceView. Arquivos tocados:
+              lib/telemetry/deviceinforecord.h (novo) + lib/CMakeLists.txt
+              lib/protocol/manifestclient.h/.cpp   (parse + sinal)
+              lib/backend/backend.h                (sinal deviceInfoReported)
+              lib/protocol/btpbackend.h/.cpp       (m_sessionPeerSourceId +
+                                                    forward)
+              lib/core/deviceconnection.h/.cpp     (sinal espelhado)
+              lib/devices/device.h                 (Device::reportedInfo)
+              lib/devices/devicesgrid.h/.cpp       (setDeviceReportedInfo)
+              lib/devices/deviceconfigdialog.h/.cpp (QLabel "Info:")
+              lib/core/mainwindow.cpp              (connect + limpar no drop)
+              tests/test_manifestclient.cpp        (+1 caso, format 2 valido)
+            build OK, ctest 39/39.
+            PROXIMO: Fase E -- bancada + tag v2.1.0 + bump dos 3 pins.
+
+2026-08-29  FASE C (bally_dongle) implementada -- C.1/C.2/C.3/C.5/C.7 [x],
+            C.4 (pin) fica p/ a bancada, C.6 pulado. NAO commitado.
+            Repo c:\git\bally_dongle. Arquivos tocados:
+              lib/ManifestCache/ManifestCache.h/.cpp   (formato 2 + serialize)
+              lib/AppRuntime/AppRuntime.cpp             (buildDongleSourceInfo)
+              scripts/inject_git_rev.py (novo) + platformio.ini
+              test/test_manifest_cache/test_main.cpp    (+2 casos, ajustes)
+            native 104/104, firmware tdongle-s3 SUCCESS (flash 44.0%).
+            LIMITACAO CONHECIDA (documentar): o dongle re-prima o manifesto
+            do robo so 1x por boot (shouldRequestManifest gate em boot_id).
+            Uma edicao de source_info em runtime no robo (settings -set sem
+            reboot) so aparece na visao do hub apos o robo reiniciar -- ou
+            na hora pela conexao direta B do TraceView. Rollout (=reflash
+            =reboot) nao e afetado. Follow-up possivel: re-prime periodico
+            ou um source_info_revision leve.
+            PROXIMO: Fase D (TraceView manifestclient + card).
+
+2026-08-29  FASE B (bally_OS) implementada -- B.1/B.2/B.4/B.5 [x], falta B.3
+            (pin) que vai junto com a bancada. NAO commitado.
+            Repo c:\git\bally_OS. Arquivos tocados:
+              lib/ManifestResponder/ManifestResponder.h/.cpp  (formato 2)
+              lib/RobotSettings/RobotSettings.h/.cpp           (modulo identity)
+              utils/BallyRobot/BallyRobot.h/.cpp               (buildSourceInfo)
+              test/test_manifest_responder/test_main.cpp       (+1 caso, ajustes)
+            native 74/74, firmware esp32-s3 SUCCESS.
+            PROXIMO: Fase C (bally_dongle ManifestCache).
+
+2026-08-29  FASE A (BTP) implementada -- A.1..A.5 [x], falta so o commit/tag.
+            Repo c:\git\BTP, branch main, ainda NAO commitado.
+            Arquivos tocados:
+              docs/commands.md              (3.2, 3.3, nova 3.12, 6)
+              docs/session-and-terminal.md  (1.2)
+              test-vectors/v2/valid/manifest_data.json + .bin (novo)
+              test-vectors/v2/manifest.json (valid_vectors += manifest_data)
+              tests/test_conformance_v2.cpp (vetor no valid_vectors())
+              CMakeLists.txt / library.json / include/btp/codec.hpp (2.1.0)
+              README.md (versao)
+            ctest 8/8, mkdocs --strict OK, vetores --check OK.
+            PROXIMO: revisar a spec com o co-dev, commitar+taggear v2.1.0,
+            depois Fase B (bally_OS ManifestResponder).

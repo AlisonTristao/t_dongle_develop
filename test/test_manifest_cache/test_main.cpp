@@ -54,6 +54,12 @@ std::vector<uint8_t> fake_record(size_t contentLen) {
     return r;
 }
 
+struct InfoTriple {
+    std::string key;
+    std::string label;
+    std::string value;
+};
+
 struct BuildOpts {
     uint32_t refSrc = kDongleSrc;      // offset 0: the requester (== dongle src in the real flow)
     uint32_t describedSrc = kRobotSrc;
@@ -65,6 +71,9 @@ struct BuildOpts {
     uint16_t topicCount = 0U;
     std::vector<uint8_t> records{};
     std::string name = "robot";
+    // Only written when formatVersion >= 2 (BTP/docs/commands.md 3.12), as
+    // info_count then key/label/value utf8_u16 triples.
+    std::vector<InfoTriple> sourceInfo{};
 };
 
 std::vector<uint8_t> build_manifest_data(const BuildOpts& o) {
@@ -89,8 +98,28 @@ std::vector<uint8_t> build_manifest_data(const BuildOpts& o) {
     put_u16(b, 0U);              // [56] action_count
     put_u16(b, static_cast<uint16_t>(o.name.size()));  // [58] name_len
     for (char c : o.name) b.push_back(static_cast<uint8_t>(c));
+    if (o.formatVersion >= 2U) {
+        put_u16(b, static_cast<uint16_t>(o.sourceInfo.size()));  // info_count
+        for (const InfoTriple& e : o.sourceInfo) {
+            put_u16(b, static_cast<uint16_t>(e.key.size()));
+            for (char c : e.key) b.push_back(static_cast<uint8_t>(c));
+            put_u16(b, static_cast<uint16_t>(e.label.size()));
+            for (char c : e.label) b.push_back(static_cast<uint8_t>(c));
+            put_u16(b, static_cast<uint16_t>(e.value.size()));
+            for (char c : e.value) b.push_back(static_cast<uint8_t>(c));
+        }
+    }
     for (uint8_t x : o.records) b.push_back(x);
     return b;
+}
+
+// Reads a utf8_u16 from `data` at `*pos`, advancing past it.
+std::string take_utf8(const uint8_t* data, size_t* pos) {
+    const uint16_t len = get_u16(data + *pos);
+    *pos += 2U;
+    std::string s(reinterpret_cast<const char*>(data + *pos), len);
+    *pos += len;
+    return s;
 }
 
 bool ingest(const std::vector<uint8_t>& payload, uint32_t nowMs = 1000U) {
@@ -133,9 +162,13 @@ void test_ingest_then_serve_round_trips() {
     const size_t n = serve(kRobotSrc, out, sizeof(out));
     TEST_ASSERT_GREATER_THAN(60U, n);
     TEST_ASSERT_EQUAL_UINT8(0x00U, out[12]);            // status SUCCESS
-    TEST_ASSERT_EQUAL_UINT16(1U, get_u16(out + 16));    // format_version
+    TEST_ASSERT_EQUAL_UINT16(2U, get_u16(out + 16));    // this dongle always serves format 2
     TEST_ASSERT_EQUAL_HEX32(kRobotSrc, get_u32(out + 40));
     TEST_ASSERT_EQUAL_HEX32(kRobotBootA, get_u32(out + 44));
+
+    // A format-1 ingest still serves a valid (empty) source_info block.
+    size_t p = 60U + get_u16(out + 58);
+    TEST_ASSERT_EQUAL_UINT16(0U, get_u16(out + p));     // info_count
 
     d = ManifestCache::diagnostics();
     TEST_ASSERT_EQUAL_UINT32(1U, d.targetedRequestsRx);
@@ -316,6 +349,56 @@ void test_external_counters() {
     TEST_ASSERT_EQUAL_UINT32(1U, d.consumeRejected);
 }
 
+// --------------------------------------------------------------------------
+// A format-2 MANIFEST_DATA carries a source_info block between source_name and
+// the records (commands.md 3.12). The dongle stores it verbatim and re-emits
+// it byte for byte -- it relays the block, it does not interpret it. An entry
+// whose robot left a field empty (label here) round-trips with that field
+// empty.
+// --------------------------------------------------------------------------
+void test_source_info_block_round_trips_ingest_and_serve() {
+    BuildOpts o;
+    o.formatVersion = 2U;
+    o.topicCount = 1U;
+    o.records = fake_record(12U);
+    o.sourceInfo = {
+        {"fw_version", "Firmware", "1dd9fc5"},
+        {"name", "", "lab bench 2"},   // empty label, kept as-is
+    };
+    TEST_ASSERT_TRUE(ingest(build_manifest_data(o)));
+
+    uint8_t out[512] = {0};
+    const size_t n = serve(kRobotSrc, out, sizeof(out));
+    TEST_ASSERT_GREATER_THAN(60U, n);
+    TEST_ASSERT_EQUAL_UINT16(2U, get_u16(out + 16));
+
+    size_t p = 60U + get_u16(out + 58);          // past the fixed prefix + source_name
+    TEST_ASSERT_EQUAL_UINT16(2U, get_u16(out + p));  // info_count
+    p += 2U;
+    TEST_ASSERT_EQUAL_STRING("fw_version", take_utf8(out, &p).c_str());
+    TEST_ASSERT_EQUAL_STRING("Firmware", take_utf8(out, &p).c_str());
+    TEST_ASSERT_EQUAL_STRING("1dd9fc5", take_utf8(out, &p).c_str());
+    TEST_ASSERT_EQUAL_STRING("name", take_utf8(out, &p).c_str());
+    TEST_ASSERT_EQUAL_STRING("", take_utf8(out, &p).c_str());
+    TEST_ASSERT_EQUAL_STRING("lab bench 2", take_utf8(out, &p).c_str());
+    // the topic record still follows the block.
+    TEST_ASSERT_EQUAL_UINT16(1U, get_u16(out + 54));  // topic_count echoed
+    TEST_ASSERT_EQUAL_UINT32(12U, get_u32(out + p));  // record_size of the one topic record
+}
+
+// --------------------------------------------------------------------------
+// A source_info block bigger than this cache's budget invalidates the whole
+// ingest -- same degraded-but-bounded rule kMaxRecordsBytes uses. The
+// manifest is simply not cached.
+// --------------------------------------------------------------------------
+void test_oversized_source_info_block_rejects_the_ingest() {
+    BuildOpts o;
+    o.formatVersion = 2U;
+    o.sourceInfo = {{"k", "l", std::string(ManifestCache::kMaxSourceInfoBytes, 'x')}};
+    TEST_ASSERT_FALSE(ingest(build_manifest_data(o)));
+    TEST_ASSERT_EQUAL_size_t(0U, ManifestCache::diagnostics().entryCount);
+}
+
 void test_reference_source_id_is_not_checked_here() {
     // ingestManifestData() itself does NOT validate offset 0 -- the
     // reference_source_id == self_source_id gate lives upstream in
@@ -338,6 +421,8 @@ int main() {
     RUN_TEST(test_shouldRequest_fast_then_steady_cadence);
     RUN_TEST(test_shouldRequest_attempts_do_not_reset_on_boot_change);
     RUN_TEST(test_successful_ingest_clears_the_pending_chase_and_next_chase_is_fast_again);
+    RUN_TEST(test_source_info_block_round_trips_ingest_and_serve);
+    RUN_TEST(test_oversized_source_info_block_rejects_the_ingest);
     RUN_TEST(test_external_counters);
     RUN_TEST(test_reference_source_id_is_not_checked_here);
     return UNITY_END();

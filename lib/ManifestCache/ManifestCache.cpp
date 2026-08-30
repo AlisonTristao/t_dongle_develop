@@ -41,6 +41,12 @@ struct Entry {
     std::uint16_t actionCount = 0U;
     std::uint8_t records[kMaxRecordsBytes];
     std::size_t recordsSize = 0U;
+    // Verbatim source_info block from this source's MANIFEST_DATA (commands.md
+    // 3.12), info_count prefix included. Always >= 2 octets once used: a
+    // format-1 source, or a format-2 one with no entries, both land here as a
+    // bare "00 00". Re-emitted as-is.
+    std::uint8_t sourceInfo[kMaxSourceInfoBytes] = {};
+    std::uint16_t sourceInfoSize = 0U;
     std::uint32_t lastSeenMs = 0U;
 };
 
@@ -59,6 +65,15 @@ Entry g_entries[kCapacity];
 PendingRequest g_pending[kCapacity];
 std::uint32_t g_catalogRevision = 1U;
 std::uint8_t g_selfUuid[16] = {};
+
+// This dongle's own serialized source_info block (commands.md 3.12), set by
+// configure() from AppRuntime. Borrowed pointer; nullptr means "serve an
+// empty block for self".
+const std::uint8_t* g_selfSourceInfo = nullptr;
+std::size_t g_selfSourceInfoSize = 0U;
+// A valid empty block (info_count = 0), re-used for a format-1 robot and
+// wherever a source has no info of its own.
+const std::uint8_t kEmptySourceInfo[2] = {0U, 0U};
 
 // Diagnostico (plano 36 fase 0a). volatile, mesmo estilo dos contadores de
 // EspNowConfig -- RX roda na task WiFi, o shell le na main.
@@ -252,6 +267,7 @@ std::size_t writeManifestData(const btp::Header& requestHeader, std::uint8_t sta
                               std::uint16_t errorCode, std::uint16_t catalogIndex, std::uint16_t catalogCount,
                               std::uint32_t configRevision, const std::uint8_t* uuid, std::uint32_t describedSourceId,
                               std::uint32_t describedBootId, std::uint8_t role, bool online, const char* name,
+                              const std::uint8_t* sourceInfo, std::size_t sourceInfoSize,
                               const std::uint8_t* recordsBlob, std::size_t recordsBlobSize,
                               std::uint16_t cachedTopicCount, std::uint16_t cachedActionCount, std::uint8_t* output,
                               std::size_t capacity) noexcept {
@@ -273,6 +289,15 @@ std::size_t writeManifestData(const btp::Header& requestHeader, std::uint8_t sta
     if (!writer.reserveU16(&topicCountOffset) || !writer.reserveU16(&actionCountOffset)) return 0U;
     if (!writer.utf8(name != nullptr ? name : "")) return 0U;
 
+    // source_info block (commands.md 3.12) -- always present in format 2,
+    // NOT_MODIFIED and error responses included. Emitted verbatim (the block
+    // already carries its own info_count); a source with none gets "00 00".
+    if (sourceInfo != nullptr && sourceInfoSize >= 2U) {
+        if (!writer.bytes(sourceInfo, sourceInfoSize)) return 0U;
+    } else if (!writer.u16(0U)) {
+        return 0U;
+    }
+
     std::uint16_t topicsWritten = 0U;
     std::uint16_t actionsWritten = 0U;
     if (recordsBlob != nullptr && recordsBlobSize > 0U) {
@@ -286,8 +311,35 @@ std::size_t writeManifestData(const btp::Header& requestHeader, std::uint8_t sta
 
 }  // namespace
 
-void configure(const std::uint8_t selfUuid[16]) noexcept {
+std::size_t serializeSourceInfo(const SourceInfoEntry* entries, std::size_t count,
+                                std::uint8_t* output, std::size_t capacity) noexcept {
+    Writer writer(output, capacity);
+    std::size_t countOffset = 0U;
+    if (!writer.reserveU16(&countOffset)) return 0U;
+
+    std::uint16_t written = 0U;
+    for (std::size_t i = 0U; i < count && written < 0xFFFFU; ++i) {
+        const char* value = (entries == nullptr) ? nullptr : entries[i].value;
+        if (value == nullptr || value[0] == '\0') continue;  // unset field: skipped, not emitted
+        if (!writer.utf8(entries[i].key) || !writer.utf8(entries[i].label) || !writer.utf8(value)) {
+            return 0U;
+        }
+        ++written;
+    }
+    writer.patchU16(countOffset, written);
+    return writer.size();
+}
+
+void configure(const std::uint8_t selfUuid[16], const std::uint8_t* selfSourceInfo,
+               std::size_t selfSourceInfoSize) noexcept {
     if (selfUuid != nullptr) std::memcpy(g_selfUuid, selfUuid, 16U);
+    if (selfSourceInfo != nullptr && selfSourceInfoSize >= 2U) {
+        g_selfSourceInfo = selfSourceInfo;
+        g_selfSourceInfoSize = selfSourceInfoSize;
+    } else {
+        g_selfSourceInfo = nullptr;
+        g_selfSourceInfoSize = 0U;
+    }
 }
 
 bool shouldRequestManifest(std::uint32_t sourceId, std::uint32_t bootId, std::uint32_t nowMs) noexcept {
@@ -341,7 +393,9 @@ static bool ingestManifestDataImpl(btp::ByteView payload, std::uint32_t nowMs) n
     const std::uint8_t flags = payload.data[13];
     const bool notModified = (flags & kFlagNotModified) != 0U;
     const std::uint16_t formatVersion = read_u16_le(payload.data + 16U);
-    if (formatVersion != kManifestFormatVersion) return false;
+    // Accept a format-1 robot too (treated as an empty source_info block) so a
+    // fleet mid-rollout still populates the cache; reject anything newer.
+    if (formatVersion != 1U && formatVersion != 2U) return false;
 
     const std::uint32_t configRevision = read_u32_le(payload.data + 20U);
     const std::uint8_t* uuid = payload.data + 24U;
@@ -357,7 +411,34 @@ static bool ingestManifestDataImpl(btp::ByteView payload, std::uint32_t nowMs) n
     const std::uint16_t nameLen = read_u16_le(payload.data + 58U);
     const std::size_t nameStart = 60U;
     if (nameStart + static_cast<std::size_t>(nameLen) > payload.size) return false;
-    const std::size_t recordsStart = nameStart + nameLen;
+
+    // source_info block sits between source_name and the records in format 2
+    // (commands.md 3.12): info_count:u16 then that many { key, label, value }
+    // utf8_u16 triples. Walk it to find where the records begin -- info_count
+    // makes its end unambiguous even with records right after it. Format 1
+    // has no block; synthesize an empty one.
+    const std::size_t infoStart = nameStart + nameLen;
+    std::size_t recordsStart = infoStart;
+    const std::uint8_t* infoBlob = kEmptySourceInfo;
+    std::size_t infoSize = sizeof(kEmptySourceInfo);
+    if (formatVersion >= 2U) {
+        if (infoStart + 2U > payload.size) return false;
+        const std::uint16_t infoCount = read_u16_le(payload.data + infoStart);
+        std::size_t pos = infoStart + 2U;
+        for (std::uint16_t entryIdx = 0U; entryIdx < infoCount; ++entryIdx) {
+            for (int field = 0; field < 3; ++field) {
+                if (pos + 2U > payload.size) return false;
+                const std::uint16_t len = read_u16_le(payload.data + pos);
+                pos += 2U;
+                if (pos + len > payload.size || pos + len < pos) return false;  // overflow-safe
+                pos += len;
+            }
+        }
+        recordsStart = pos;
+        infoSize = recordsStart - infoStart;
+        if (infoSize > kMaxSourceInfoBytes) return false;  // beyond this cache's budget
+        infoBlob = payload.data + infoStart;
+    }
     const std::size_t recordsSize = payload.size - recordsStart;
 
     if (notModified) {
@@ -392,6 +473,12 @@ static bool ingestManifestDataImpl(btp::ByteView payload, std::uint32_t nowMs) n
     entry->online = (sourceFlags & 0x01U) != 0U;
     entry->configRevision = configRevision;
     entry->lastSeenMs = nowMs;
+
+    // source_info is not gated by config_revision (commands.md 3.12): refresh
+    // it from every response, NOT_MODIFIED included, the same as uuid/online
+    // above and unlike name/records below.
+    std::memcpy(entry->sourceInfo, infoBlob, infoSize);
+    entry->sourceInfoSize = static_cast<std::uint16_t>(infoSize);
 
     if (!notModified) {
         const std::size_t copyLen = (nameLen < kMaxNameLength) ? nameLen : kMaxNameLength;
@@ -435,6 +522,8 @@ void resetForTests() noexcept {
     for (PendingRequest& pending : g_pending) pending = PendingRequest{};
     g_catalogRevision = 1U;
     std::memset(g_selfUuid, 0, sizeof(g_selfUuid));
+    g_selfSourceInfo = nullptr;
+    g_selfSourceInfoSize = 0U;
     g_diagPrimeSent = 0U;
     g_diagIngestOk = 0U;
     g_diagIngestFail = 0U;
@@ -507,8 +596,8 @@ std::size_t buildEnumerationResponse(std::size_t index, const btp::Header& reque
         return writeManifestData(requestHeader, kStatusSuccess, flags, kErrorNone,
                                  static_cast<std::uint16_t>(index), static_cast<std::uint16_t>(total),
                                  kSelfConfigRevision, g_selfUuid, BtpTransport::sourceId(), BtpTransport::bootId(),
-                                 kSourceRoleDongle, /*online=*/true, kSelfName, selfRecords, selfRecordsSize,
-                                 selfTopicCount, 0U, output, outputCapacity);
+                                 kSourceRoleDongle, /*online=*/true, kSelfName, g_selfSourceInfo, g_selfSourceInfoSize,
+                                 selfRecords, selfRecordsSize, selfTopicCount, 0U, output, outputCapacity);
     }
 
     Entry* sorted[kCapacity];
@@ -519,8 +608,9 @@ std::size_t buildEnumerationResponse(std::size_t index, const btp::Header& reque
 
     return writeManifestData(requestHeader, kStatusSuccess, flags, kErrorNone, static_cast<std::uint16_t>(index),
                              static_cast<std::uint16_t>(total), entry->configRevision, entry->uuid, entry->sourceId,
-                             entry->bootId, entry->role, entry->online, entry->name, entry->records,
-                             entry->recordsSize, entry->topicCount, entry->actionCount, output, outputCapacity);
+                             entry->bootId, entry->role, entry->online, entry->name, entry->sourceInfo,
+                             entry->sourceInfoSize, entry->records, entry->recordsSize, entry->topicCount,
+                             entry->actionCount, output, outputCapacity);
 }
 
 std::size_t buildTargetedResponse(std::uint32_t targetSourceId, std::uint32_t targetBootId,
@@ -540,15 +630,15 @@ std::size_t buildTargetedResponse(std::uint32_t targetSourceId, std::uint32_t ta
 
     if (!isSelf && entry == nullptr) {
         return writeManifestData(requestHeader, kStatusRejected, kFlagCatalogComplete, kErrorNotFound, 0U, 1U, 0U,
-                                 nullptr, 0U, 0U, 0U, false, "unknown source", nullptr, 0U, 0U, 0U, output,
-                                 outputCapacity);
+                                 nullptr, 0U, 0U, 0U, false, "unknown source", nullptr, 0U, nullptr, 0U, 0U, 0U,
+                                 output, outputCapacity);
     }
 
     const std::uint32_t foundBootId = isSelf ? BtpTransport::bootId() : entry->bootId;
     if (targetBootId != 0U && targetBootId != foundBootId) {
         return writeManifestData(requestHeader, kStatusRejected, kFlagCatalogComplete, kErrorStaleTargetBoot, 0U, 1U,
-                                 0U, nullptr, 0U, 0U, 0U, false, "boot mismatch", nullptr, 0U, 0U, 0U, output,
-                                 outputCapacity);
+                                 0U, nullptr, 0U, 0U, 0U, false, "boot mismatch", nullptr, 0U, nullptr, 0U, 0U, 0U,
+                                 output, outputCapacity);
     }
 
     const std::uint32_t foundRevision = isSelf ? kSelfConfigRevision : entry->configRevision;
@@ -556,12 +646,15 @@ std::size_t buildTargetedResponse(std::uint32_t targetSourceId, std::uint32_t ta
     const std::uint8_t foundRole = isSelf ? kSourceRoleDongle : entry->role;
     const bool foundOnline = isSelf ? true : entry->online;
     const char* foundName = isSelf ? kSelfName : entry->name;
+    const std::uint8_t* foundSourceInfo = isSelf ? g_selfSourceInfo : entry->sourceInfo;
+    const std::size_t foundSourceInfoSize = isSelf ? g_selfSourceInfoSize : entry->sourceInfoSize;
 
     if (knownRevision != 0U && knownRevision == foundRevision) {
         return writeManifestData(requestHeader, kStatusSuccess,
                                  static_cast<std::uint8_t>(kFlagNotModified | kFlagCatalogComplete), kErrorNone, 0U,
                                  1U, foundRevision, foundUuid, targetSourceId, foundBootId, foundRole, foundOnline,
-                                 foundName, nullptr, 0U, 0U, 0U, output, outputCapacity);
+                                 foundName, foundSourceInfo, foundSourceInfoSize, nullptr, 0U, 0U, 0U, output,
+                                 outputCapacity);
     }
 
     // Topico 27: a MANIFEST_REQUEST targeted at BtpTransport::sourceId() is
@@ -580,8 +673,9 @@ std::size_t buildTargetedResponse(std::uint32_t targetSourceId, std::uint32_t ta
     const std::uint16_t actionCount = isSelf ? 0U : entry->actionCount;
 
     return writeManifestData(requestHeader, kStatusSuccess, kFlagCatalogComplete, kErrorNone, 0U, 1U, foundRevision,
-                             foundUuid, targetSourceId, foundBootId, foundRole, foundOnline, foundName, records,
-                             recordsSize, topicCount, actionCount, output, outputCapacity);
+                             foundUuid, targetSourceId, foundBootId, foundRole, foundOnline, foundName, foundSourceInfo,
+                             foundSourceInfoSize, records, recordsSize, topicCount, actionCount, output,
+                             outputCapacity);
 }
 
 bool lookupTopicMaxRateMillihz(std::uint32_t sourceId, std::uint32_t topicId,

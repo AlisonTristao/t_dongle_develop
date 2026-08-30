@@ -39,7 +39,11 @@ namespace ManifestCache {
 
 constexpr std::uint16_t kManifestRequestObjectId = 0x0003U;
 constexpr std::uint16_t kManifestDataObjectId = 0x0004U;
-constexpr std::uint16_t kManifestFormatVersion = 1U;
+// Format 2 (BTP/docs/commands.md section 3.12) adds the source_info block
+// after source_name. This dongle emits format 2 for every source it serves
+// -- its own self-description and every cached robot -- and ingests format 1
+// or 2 from a robot (format 1 is treated as an empty source_info block).
+constexpr std::uint16_t kManifestFormatVersion = 2U;
 
 constexpr std::uint8_t kSourceRoleRobot = 0x01U;
 constexpr std::uint8_t kSourceRoleDongle = 0x02U;
@@ -58,6 +62,15 @@ constexpr std::size_t kCapacity = 8U;
 constexpr std::size_t kMaxRecordsBytes = 2048U;
 constexpr std::size_t kMaxNameLength = 64U;
 
+// Per-source source_info block (commands.md section 3.12): info_count:u16
+// then that many { key, label, value } utf8_u16 triples, stored and
+// re-emitted verbatim (info_count prefix included), the same way records
+// are. commands.md section 6 caps the wire at 32 entries; a robot in
+// practice sends well under 400 octets. A block larger than this is
+// dropped whole (the manifest is still cached, just without its info) --
+// same degraded-but-bounded rule as kMaxRecordsBytes.
+constexpr std::size_t kMaxSourceInfoBytes = 512U;
+
 // Minimum time between two MANIFEST_REQUESTs this dongle sends to the same
 // (source_id, boot_id) while waiting for a reply, so a 50Hz TELEMETRY stream
 // from a not-yet-cached robot does not flood it with duplicate requests.
@@ -74,7 +87,32 @@ constexpr std::uint32_t kRequestCooldownMs = 3000U;
 constexpr std::uint32_t kFastRequestCooldownMs = 1000U;
 constexpr std::uint32_t kFastRequestAttempts = 3U;
 
-void configure(const std::uint8_t selfUuid[16]) noexcept;
+// One source_info entry (commands.md section 3.12), used only to build this
+// dongle's OWN block via serializeSourceInfo(). `key` is a stable machine
+// identifier ("fw_version"), `label` a display name ("Firmware", may be
+// empty), `value` the datum as text. Cached robots' blocks arrive already
+// serialized in their MANIFEST_DATA and are never rebuilt from entries.
+struct SourceInfoEntry {
+    const char* key;
+    const char* label;
+    const char* value;
+};
+
+// Serializes `entries` (skipping any whose value is empty -- the same rule
+// bally_OS's ManifestResponder uses, so an unset field simply does not
+// appear) into a source_info block: info_count:u16 then the surviving
+// triples. Returns bytes written, or 0 if `capacity` is too small. The
+// caller passes the result to configure() as this dongle's self block.
+std::size_t serializeSourceInfo(const SourceInfoEntry* entries, std::size_t count,
+                                std::uint8_t* output, std::size_t capacity) noexcept;
+
+// `selfSourceInfo`/`selfSourceInfoSize` is this dongle's own serialized
+// source_info block (from serializeSourceInfo). Borrowed, must outlive the
+// cache; nullptr / 0 means "no info" and the self descriptor then carries an
+// empty block.
+void configure(const std::uint8_t selfUuid[16],
+               const std::uint8_t* selfSourceInfo = nullptr,
+               std::size_t selfSourceInfoSize = 0U) noexcept;
 
 // True if this dongle has no usable manifest for (sourceId, bootId) yet
 // (never cached, or cached under a different boot_id -- i.e. the peer
