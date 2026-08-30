@@ -494,26 +494,60 @@ bool DatabaseStore::logCommandWithOutput(const char* command, const char* output
         return false;
     }
 
+    // Bound parameters instead of a concatenated SQL string built with
+    // escapeSqlText(): the command output can be ~1.5 KB (a full module help
+    // dump when someone types a bare "dongle"), and folding that into the
+    // statement text -- then handing it to sqlite3_exec's tokenizer/parser --
+    // ran the loopTask's 8 KB stack out on device (topico 34/35 boot-heap
+    // notes). sqlite3_bind_text copies the blob straight into the prepared
+    // statement without the parser or an extra String temp ever seeing it.
+    if (!lockDb()) {
+        return false;
+    }
+    if (db_ == nullptr) {
+        unlockDb();
+        return false;
+    }
+
     const int64_t now = currentEpochSeconds();
-    const String sourceText = (source != nullptr) ? source : "serial";
-    const String outputText = (output != nullptr) ? output : "";
+    const char* sourceText = (source != nullptr && source[0] != '\0') ? source : "serial";
+    const char* outputText = (output != nullptr) ? output : "";
 
-    String sql;
-    sql.reserve(760);
-    sql += "INSERT INTO command_log(command,source,created_at) VALUES('";
-    sql += escapeSqlText(String(command));
-    sql += "','";
-    sql += escapeSqlText(sourceText);
-    sql += "',";
-    sql += String(static_cast<long long>(now));
-    sql += ");";
-    sql += "INSERT INTO command_log_output(log_id,output,created_at) VALUES(last_insert_rowid(),'";
-    sql += escapeSqlText(outputText);
-    sql += "',";
-    sql += String(static_cast<long long>(now));
-    sql += ");";
+    bool ok = false;
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(
+            db_,
+            "INSERT INTO command_log(command,source,created_at) VALUES(?1,?2,?3);",
+            -1, &stmt, nullptr) == SQLITE_OK && stmt != nullptr) {
+        sqlite3_bind_text(stmt, 1, command, -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 2, sourceText, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(stmt, 3, now);
+        ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    }
+    sqlite3_finalize(stmt);
+    stmt = nullptr;
 
-    return executeNoResult(sql);
+    if (ok) {
+        const sqlite3_int64 logId = sqlite3_last_insert_rowid(db_);
+        ok = false;
+        if (sqlite3_prepare_v2(
+                db_,
+                "INSERT INTO command_log_output(log_id,output,created_at) VALUES(?1,?2,?3);",
+                -1, &stmt, nullptr) == SQLITE_OK && stmt != nullptr) {
+            sqlite3_bind_int64(stmt, 1, logId);
+            sqlite3_bind_text(stmt, 2, outputText, -1, SQLITE_STATIC);
+            sqlite3_bind_int64(stmt, 3, now);
+            ok = (sqlite3_step(stmt) == SQLITE_DONE);
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    if (!ok) {
+        logLine(String("[database] SQL error: ") + sqlite3_errmsg(db_));
+    }
+
+    unlockDb();
+    return ok;
 }
 
 bool DatabaseStore::logOutgoingEspNow(const uint8_t mac[6], btp::MessageType type, const uint8_t* payload, size_t payloadSize, bool delivered) {

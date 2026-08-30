@@ -261,7 +261,17 @@ std::string runLine(const std::string& command, const std::string& source, std::
     }
 
     if (!skipCommandPersistence && !isRepeatOfLastCommand && ctx.database != nullptr && ctx.database->isReady()) {
-        if (!ctx.database->logCommandWithOutput(normalized.c_str(), combinedText.c_str(), source.c_str())) {
+        // The caller (BTP terminal / TraceView) still gets the full text via
+        // outFullText above; only the persisted copy is capped. A bare "dongle"
+        // -- or any unknown verb on a known module -- yields that module's whole
+        // help dump (~1.5 KB), and there is nothing worth keeping in command_log
+        // past the first few lines. Bounding it here also bounds the transient
+        // footprint of the DB write, which shares the shell's call stack.
+        static constexpr size_t kMaxPersistedOutput = 512;
+        const std::string persistedText = (combinedText.size() > kMaxPersistedOutput)
+            ? combinedText.substr(0, kMaxPersistedOutput) + "\n... (saida truncada no log)"
+            : combinedText;
+        if (!ctx.database->logCommandWithOutput(normalized.c_str(), persistedText.c_str(), source.c_str())) {
             ShellCommandSupport::warnWithCode(AppError::Code::DATABASE_COMMAND_LOG_FAILED, "falha ao persistir log de comando");
         }
     }
