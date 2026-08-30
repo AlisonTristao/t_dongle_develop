@@ -254,6 +254,11 @@ lib). Se a bancada passar, ai sim: tag BTP v2.1.0 + bump dos 3 pins + commits.
          ESPERADO: aparece na conexao DIRETA B do TraceView na hora; na
          visao do HUB so apos o robo reiniciar (limitacao conhecida -- o
          dongle re-prima 1x por boot). Confirmar os dois comportamentos.
+[ ] E.5b OTA endpoint: card do robo mostra "OTA endpoint: ballyrobot.local".
+         Abrir engrenagem -> campo "OTA Address" vazio mostra placeholder
+         "device reports: ballyrobot.local" + botao "Use reported"; clicar
+         preenche. Campo ja preenchido != reportado -> botao aparece;
+         == reportado -> some. Nunca sobrescreve sozinho.
 [ ] E.6  Se E.1..E.5 ok:
            - BTP: commit + `git tag v2.1.0` em main (c:\git\BTP).
            - bally_OS: BTP.git -> #v2.1.0 (idf_component.yml/lib_deps).
@@ -268,6 +273,33 @@ LOG DE EXECUCAO
 ====================================================================
 
 2026-08-29  Plano criado. Decisoes 1-7 travadas.
+
+2026-08-29  EXTRA (pedido do usuario): ota_endpoint reportado + auto-fill.
+            bally_OS:
+              - BallyRobot.cpp buildSourceInfo(): +entrada "ota_endpoint" =
+                "<ota_hostname>.local" (settings.data().ota_hostname; TraceView
+                so trata *.local como mDNS). Slice no source_info_scratch_.
+              - ManifestResponder: build_manifest_data agora TRUNCA o
+                source_info por orcamento (kRecordsReserveBytes=256) em vez de
+                falhar a resposta inteira quando name+description longos
+                estouram os 600 do send_logical. info_count = o que coube; os
+                topic records (schema) sempre ganham prioridade. Writer ganhou
+                reserveU16/patchU16. +test_source_info_truncates_before_
+                crowding_out_the_topic_records. native 82/82.
+            TraceView:
+              - DeviceConfigDialog: campo "OTA Address" ganha botao
+                "Use reported" (QToolButton) ao lado. setReportedInfo() extrai
+                a key "ota_endpoint" -> placeholder "device reports: X" +
+                botao visivel so quando o valor reportado difere do digitado.
+                Nunca sobrescreve sozinho (otaAddress e config persistida).
+                updateReportedOtaHint() + textChanged do campo re-avalia.
+            Arquivos: bally_OS BallyRobot.cpp, ManifestResponder.h/.cpp,
+              test_manifest_responder; TraceView deviceconfigdialog.h/.cpp.
+            VERIFICADO: bally_OS native 82/82, firmware esp32-s3 SUCCESS;
+            TraceView build OK, ctest 41/41.
+            OBS: ha co-dev buildando o TraceView em paralelo (colisao de
+            .ninja_deps / obj truncado uma vez -- resolvido com rebuild).
+
 2026-08-29  FASE D (TraceView) implementada -- D.1/D.2/D.3/D.5/D.6 [x],
             D.4 (pin) fica p/ a bancada. NAO commitado.
             Repo c:\git\TraceView. Arquivos tocados:
