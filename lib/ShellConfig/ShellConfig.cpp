@@ -262,8 +262,11 @@ std::string runLine(const std::string& command, const std::string& source, std::
     // the shell-execution boundary and hands back plain text -- the BTP
     // terminal (ShellOutput::renderResponse) is the single place that
     // re-applies colour, and COMMAND_RESULT / the command_log stay escape-free.
-    combinedText = shell_strip_sgr(combinedText);
-    output = shell_strip_sgr(output);
+    // Nothing adds SGR in a no-colour build, so skip the two copies then.
+    if (shell_color_enabled()) {
+        combinedText = shell_strip_sgr(combinedText);
+        output = shell_strip_sgr(output);
+    }
 
     if (outFullText != nullptr) {
         *outFullText = combinedText;

@@ -3,6 +3,7 @@
 #include <ShellStyle.h>
 
 #include <cstring>
+#include <string_view>
 
 namespace {
 
@@ -351,8 +352,10 @@ std::string renderResponse(const std::string& response) {
     // framework messages, and ShellConfig::runLine strips it before handing the
     // text back -- but be defensive). Strip first so this function is the one
     // place that decides a terminal line's colour, keeping the "! " prefix and
-    // the colour in agreement.
-    String text = String(shell_strip_sgr(response).c_str());
+    // the colour in agreement. Nothing upstream adds SGR in a no-colour build,
+    // so skip the copy then.
+    String text = shell_color_enabled() ? String(shell_strip_sgr(response).c_str())
+                                        : String(response.c_str());
     text.replace("\r\n", "\n");
     text.replace('\r', '\n');
     text.trim();
@@ -376,7 +379,10 @@ std::string renderResponse(const std::string& response) {
         if (line.length() > 0) {
             // Classify the raw line (before stripLeadingBracketTags eats a
             // leading "[help]" / ESP-NOW "[error]" tag the classifier keys on).
-            const ShellMsgClass cls = shell_classify_line(std::string(line.c_str()));
+            // std::string_view straight off the Arduino String buffer -- no copy.
+            const ShellMsgClass cls = shell_color_enabled()
+                ? shell_classify_line(std::string_view(line.c_str(), line.length()))
+                : ShellMsgClass::Output;
             if (isEspNowStructuredLine(line)) {
                 appendLineWithPrefix(out, nullptr, line, cls);
             } else {
