@@ -4,6 +4,8 @@
 #include "SerialMux.h"
 #include "ShellOutput.h"
 
+#include <ShellStyle.h>
+
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -107,45 +109,22 @@ uint16_t lcdColorForLine(const string& text) {
         return panelColor;
     };
 
-    string lower = text;
-    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) {
-        return static_cast<char>(std::tolower(ch));
-    });
-
-    const auto hasAny = [&lower](std::initializer_list<const char*> terms) {
-        for (const char* term : terms) {
-            if (lower.find(term) != string::npos) {
-                return true;
-            }
-        }
-        return false;
-    };
-
-    if (hasAny({"erro", "error", "falha", "failed", "invalid", "invalido"})) {
-        return toPanelColor(ST77XX_RED);
+    // Same classification the BTP terminal uses for its ANSI colours
+    // (TinyShell ShellStyle), mapped onto the four panel colours -- so the LCD
+    // and the terminal always agree on what a line "is".
+    switch (shell_classify_line(text)) {
+        case ShellMsgClass::Error:
+            return toPanelColor(ST77XX_RED);
+        case ShellMsgClass::Warning:
+        case ShellMsgClass::Help:
+            return toPanelColor(ST77XX_YELLOW);
+        case ShellMsgClass::Success:
+            return toPanelColor(ST77XX_GREEN);
+        case ShellMsgClass::Output:
+        case ShellMsgClass::Muted:
+        default:
+            return toPanelColor(ST77XX_WHITE);
     }
-
-    if (hasAny({"warning", "warn", "aviso", "atencao"}) || lower.rfind("[help]", 0) == 0) {
-        return toPanelColor(ST77XX_YELLOW);
-    }
-
-    if (hasAny({
-            "sucesso",
-            "success",
-            "inicializado",
-            "atualizado",
-            "enviado",
-            "adicionado",
-            "removido",
-            "ligado",
-            "desligado",
-            "limpo",
-            "pong"
-        })) {
-        return toPanelColor(ST77XX_GREEN);
-    }
-
-    return toPanelColor(ST77XX_WHITE);
 }
 
 } // namespace

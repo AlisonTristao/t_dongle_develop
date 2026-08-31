@@ -1,5 +1,7 @@
 #include "ShellOutput.h"
 
+#include <ShellStyle.h>
+
 #include <cstring>
 
 namespace {
@@ -111,14 +113,24 @@ String normalizeNewlines(const char* text) {
 }
 
 // String counterpart of the per-line half of writeLine()/writeRawLine():
-// appends `line` to `out` with the given prefix and a CR+LF terminator. Only
-// the single-line, non-empty case renderResponse() needs.
-void appendLineWithPrefix(std::string& out, const char* prefix, const String& line) {
+// appends `line` to `out` with the given prefix and a CR+LF terminator, the
+// whole thing wrapped in the SGR sequence for `cls` (a no-op when the class is
+// Output or the firmware was built without TINYSHELL_COLOR). Only the
+// single-line, non-empty case renderResponse() needs.
+void appendLineWithPrefix(std::string& out, const char* prefix, const String& line,
+                          ShellMsgClass cls = ShellMsgClass::Output) {
+    const char* sgr = shell_sgr(cls);
     out += '\r';
+    if (sgr[0] != '\0') {
+        out += sgr;
+    }
     if (prefix != nullptr) {
         out += prefix;
     }
     out += line.c_str();
+    if (sgr[0] != '\0') {
+        out += shell_sgr_reset();
+    }
     out += "\r\n";
 }
 
@@ -335,7 +347,12 @@ void printResponse(Stream& io, const std::string& response) {
 }
 
 std::string renderResponse(const std::string& response) {
-    String text = String(response.c_str());
+    // The response may already carry ShellStyle SGR (TinyShell colours its own
+    // framework messages, and ShellConfig::runLine strips it before handing the
+    // text back -- but be defensive). Strip first so this function is the one
+    // place that decides a terminal line's colour, keeping the "! " prefix and
+    // the colour in agreement.
+    String text = String(shell_strip_sgr(response).c_str());
     text.replace("\r\n", "\n");
     text.replace('\r', '\n');
     text.trim();
@@ -357,13 +374,16 @@ std::string renderResponse(const std::string& response) {
 
         line.trim();
         if (line.length() > 0) {
+            // Classify the raw line (before stripLeadingBracketTags eats a
+            // leading "[help]" / ESP-NOW "[error]" tag the classifier keys on).
+            const ShellMsgClass cls = shell_classify_line(std::string(line.c_str()));
             if (isEspNowStructuredLine(line)) {
-                appendLineWithPrefix(out, nullptr, line);
+                appendLineWithPrefix(out, nullptr, line, cls);
             } else {
                 const String cleanLine = stripLeadingBracketTags(line);
                 if (cleanLine.length() > 0) {
                     appendLineWithPrefix(out, hasVisualPrefix(cleanLine.c_str()) ? nullptr : kOutputPrefix,
-                                         cleanLine);
+                                         cleanLine, cls);
                 }
             }
         }

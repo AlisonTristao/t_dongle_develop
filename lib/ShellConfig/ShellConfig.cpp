@@ -9,6 +9,8 @@
 #include "SudoCommands.h"
 #include "error_codes.h"
 
+#include <ShellStyle.h>
+
 #include <Arduino.h>
 #include <Esp.h>
 #include <esp_heap_caps.h>
@@ -255,6 +257,13 @@ std::string runLine(const std::string& command, const std::string& source, std::
     if (combinedText.empty()) {
         combinedText = "(sem saida textual)";
     }
+
+    // TINYSHELL_COLOR: TinyShell colours its own framework messages. runLine is
+    // the shell-execution boundary and hands back plain text -- the BTP
+    // terminal (ShellOutput::renderResponse) is the single place that
+    // re-applies colour, and COMMAND_RESULT / the command_log stay escape-free.
+    combinedText = shell_strip_sgr(combinedText);
+    output = shell_strip_sgr(output);
 
     if (outFullText != nullptr) {
         *outFullText = combinedText;
