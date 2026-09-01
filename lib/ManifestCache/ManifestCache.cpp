@@ -2,6 +2,7 @@
 
 #include <BtpTransport.h>
 #include <DonglePublisher.h>
+#include <btp/messages.hpp>
 
 #include <cstring>
 
@@ -379,38 +380,54 @@ bool shouldRequestManifest(std::uint32_t sourceId, std::uint32_t bootId, std::ui
 
 std::size_t buildRequest(std::uint32_t targetSourceId, std::uint32_t targetBootId, std::uint32_t knownRevision,
                          std::uint8_t* output, std::size_t outputCapacity) noexcept {
-    Writer writer(output, outputCapacity);
-    if (!writer.u32(targetSourceId) || !writer.u32(targetBootId) || !writer.u32(knownRevision)) return 0U;
-    return writer.size();
+    btp::ManifestRequest request{};
+    request.target_source_id = targetSourceId;
+    request.target_boot_id = targetBootId;
+    request.known_config_revision = knownRevision;
+
+    std::size_t written = 0U;
+    if (btp::encode_manifest_request(request, output, outputCapacity, &written) != btp::MessageError::Ok) {
+        return 0U;
+    }
+    return written;
 }
 
 static bool ingestManifestDataImpl(btp::ByteView payload, std::uint32_t nowMs) noexcept {
-    if (payload.data == nullptr || payload.size < 60U) return false;
+    // The MANIFEST_DATA fixed head (commands.md section 3.3) is now
+    // btp::ManifestReader::header(): the request-reference, the status/role
+    // enums, manifest_format_version {1,2}, the reserved word, the section-6
+    // count limits and the source_name bounds all move into the library. Only
+    // the topic/action records past source_name stay opaque here -- this cache
+    // relays them verbatim (walkRecords / appendRecordsTruncated below), it
+    // never parses a field.
+    btp::ManifestReader reader(payload.data, payload.size);
+    btp::ManifestHeader header{};
+    if (reader.header(&header) != btp::MessageError::Ok) return false;
 
-    const std::uint8_t status = payload.data[12];
-    if (status != kStatusSuccess) return false;  // only interested in successful descriptors
+    if (header.status != static_cast<std::uint8_t>(btp::ResultStatus::Success)) {
+        return false;  // only interested in successful descriptors
+    }
 
-    const std::uint8_t flags = payload.data[13];
-    const bool notModified = (flags & kFlagNotModified) != 0U;
-    const std::uint16_t formatVersion = read_u16_le(payload.data + 16U);
-    // Accept a format-1 robot too (treated as an empty source_info block) so a
-    // fleet mid-rollout still populates the cache; reject anything newer.
-    if (formatVersion != 1U && formatVersion != 2U) return false;
-
-    const std::uint32_t configRevision = read_u32_le(payload.data + 20U);
-    const std::uint8_t* uuid = payload.data + 24U;
-    const std::uint32_t describedSourceId = read_u32_le(payload.data + 40U);
-    const std::uint32_t describedBootId = read_u32_le(payload.data + 44U);
-    const std::uint8_t role = payload.data[48];
-    const std::uint8_t sourceFlags = payload.data[49];
-    const std::uint16_t topicCount = read_u16_le(payload.data + 54U);
-    const std::uint16_t actionCount = read_u16_le(payload.data + 56U);
+    const bool notModified = (header.flags & btp::kManifestNotModified) != 0U;
+    // btp::ManifestReader already accepted only format 1 or 2 (format 1 is
+    // treated as an empty source_info block, so a fleet mid-rollout still
+    // populates the cache).
+    const std::uint16_t formatVersion = header.manifest_format_version;
+    const std::uint32_t configRevision = header.config_revision;
+    const std::uint8_t* uuid = header.source_uuid;
+    const std::uint32_t describedSourceId = header.described_source_id;
+    const std::uint32_t describedBootId = header.described_boot_id;
+    const std::uint8_t role = header.source_role;
+    const std::uint8_t sourceFlags = header.source_flags;
+    const std::uint16_t topicCount = header.topic_count;
+    const std::uint16_t actionCount = header.action_count;
 
     if (describedSourceId == 0U || describedBootId == 0U) return false;
 
-    const std::uint16_t nameLen = read_u16_le(payload.data + 58U);
-    const std::size_t nameStart = 60U;
-    if (nameStart + static_cast<std::size_t>(nameLen) > payload.size) return false;
+    // source_name is a ByteView into `payload`; the source_info block (format 2)
+    // or the records (format 1) begin right after it.
+    const std::uint16_t nameLen = static_cast<std::uint16_t>(header.source_name.size);
+    const std::size_t nameStart = static_cast<std::size_t>(header.source_name.data - payload.data);
 
     // source_info block sits between source_name and the records in format 2
     // (commands.md 3.12): info_count:u16 then that many { key, label, value }

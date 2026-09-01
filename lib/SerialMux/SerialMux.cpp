@@ -7,6 +7,7 @@
 #include <ManifestCache.h>
 #include <ShellOutput.h>
 #include <SubscriptionRegistry.h>
+#include <btp/messages.hpp>
 #include <btp/stream.hpp>
 
 #include <esp_random.h>
@@ -596,21 +597,12 @@ void handleTerminalIn(const btp::DecodedFrame& decoded) noexcept {
     g_terminalShell.feed(decoded.payload.data, decoded.payload.size);
 }
 
+// The one remaining hand read: UNSUBSCRIBE's subscription_id, kept because its
+// handler stays deliberately lenient (see handleUnsubscribeRequest). Every
+// other CONTROL payload layout now goes through btp::messages.
 std::uint32_t readU32Le(const std::uint8_t* data) noexcept {
     return static_cast<std::uint32_t>(data[0]) | (static_cast<std::uint32_t>(data[1]) << 8U) |
            (static_cast<std::uint32_t>(data[2]) << 16U) | (static_cast<std::uint32_t>(data[3]) << 24U);
-}
-
-void writeU16(std::uint8_t* output, std::uint16_t value) noexcept {
-    output[0] = static_cast<std::uint8_t>(value);
-    output[1] = static_cast<std::uint8_t>(value >> 8U);
-}
-
-void writeU32(std::uint8_t* output, std::uint32_t value) noexcept {
-    output[0] = static_cast<std::uint8_t>(value);
-    output[1] = static_cast<std::uint8_t>(value >> 8U);
-    output[2] = static_cast<std::uint8_t>(value >> 16U);
-    output[3] = static_cast<std::uint8_t>(value >> 24U);
 }
 
 // Desktop -> dongle catalog discovery (topico 16 PASSO 6/7): answers from
@@ -625,13 +617,14 @@ void writeU32(std::uint8_t* output, std::uint32_t value) noexcept {
 // HELLO_RESULT -- no bypass, so it cannot jump ahead of already-queued
 // session/terminal traffic.
 void handleManifestRequest(const btp::DecodedFrame& decoded) noexcept {
-    if (decoded.payload.size != 12U || decoded.payload.data == nullptr) {
-        return;  // malformed MANIFEST_REQUEST; silently dropped like any other malformed CONTROL payload
+    btp::ManifestRequest request{};
+    if (btp::decode_manifest_request(decoded.payload.data, decoded.payload.size, &request) !=
+        btp::MessageError::Ok) {
+        return;  // malformed MANIFEST_REQUEST (not exactly 12 octets); silently dropped
     }
-
-    const std::uint32_t targetSourceId = readU32Le(decoded.payload.data);
-    const std::uint32_t targetBootId = readU32Le(decoded.payload.data + 4U);
-    const std::uint32_t knownRevision = readU32Le(decoded.payload.data + 8U);
+    const std::uint32_t targetSourceId = request.target_source_id;
+    const std::uint32_t targetBootId = request.target_boot_id;
+    const std::uint32_t knownRevision = request.known_config_revision;
 
     static std::uint8_t payload[kOutboundPayloadCap];  // main-loop only, see enqueueOwn
 
@@ -706,10 +699,6 @@ void dispatchUpstreamActions(const SubscriptionRegistry::UpstreamAction* actions
     }
 }
 
-std::uint32_t readU16LeAsU32(const std::uint8_t* data) noexcept {
-    return static_cast<std::uint32_t>(readU32Le(data) & 0xFFFFU);
-}
-
 // Desktop -> dongle SUBSCRIBE (commands.md section 4, 20-byte
 // payload). This dongle answers synchronously from its own local knowledge
 // (ManifestCache's already-cached schema max_rate_millihz) rather than
@@ -742,15 +731,17 @@ void handleSubscribeRequest(const btp::DecodedFrame& decoded) noexcept {
         return;
     }
 
-    if (decoded.payload.size < 20U || decoded.payload.data == nullptr) {
-        return;  // malformed; silently dropped like any other malformed CONTROL payload
+    // btp::decode_subscribe owns the 20-octet layout, the zero reserved-flags
+    // word and the "every field non-zero" rule (commands.md section 4). A
+    // structurally bad payload (wrong size, reserved bits set) is dropped like
+    // any malformed CONTROL frame; a well-formed one with a zero field still
+    // gets a REJECTED/INVALID_ARGUMENT reply, as before.
+    btp::Subscribe sub{};
+    const btp::MessageError subErr =
+        btp::decode_subscribe(decoded.payload.data, decoded.payload.size, &sub);
+    if (subErr != btp::MessageError::Ok && subErr != btp::MessageError::ZeroField) {
+        return;
     }
-
-    const std::uint32_t targetSourceId = readU32Le(decoded.payload.data);
-    const std::uint32_t targetBootId = readU32Le(decoded.payload.data + 4U);
-    const std::uint32_t topicId = readU16LeAsU32(decoded.payload.data + 8U);
-    const std::uint32_t requestedRateMillihz = readU32Le(decoded.payload.data + 12U);
-    const std::uint32_t requestedLeaseMs = readU32Le(decoded.payload.data + 16U);
 
     constexpr std::uint8_t kStatusSuccess = 0x00U;
     constexpr std::uint8_t kStatusRejected = 0x01U;
@@ -765,11 +756,14 @@ void handleSubscribeRequest(const btp::DecodedFrame& decoded) noexcept {
     std::uint32_t effectiveRateMillihz = 0U;
     std::uint32_t grantedLeaseMs = 0U;
 
-    if (targetSourceId == 0U || targetBootId == 0U || topicId == 0U || topicId > 0xFFFFU ||
-        requestedRateMillihz == 0U || requestedLeaseMs == 0U) {
+    if (subErr == btp::MessageError::ZeroField) {
         status = kStatusRejected;
         errorCode = kErrorInvalidArgument;
     } else {
+        const std::uint32_t targetSourceId = sub.target_source_id;
+        const std::uint32_t topicId = sub.topic_id;
+        const std::uint32_t requestedRateMillihz = sub.requested_rate_millihz;
+        const std::uint32_t requestedLeaseMs = sub.requested_lease_ms;
         std::uint32_t schemaMaxRateMillihz = 0U;
         if (!ManifestCache::lookupTopicMaxRateMillihz(targetSourceId, topicId, &schemaMaxRateMillihz)) {
             status = kStatusRejected;
@@ -801,22 +795,25 @@ void handleSubscribeRequest(const btp::DecodedFrame& decoded) noexcept {
         }
     }
 
+    btp::SubscribeResult result{};
+    result.request = {decoded.header.source_id, decoded.header.boot_id, decoded.header.sequence};
+    result.status = status;
+    result.error_code = errorCode;
+    result.subscription_id = subscriptionId;
+    result.effective_rate_millihz = effectiveRateMillihz;
+    result.granted_lease_ms = grantedLeaseMs;
+
     std::uint8_t responsePayload[28];
-    writeU32(responsePayload, decoded.header.source_id);
-    writeU32(responsePayload + 4U, decoded.header.boot_id);
-    writeU32(responsePayload + 8U, decoded.header.sequence);
-    responsePayload[12] = status;
-    responsePayload[13] = 0U;  // reserved
-    writeU16(responsePayload + 14U, errorCode);
-    writeU32(responsePayload + 16U, subscriptionId);
-    writeU32(responsePayload + 20U, effectiveRateMillihz);
-    writeU32(responsePayload + 24U, grantedLeaseMs);
+    std::size_t written = 0U;
+    if (btp::encode_subscribe_result(result, responsePayload, sizeof(responsePayload), &written) !=
+        btp::MessageError::Ok) {
+        return;
+    }
     // No source_id stamp here (unlike handleManifestRequest): a bound child's
     // SUBSCRIBE is relayed to the robot above and answered by the robot,
     // sealed; this enqueueOwn path only runs for the unbound console, which
     // sees every frame regardless of header source_id.
-    enqueueOwn(btp::MessageType::Control, SerialSession::kSubscribeResultObjectId, responsePayload,
-              sizeof(responsePayload));
+    enqueueOwn(btp::MessageType::Control, SerialSession::kSubscribeResultObjectId, responsePayload, written);
 }
 
 // Desktop -> dongle UNSUBSCRIBE (commands.md section 4, 12-byte
@@ -850,15 +847,22 @@ void handleUnsubscribeRequest(const btp::DecodedFrame& decoded) noexcept {
         SubscriptionRegistry::onDesktopUnsubscribe(currentClientId(), subscriptionId, millis());
     dispatchUpstreamAction(outcome.upstream);
 
+    // Idempotent SUCCESS/NONE (section 4). The lenient parse above stays --
+    // btp::decode_unsubscribe would additionally require target_source_id /
+    // target_boot_id non-zero, fields this handler does not use, and rejecting
+    // on them would turn a defined idempotent retry into a silent drop.
+    btp::ControlResult result{};
+    result.request = {decoded.header.source_id, decoded.header.boot_id, decoded.header.sequence};
+    result.status = static_cast<std::uint8_t>(btp::ResultStatus::Success);
+    result.error_code = static_cast<std::uint16_t>(btp::ResultError::None);
+
     std::uint8_t responsePayload[16];
-    writeU32(responsePayload, decoded.header.source_id);
-    writeU32(responsePayload + 4U, decoded.header.boot_id);
-    writeU32(responsePayload + 8U, decoded.header.sequence);
-    responsePayload[12] = 0x00U;  // status: SUCCESS
-    responsePayload[13] = 0U;     // reserved
-    writeU16(responsePayload + 14U, 0x0000U);  // error_code: NONE
-    enqueueOwn(btp::MessageType::Control, SerialSession::kUnsubscribeResultObjectId, responsePayload,
-              sizeof(responsePayload));
+    std::size_t written = 0U;
+    if (btp::encode_unsubscribe_result(result, responsePayload, sizeof(responsePayload), &written) !=
+        btp::MessageError::Ok) {
+        return;
+    }
+    enqueueOwn(btp::MessageType::Control, SerialSession::kUnsubscribeResultObjectId, responsePayload, written);
 }
 
 // Drains whatever g_terminalShell echoed into g_terminalOut and chunks it
@@ -1043,6 +1047,8 @@ void maybeSendStatusHeartbeat(std::uint32_t nowMs) noexcept {
                          2U + SubscriptionRegistry::kMaxTopics * SerialSession::kTopicStatusRecordSize];
     std::size_t size = 0U;
     if (topicCount > 0U) {
+        static_assert(SubscriptionRegistry::kMaxTopics <= SerialSession::kMaxStatusTopics,
+                      "buildStatusV2 caps topicCount at kMaxStatusTopics");
         SerialSession::TopicStatusRecord records[SubscriptionRegistry::kMaxTopics];
         for (std::size_t i = 0U; i < topicCount; ++i) {
             records[i].sourceId = snapshotEntries[i].sourceId;

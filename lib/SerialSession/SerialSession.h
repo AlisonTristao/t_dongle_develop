@@ -189,11 +189,17 @@ struct TopicStatusRecord {
 // one-line change here.
 constexpr std::size_t kTopicStatusRecordSize = 28U;
 
+// Upper bound on topicCount for buildStatusV2 in a single call: the dongle
+// tracks a subscription for at most this many topics. Kept independent of
+// SubscriptionRegistry::kMaxTopics so this module stays a leaf (SerialMux
+// static_asserts the two agree), matching LocalLimits::maxSubscriptions.
+constexpr std::size_t kMaxStatusTopics = 8U;
+
 // Builds a status_version=2 payload: the same 92-byte v1 prefix (with
 // status_version patched to 2), a uint16_le topic_status_count, then
 // topicCount kTopicStatusRecordSize-byte TopicStatusRecord entries. Returns 0
-// on capacity failure (caller falls back to buildStatus()'s v1-only payload
-// rather than sending nothing).
+// on capacity failure or topicCount > kMaxStatusTopics (caller falls back to
+// buildStatus()'s v1-only payload rather than sending nothing).
 std::size_t buildStatusV2(const StatusCounters& counters, const TopicStatusRecord* topics, std::size_t topicCount,
                           std::uint8_t* output, std::size_t outputCapacity) noexcept;
 

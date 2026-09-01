@@ -1,40 +1,31 @@
 #include "SerialSession.h"
 
 #include <BtpTransport.h>
+#include <btp/messages.hpp>
 
 #include <cstring>
 
 namespace SerialSession {
 namespace {
 
-void writeU16(std::uint8_t* output, std::uint16_t value) noexcept {
-    output[0] = static_cast<std::uint8_t>(value);
-    output[1] = static_cast<std::uint8_t>(value >> 8U);
-}
-
-void writeU32(std::uint8_t* output, std::uint32_t value) noexcept {
-    output[0] = static_cast<std::uint8_t>(value);
-    output[1] = static_cast<std::uint8_t>(value >> 8U);
-    output[2] = static_cast<std::uint8_t>(value >> 16U);
-    output[3] = static_cast<std::uint8_t>(value >> 24U);
-}
-
-void writeU64(std::uint8_t* output, std::uint64_t value) noexcept {
-    for (std::size_t i = 0U; i < 8U; ++i) {
-        output[i] = static_cast<std::uint8_t>(value >> (8U * i));
-    }
-}
-
-std::uint16_t readU16(const std::uint8_t* input) noexcept {
-    return static_cast<std::uint16_t>(input[0]) |
-           static_cast<std::uint16_t>(static_cast<std::uint16_t>(input[1]) << 8U);
-}
-
-std::uint32_t readU32(const std::uint8_t* input) noexcept {
-    return static_cast<std::uint32_t>(input[0]) |
-           (static_cast<std::uint32_t>(input[1]) << 8U) |
-           (static_cast<std::uint32_t>(input[2]) << 16U) |
-           (static_cast<std::uint32_t>(input[3]) << 24U);
+// The STATUS counter block (commands.md section 5.2) is btp::StatusV1; this
+// maps the module's own counter struct onto it. status_version is written by
+// the btp::encode_status_* call, not carried here.
+btp::StatusV1 toStatusBlock(const StatusCounters& counters) noexcept {
+    btp::StatusV1 base{};
+    base.flags = counters.degraded ? btp::kStatusDegraded : static_cast<std::uint16_t>(0U);
+    base.uptime_us = counters.uptimeUs;
+    base.frames_rx = counters.framesRx;
+    base.frames_tx = counters.framesTx;
+    base.frames_dropped = counters.framesDropped;
+    base.crc_errors = counters.crcErrors;
+    base.decode_errors = counters.decodeErrors;
+    base.reassembly_completed = counters.reassemblyCompleted;
+    base.reassembly_timeouts = counters.reassemblyTimeouts;
+    base.reassembly_rejected = counters.reassemblyRejected;
+    base.command_duplicates = counters.commandDuplicates;
+    base.telemetry_dropped = counters.telemetryDropped;
+    return base;
 }
 
 bool isHexDigit(char c) noexcept {
@@ -69,70 +60,55 @@ PriorityClass classify(btp::MessageType type, std::uint16_t objectId) noexcept {
 }
 
 HelloParseError parseHello(btp::ByteView payload, HelloView* out) noexcept {
-    if (out == nullptr || (payload.data == nullptr && payload.size != 0U)) {
-        return HelloParseError::PayloadTooShort;
-    }
-    if (payload.size < 40U) {
+    if (out == nullptr) {
         return HelloParseError::PayloadTooShort;
     }
 
-    const std::uint8_t versionCount = payload.data[1];
-    if (payload.size != 40U + static_cast<std::size_t>(versionCount)) {
-        return HelloParseError::SizeMismatch;
+    // The HELLO byte layout (session-and-terminal.md section 1) is now
+    // btp::decode_hello -- offsets, the reserved-flags/zero-capability/
+    // ascending-versions rules and the section 6 limits all live in the
+    // library. This wrapper only adapts the result to HelloView and folds
+    // btp::MessageError onto the module's own error enum (nothing downstream
+    // of onFrame() branches on a specific variant -- only Ok vs not-Ok).
+    btp::Hello hello{};
+    const btp::MessageError err = btp::decode_hello(payload.data, payload.size, &hello);
+    if (err != btp::MessageError::Ok) {
+        switch (err) {
+            case btp::MessageError::PayloadTooShort:
+                return HelloParseError::PayloadTooShort;
+            case btp::MessageError::TrailingBytes:
+                return HelloParseError::SizeMismatch;
+            case btp::MessageError::ReservedNotZero:
+                return HelloParseError::NonZeroReservedFlags;
+            case btp::MessageError::NotAscending:
+            case btp::MessageError::CountTooLarge:  // version_count past kMaxAnnouncedVersions
+                return HelloParseError::VersionsNotAscending;
+            default:  // ZeroField (no versions / zero capability / zero uuid), InvalidValue (bad role)
+                return HelloParseError::ZeroCapability;
+        }
     }
 
-    HelloView hello{};
-    hello.role = payload.data[0];
-    hello.versionCount = versionCount;
-    hello.flags = readU16(payload.data + 2U);
-    hello.maxLogicalPayload = readU32(payload.data + 4U);
-    hello.maxInflightReassemblies = readU16(payload.data + 8U);
-    hello.maxSubscriptions = readU16(payload.data + 10U);
-    hello.maxDedupEntries = readU32(payload.data + 12U);
-    hello.sessionTimeoutMs = readU32(payload.data + 16U);
-    std::memcpy(hello.peerUuid, payload.data + 20U, 16U);
-    hello.configRevision = readU32(payload.data + 36U);
+    HelloView view{};
+    view.role = hello.role;
+    view.versionCount = hello.version_count;
+    view.flags = 0U;  // decode_hello already rejected a non-zero flags word
+    view.maxLogicalPayload = hello.max_logical_payload;
+    view.maxInflightReassemblies = hello.max_inflight_reassemblies;
+    view.maxSubscriptions = hello.max_subscriptions;
+    view.maxDedupEntries = hello.max_dedup_entries;
+    view.sessionTimeoutMs = hello.session_timeout_ms;
+    std::memcpy(view.peerUuid, hello.peer_uuid, 16U);
+    view.configRevision = hello.config_revision;
 
-    if (hello.flags != 0U) {
-        return HelloParseError::NonZeroReservedFlags;
-    }
-    if (hello.maxLogicalPayload == 0U || hello.maxInflightReassemblies == 0U ||
-        hello.maxSubscriptions == 0U || hello.maxDedupEntries == 0U || hello.sessionTimeoutMs == 0U) {
-        return HelloParseError::ZeroCapability;
-    }
-
-    bool uuidAllZero = true;
-    for (std::size_t i = 0U; i < 16U; ++i) {
-        if (hello.peerUuid[i] != 0U) {
-            uuidAllZero = false;
+    view.supportsVersion1 = false;
+    for (std::size_t i = 0U; i < hello.version_count; ++i) {
+        if (hello.versions[i] == 1U) {
+            view.supportsVersion1 = true;
             break;
         }
     }
-    if (uuidAllZero) {
-        return HelloParseError::ZeroCapability;
-    }
 
-    if (versionCount == 0U) {
-        return HelloParseError::NoVersions;
-    }
-
-    hello.supportsVersion1 = false;
-    std::uint8_t previous = 0U;
-    for (std::size_t i = 0U; i < versionCount; ++i) {
-        const std::uint8_t version = payload.data[40U + i];
-        if (version == 0U) {
-            return HelloParseError::VersionsNotAscending;
-        }
-        if (i > 0U && version <= previous) {
-            return HelloParseError::VersionsNotAscending;
-        }
-        previous = version;
-        if (version == 1U) {
-            hello.supportsVersion1 = true;
-        }
-    }
-
-    *out = hello;
+    *out = view;
     return HelloParseError::Ok;
 }
 
@@ -155,53 +131,60 @@ std::size_t buildHelloResultSuccess(std::uint32_t requestSourceId, std::uint32_t
                                     std::uint32_t replyToSequence, const EffectiveLimits& limits,
                                     const std::uint8_t localUuid[16], std::uint32_t configRevision,
                                     std::uint8_t* output, std::size_t outputCapacity) noexcept {
-    constexpr std::size_t kSize = 52U;
-    if (output == nullptr || outputCapacity < kSize || localUuid == nullptr) {
+    if (localUuid == nullptr) {
         return 0U;
     }
+    btp::HelloResult result{};
+    result.request = {requestSourceId, requestBootId, replyToSequence};
+    result.status = static_cast<std::uint8_t>(btp::ResultStatus::Success);
+    result.selected_version = 1U;
+    result.error_code = static_cast<std::uint16_t>(btp::ResultError::None);
+    result.max_logical_payload = limits.maxLogicalPayload;
+    result.max_inflight_reassemblies = limits.maxInflightReassemblies;
+    result.max_subscriptions = limits.maxSubscriptions;
+    result.max_dedup_entries = limits.maxDedupEntries;
+    result.session_timeout_ms = limits.sessionTimeoutMs;
+    std::memcpy(result.peer_uuid, localUuid, 16U);
+    result.config_revision = configRevision;
 
-    writeU32(output, requestSourceId);
-    writeU32(output + 4U, requestBootId);
-    writeU32(output + 8U, replyToSequence);
-    output[12] = 0x00U; // SUCCESS
-    output[13] = 0x01U; // selected_version
-    writeU16(output + 14U, 0x0000U); // error_code NONE
-    writeU32(output + 16U, limits.maxLogicalPayload);
-    writeU16(output + 20U, limits.maxInflightReassemblies);
-    writeU16(output + 22U, limits.maxSubscriptions);
-    writeU32(output + 24U, limits.maxDedupEntries);
-    writeU32(output + 28U, limits.sessionTimeoutMs);
-    std::memcpy(output + 32U, localUuid, 16U);
-    writeU32(output + 48U, configRevision);
-    return kSize;
+    std::size_t written = 0U;
+    if (btp::encode_hello_result(result, output, outputCapacity, &written) != btp::MessageError::Ok) {
+        return 0U;
+    }
+    return written;
 }
 
 std::size_t buildHelloResultFailure(std::uint32_t requestSourceId, std::uint32_t requestBootId,
                                     std::uint32_t replyToSequence, std::uint8_t* output,
                                     std::size_t outputCapacity) noexcept {
-    constexpr std::size_t kSize = 52U;
-    if (output == nullptr || outputCapacity < kSize) {
+    btp::HelloResult result{};
+    result.request = {requestSourceId, requestBootId, replyToSequence};
+    result.status = static_cast<std::uint8_t>(btp::ResultStatus::Unsupported);
+    result.selected_version = 0U;  // no version selected on failure
+    result.error_code = static_cast<std::uint16_t>(btp::ResultError::UnsupportedVersion);
+    // limits, peer_uuid and config_revision stay zero.
+
+    std::size_t written = 0U;
+    if (btp::encode_hello_result(result, output, outputCapacity, &written) != btp::MessageError::Ok) {
         return 0U;
     }
-    std::memset(output, 0, kSize);
-    writeU32(output, requestSourceId);
-    writeU32(output + 4U, requestBootId);
-    writeU32(output + 8U, replyToSequence);
-    output[12] = 0x05U; // UNSUPPORTED
-    output[13] = 0x00U; // selected_version = 0 on failure
-    writeU16(output + 14U, 0x0008U); // UNSUPPORTED_VERSION
-    return kSize;
+    return written;
 }
 
 bool parseSessionClose(btp::ByteView payload, SessionCloseView* out) noexcept {
-    if (out == nullptr || payload.data == nullptr || payload.size != 8U) {
+    if (out == nullptr) {
         return false;
     }
-    if (payload.data[1] != 0U || payload.data[2] != 0U || payload.data[3] != 0U) {
-        return false; // reserved octets must be zero
+    // btp::decode_session_close enforces the 8-octet size, the zero reserved
+    // octets and the reason enum (0..3) -- the last is stricter than the old
+    // hand-rolled parse, which stored any reason byte; onFrame() only cares
+    // whether the parse succeeded (SUCCESS vs REJECTED in the result).
+    btp::SessionClose close{};
+    if (btp::decode_session_close(payload.data, payload.size, &close) != btp::MessageError::Ok) {
+        return false;
     }
-    out->reason = payload.data[0];
-    out->drainTimeoutMs = readU32(payload.data + 4U);
+    out->reason = close.reason;
+    out->drainTimeoutMs = close.drain_timeout_ms;
     return true;
 }
 
@@ -209,74 +192,63 @@ std::size_t buildSessionCloseResult(std::uint32_t requestSourceId, std::uint32_t
                                     std::uint32_t replyToSequence, std::uint8_t status,
                                     std::uint16_t errorCode, std::uint8_t* output,
                                     std::size_t outputCapacity) noexcept {
-    constexpr std::size_t kSize = 16U;
-    if (output == nullptr || outputCapacity < kSize) {
+    btp::ControlResult result{};
+    result.request = {requestSourceId, requestBootId, replyToSequence};
+    result.status = status;
+    result.error_code = errorCode;
+
+    std::size_t written = 0U;
+    if (btp::encode_session_close_result(result, output, outputCapacity, &written) != btp::MessageError::Ok) {
         return 0U;
     }
-    writeU32(output, requestSourceId);
-    writeU32(output + 4U, requestBootId);
-    writeU32(output + 8U, replyToSequence);
-    output[12] = status;
-    output[13] = 0U;
-    writeU16(output + 14U, errorCode);
-    return kSize;
+    return written;
 }
+
+// The module's wire constants must stay equal to the library's -- SerialMux
+// and the tests size buffers off the SerialSession names, btp::messages does
+// the actual serialization. This is the "24 vs 28" guard, now cross-checked
+// against the single source of truth.
+static_assert(kStatusPayloadSize == btp::kStatusV1Size,
+              "kStatusPayloadSize must match btp::kStatusV1Size");
+static_assert(kTopicStatusRecordSize == btp::kTopicStatusRecordSize,
+              "kTopicStatusRecordSize must match btp::kTopicStatusRecordSize");
 
 std::size_t buildStatus(const StatusCounters& counters, std::uint8_t* output,
                         std::size_t outputCapacity) noexcept {
-    if (output == nullptr || outputCapacity < kStatusPayloadSize) {
+    const btp::StatusV1 base = toStatusBlock(counters);
+    std::size_t written = 0U;
+    if (btp::encode_status_v1(base, output, outputCapacity, &written) != btp::MessageError::Ok) {
         return 0U;
     }
-    writeU16(output, 1U); // status_version
-    writeU16(output + 2U, counters.degraded ? 0x0001U : 0x0000U);
-    writeU64(output + 4U, counters.uptimeUs);
-    writeU64(output + 12U, counters.framesRx);
-    writeU64(output + 20U, counters.framesTx);
-    writeU64(output + 28U, counters.framesDropped);
-    writeU64(output + 36U, counters.crcErrors);
-    writeU64(output + 44U, counters.decodeErrors);
-    writeU64(output + 52U, counters.reassemblyCompleted);
-    writeU64(output + 60U, counters.reassemblyTimeouts);
-    writeU64(output + 68U, counters.reassemblyRejected);
-    writeU64(output + 76U, counters.commandDuplicates);
-    writeU64(output + 84U, counters.telemetryDropped);
-    return kStatusPayloadSize;
+    return written;
 }
-
-// Guards the stride against the field writes below drifting apart again (the
-// original topico 17 draft wrote 28 bytes per record while advancing 24,
-// overlapping every record after the first and overrunning the caller's
-// buffer by 4 bytes on a full snapshot). 4 + 2 + 2 + 4 + 8 + 8 = 28.
-static_assert(kTopicStatusRecordSize == 4U + 2U + 2U + 4U + 8U + 8U,
-              "topic_status stride must match the sum of the section 8.1 field widths");
 
 std::size_t buildStatusV2(const StatusCounters& counters, const TopicStatusRecord* topics, std::size_t topicCount,
                           std::uint8_t* output, std::size_t outputCapacity) noexcept {
-    const std::size_t total = kStatusPayloadSize + 2U + topicCount * kTopicStatusRecordSize;
-    if (output == nullptr || outputCapacity < total || (topics == nullptr && topicCount != 0U)) {
+    const btp::StatusV1 base = toStatusBlock(counters);
+
+    // SerialSession::TopicStatusRecord and btp::TopicStatusRecord are the same
+    // wire shape; copy field-by-field so a future divergence is a compile error
+    // here, not a silent misencode.
+    btp::TopicStatusRecord scratch[kMaxStatusTopics];
+    if (topicCount > kMaxStatusTopics || (topics == nullptr && topicCount != 0U)) {
         return 0U;
     }
-
-    // Same v1 prefix (buildStatus's own bounds check is redundant here since
-    // total >= kStatusPayloadSize was just checked above), then patch
-    // status_version to 2.
-    if (buildStatus(counters, output, outputCapacity) == 0U) return 0U;
-    writeU16(output, 2U);  // status_version
-
-    std::size_t offset = kStatusPayloadSize;
-    writeU16(output + offset, static_cast<std::uint16_t>(topicCount));
-    offset += 2U;
     for (std::size_t i = 0U; i < topicCount; ++i) {
-        const TopicStatusRecord& record = topics[i];
-        writeU32(output + offset, record.sourceId);
-        writeU16(output + offset + 4U, record.topicId);
-        writeU16(output + offset + 6U, record.subscriberCount);
-        writeU32(output + offset + 8U, record.effectiveRateMillihz);
-        writeU64(output + offset + 12U, record.bytesTotal);
-        writeU64(output + offset + 20U, record.samplesDroppedTotal);
-        offset += kTopicStatusRecordSize;
+        scratch[i].source_id = topics[i].sourceId;
+        scratch[i].topic_id = topics[i].topicId;
+        scratch[i].subscriber_count = topics[i].subscriberCount;
+        scratch[i].effective_rate_millihz = topics[i].effectiveRateMillihz;
+        scratch[i].bytes_total = topics[i].bytesTotal;
+        scratch[i].samples_dropped_total = topics[i].samplesDroppedTotal;
     }
-    return offset;
+
+    std::size_t written = 0U;
+    if (btp::encode_status_v2(base, scratch, topicCount, output, outputCapacity, &written) !=
+        btp::MessageError::Ok) {
+        return 0U;
+    }
+    return written;
 }
 
 bool tryParseEnterLine(const char* line, char outReadyLine[kReadyLineCapacity]) noexcept {

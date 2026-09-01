@@ -1,6 +1,7 @@
 #include "BtpTransport.h"
 
 #include <btp/fragmentation.hpp>
+#include <btp/messages.hpp>
 
 #include <atomic>
 #include <cstring>
@@ -64,30 +65,6 @@ private:
 
 bool sameMac(const std::uint8_t* lhs, const std::uint8_t* rhs) noexcept {
     return std::memcmp(lhs, rhs, 6U) == 0;
-}
-
-void writeU16(std::uint8_t* output, std::uint16_t value) noexcept {
-    output[0] = static_cast<std::uint8_t>(value);
-    output[1] = static_cast<std::uint8_t>(value >> 8U);
-}
-
-void writeU32(std::uint8_t* output, std::uint32_t value) noexcept {
-    output[0] = static_cast<std::uint8_t>(value);
-    output[1] = static_cast<std::uint8_t>(value >> 8U);
-    output[2] = static_cast<std::uint8_t>(value >> 16U);
-    output[3] = static_cast<std::uint8_t>(value >> 24U);
-}
-
-std::uint16_t readU16(const std::uint8_t* input) noexcept {
-    return static_cast<std::uint16_t>(input[0]) |
-           static_cast<std::uint16_t>(static_cast<std::uint16_t>(input[1]) << 8U);
-}
-
-std::uint32_t readU32(const std::uint8_t* input) noexcept {
-    return static_cast<std::uint32_t>(input[0]) |
-           (static_cast<std::uint32_t>(input[1]) << 8U) |
-           (static_cast<std::uint32_t>(input[2]) << 16U) |
-           (static_cast<std::uint32_t>(input[3]) << 24U);
 }
 
 }  // namespace
@@ -430,34 +407,39 @@ ParseError parse_request(const btp::Header& header,
     }
     if (header.type != btp::MessageType::Command) return ParseError::WrongType;
     if (header.object_id != kCommandRequestObjectId) return ParseError::WrongObject;
-    if (payload.size < kRequestPrefixSize) return ParseError::PayloadTooShort;
 
-    RequestView request{
-        .target_source_id = readU32(payload.data),
-        .target_boot_id = readU32(payload.data + 4U),
-        .action_id = readU16(payload.data + 8U),
-        .action_version = readU16(payload.data + 10U),
-        .parameters = {payload.data + kRequestPrefixSize, 0U},
-    };
-    const std::uint16_t flags = readU16(payload.data + 12U);
-    const std::uint16_t reserved = readU16(payload.data + 14U);
-    const std::uint32_t parameterSize = readU32(payload.data + 16U);
-
-    if (request.target_source_id == 0U || request.target_boot_id == 0U) {
-        return ParseError::InvalidEnvelope;
+    // The COMMAND_REQUEST layout (commands.md section 2.1) is btp::decode_command_request:
+    // the 20-octet prefix, the zero flags/reserved words, every id non-zero and
+    // "parameter_size consumes the payload exactly" all move into the library.
+    btp::CommandRequest cmd{};
+    const btp::MessageError err = btp::decode_command_request(payload.data, payload.size, &cmd);
+    if (err != btp::MessageError::Ok) {
+        switch (err) {
+            case btp::MessageError::PayloadTooShort:
+                return ParseError::PayloadTooShort;
+            case btp::MessageError::ReservedNotZero:
+                return ParseError::InvalidFlags;
+            case btp::MessageError::TrailingBytes:
+            case btp::MessageError::LengthOverflow:
+                return ParseError::SizeMismatch;
+            case btp::MessageError::CountTooLarge:  // parameter_size past the wire ceiling
+                return ParseError::ParametersTooLarge;
+            default:  // ZeroField: a zero target or action id -- was InvalidEnvelope / InvalidAction
+                return ParseError::InvalidEnvelope;
+        }
     }
-    if (request.target_source_id != local_source_id || request.target_boot_id != local_boot_id) {
+
+    if (cmd.target_source_id != local_source_id || cmd.target_boot_id != local_boot_id) {
         return ParseError::WrongTarget;
     }
-    if (request.action_id == 0U || request.action_version == 0U) {
-        return ParseError::InvalidAction;
-    }
-    if (flags != 0U || reserved != 0U) return ParseError::InvalidFlags;
-    if (parameterSize != payload.size - kRequestPrefixSize) return ParseError::SizeMismatch;
-    if (parameterSize > kMaxShellCommandSize) return ParseError::ParametersTooLarge;
+    // Stricter local ceiling than the wire's 32768: one TinyShell line.
+    if (cmd.parameters.size > kMaxShellCommandSize) return ParseError::ParametersTooLarge;
 
-    request.parameters.size = parameterSize;
-    *request_out = request;
+    request_out->target_source_id = cmd.target_source_id;
+    request_out->target_boot_id = cmd.target_boot_id;
+    request_out->action_id = cmd.action_id;
+    request_out->action_version = cmd.action_version;
+    request_out->parameters = cmd.parameters;
     return ParseError::Ok;
 }
 
@@ -494,29 +476,31 @@ ParseError parse_result(const btp::Header& header, btp::ByteView payload, Result
     }
     if (header.type != btp::MessageType::Command) return ParseError::WrongType;
     if (header.object_id != kCommandResultObjectId) return ParseError::WrongObject;
-    if (payload.size < kResultPrefixSize) return ParseError::PayloadTooShort;
 
-    ResultView result{};
-    result.request_source_id = readU32(payload.data);
-    result.request_boot_id = readU32(payload.data + 4U);
-    result.reply_to_sequence = readU32(payload.data + 8U);
-    result.action_id = readU16(payload.data + 12U);
-    result.action_version = readU16(payload.data + 14U);
-    result.status = static_cast<Status>(payload.data[16]);
-    result.error_code = static_cast<ErrorCode>(readU16(payload.data + 18U));
+    // COMMAND_RESULT layout (commands.md section 2.4) is btp::decode_command_result:
+    // the 26-octet prefix, the zero reserved byte, the utf8_u16 message and the
+    // bytes_u32 result, and the "status is a defined ResultStatus" check the
+    // old hand parse skipped.
+    btp::CommandResult res{};
+    const btp::MessageError err = btp::decode_command_result(payload.data, payload.size, &res);
+    if (err != btp::MessageError::Ok) {
+        switch (err) {
+            case btp::MessageError::PayloadTooShort:
+                return ParseError::PayloadTooShort;
+            default:  // TrailingBytes / LengthOverflow / CountTooLarge / ReservedNotZero / InvalidValue
+                return ParseError::SizeMismatch;
+        }
+    }
 
-    const std::uint16_t messageSize = readU16(payload.data + 20U);
-    const std::size_t messageOffset = 22U;
-    if (payload.size < messageOffset + messageSize + 4U) return ParseError::SizeMismatch;
-    result.message = {payload.data + messageOffset, messageSize};
-
-    const std::size_t resultLenOffset = messageOffset + messageSize;
-    const std::uint32_t resultSize = readU32(payload.data + resultLenOffset);
-    const std::size_t resultOffset = resultLenOffset + 4U;
-    if (payload.size != resultOffset + resultSize) return ParseError::SizeMismatch;
-    result.result = {payload.data + resultOffset, resultSize};
-
-    *result_out = result;
+    result_out->request_source_id = res.request.request_source_id;
+    result_out->request_boot_id = res.request.request_boot_id;
+    result_out->reply_to_sequence = res.request.reply_to_sequence;
+    result_out->action_id = res.action_id;
+    result_out->action_version = res.action_version;
+    result_out->status = static_cast<Status>(res.status);
+    result_out->error_code = static_cast<ErrorCode>(res.error_code);
+    result_out->message = res.message;
+    result_out->result = res.result;
     return ParseError::Ok;
 }
 
@@ -533,26 +517,23 @@ std::size_t build_result(std::uint32_t request_source_id,
                          std::uint8_t* output,
                          std::size_t output_capacity) noexcept {
     const std::size_t messageLen = (message == nullptr) ? 0U : std::strlen(message);
-    if (messageLen > kMaxResultMessageSize) return 0U;
-
-    const std::size_t total = kResultPrefixSize + messageLen + result_size;
-    if (output == nullptr || output_capacity < total) return 0U;
+    if (messageLen > kMaxResultMessageSize) return 0U;  // local cap, tighter than the wire's
     if (result_size > 0U && result == nullptr) return 0U;
 
-    writeU32(output, request_source_id);
-    writeU32(output + 4U, request_boot_id);
-    writeU32(output + 8U, reply_to_sequence);
-    writeU16(output + 12U, action_id);
-    writeU16(output + 14U, action_version);
-    output[16] = static_cast<std::uint8_t>(status);
-    output[17] = 0U;
-    writeU16(output + 18U, static_cast<std::uint16_t>(error_code));
-    writeU16(output + 20U, static_cast<std::uint16_t>(messageLen));
-    if (messageLen > 0U) std::memcpy(output + 22U, message, messageLen);
-    writeU32(output + 22U + messageLen, static_cast<std::uint32_t>(result_size));
-    if (result_size > 0U) std::memcpy(output + 26U + messageLen, result, result_size);
+    btp::CommandResult out{};
+    out.request = {request_source_id, request_boot_id, reply_to_sequence};
+    out.action_id = action_id;
+    out.action_version = action_version;
+    out.status = static_cast<std::uint8_t>(status);
+    out.error_code = static_cast<std::uint16_t>(error_code);
+    out.message = {reinterpret_cast<const std::uint8_t*>(message), messageLen};
+    out.result = {result, result_size};
 
-    return total;
+    std::size_t written = 0U;
+    if (btp::encode_command_result(out, output, output_capacity, &written) != btp::MessageError::Ok) {
+        return 0U;
+    }
+    return written;
 }
 
 std::uint32_t source_id_from_mac(const std::uint8_t mac[6]) noexcept {
