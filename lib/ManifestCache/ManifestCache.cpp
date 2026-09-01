@@ -40,8 +40,15 @@ struct Entry {
     char name[kMaxNameLength + 1U] = {};
     std::uint16_t topicCount = 0U;
     std::uint16_t actionCount = 0U;
+    // Topic records then action records, concatenated verbatim, each
+    // self-delimited by its own record_size (commands.md 3.5). The two runs
+    // are already contiguous in the MANIFEST_DATA payload; btp::ManifestReader
+    // ::raw_records hands them back split, and topicRecordsSize is the byte
+    // offset of the boundary so they can be spliced back as two separate runs
+    // by btp::ManifestWriter::put_raw_records.
     std::uint8_t records[kMaxRecordsBytes];
     std::size_t recordsSize = 0U;
+    std::size_t topicRecordsSize = 0U;
     // Verbatim source_info block from this source's MANIFEST_DATA (commands.md
     // 3.12), info_count prefix included. Always >= 2 octets once used: a
     // format-1 source, or a format-2 one with no entries, both land here as a
@@ -96,9 +103,11 @@ std::uint32_t read_u32_le(const std::uint8_t* data) noexcept {
 }
 
 // Append-only cursor with two-phase (reserve + patch) support for the
-// topic_count/action_count fields, whose real values are only known after
-// the truncated records walk below. Every append returns false (and does not
-// partially mutate the buffer) on overflow.
+// source_info info_count field, whose value is only known after the entries
+// that survive the empty-value filter are written. Every append returns false
+// (and does not partially mutate the buffer) on overflow. Used only by
+// serializeSourceInfo() now -- the MANIFEST_DATA head and record splicing
+// moved to btp::ManifestWriter.
 class Writer {
 public:
     Writer(std::uint8_t* out, std::size_t capacity) noexcept : out_(out), capacity_(capacity) {}
@@ -144,55 +153,6 @@ private:
     std::size_t capacity_;
     std::size_t pos_ = 0U;
 };
-
-// Walks `totalRecords` (topicCount + actionCount) record_size-prefixed
-// records inside `blob`, requiring exact consumption of `blobSize`. Used
-// both to validate a freshly-received manifest before caching it (strict:
-// any short read invalidates the whole thing) and, via
-// appendRecordsTruncated below, to copy whole records into a response.
-bool walkRecords(const std::uint8_t* blob, std::size_t blobSize, std::uint32_t totalRecords,
-                 std::size_t* consumed_out) noexcept {
-    std::size_t pos = 0U;
-    for (std::uint32_t i = 0U; i < totalRecords; ++i) {
-        if (pos + 4U > blobSize) return false;
-        const std::uint32_t contentSize = read_u32_le(blob + pos);
-        const std::size_t recordTotalLen = 4U + static_cast<std::size_t>(contentSize);
-        if (pos + recordTotalLen > blobSize || pos + recordTotalLen < pos) return false;  // overflow-safe
-        pos += recordTotalLen;
-    }
-    *consumed_out = pos;
-    return true;
-}
-
-// Copies as many whole records (topics first, then actions) as fit in
-// `writer`'s remaining capacity, stopping before any partial record. Reports
-// how many of each were actually written -- callers patch topic_count/
-// action_count with these, never with the cached totals.
-void appendRecordsTruncated(Writer& writer, const std::uint8_t* blob, std::size_t blobSize,
-                            std::uint16_t topicCount, std::uint16_t actionCount, std::uint16_t* topicsWritten_out,
-                            std::uint16_t* actionsWritten_out) noexcept {
-    std::uint16_t topicsWritten = 0U;
-    std::uint16_t actionsWritten = 0U;
-    std::size_t pos = 0U;
-    const std::uint32_t totalRecords = static_cast<std::uint32_t>(topicCount) + static_cast<std::uint32_t>(actionCount);
-
-    for (std::uint32_t i = 0U; i < totalRecords; ++i) {
-        if (pos + 4U > blobSize) break;
-        const std::uint32_t contentSize = read_u32_le(blob + pos);
-        const std::size_t recordTotalLen = 4U + static_cast<std::size_t>(contentSize);
-        if (pos + recordTotalLen > blobSize) break;  // corrupt cache; stop defensively
-        if (!writer.bytes(blob + pos, recordTotalLen)) break;  // doesn't fit the response; stop
-        pos += recordTotalLen;
-        if (i < topicCount) {
-            ++topicsWritten;
-        } else {
-            ++actionsWritten;
-        }
-    }
-
-    *topicsWritten_out = topicsWritten;
-    *actionsWritten_out = actionsWritten;
-}
 
 Entry* findEntry(std::uint32_t sourceId) noexcept {
     for (Entry& entry : g_entries) {
@@ -264,50 +224,67 @@ std::size_t collectSortedEntries(Entry* out[kCapacity]) noexcept {
     return count;
 }
 
+// Builds one MANIFEST_DATA response via btp::ManifestWriter. The fixed head,
+// the reserved word, the record_size framing and the source_role validation
+// all live in the library now; this dongle only supplies the field values and
+// the two verbatim byte runs it caches.
+//
+// `recordsBlob` holds the topic records then the action records concatenated
+// (Entry::records); `topicRecordsSize` is the split point. put_raw_records
+// copies whole records only and patches topic_count/action_count down to what
+// the response buffer held, so a large catalog served into a small frame stays
+// consistent (see ManifestCache.h). A NOT_FOUND / STALE_TARGET_BOOT /
+// NOT_MODIFIED response passes recordsBlob = nullptr.
 std::size_t writeManifestData(const btp::Header& requestHeader, std::uint8_t status, std::uint8_t flags,
                               std::uint16_t errorCode, std::uint16_t catalogIndex, std::uint16_t catalogCount,
                               std::uint32_t configRevision, const std::uint8_t* uuid, std::uint32_t describedSourceId,
                               std::uint32_t describedBootId, std::uint8_t role, bool online, const char* name,
                               const std::uint8_t* sourceInfo, std::size_t sourceInfoSize,
                               const std::uint8_t* recordsBlob, std::size_t recordsBlobSize,
-                              std::uint16_t cachedTopicCount, std::uint16_t cachedActionCount, std::uint8_t* output,
-                              std::size_t capacity) noexcept {
-    Writer writer(output, capacity);
+                              std::size_t topicRecordsSize, std::uint8_t* output, std::size_t capacity) noexcept {
+    btp::ManifestHeader header{};
+    header.request.request_source_id = requestHeader.source_id;
+    header.request.request_boot_id = requestHeader.boot_id;
+    header.request.reply_to_sequence = requestHeader.sequence;
+    header.status = status;
+    header.flags = flags;
+    header.error_code = errorCode;
+    header.manifest_format_version = kManifestFormatVersion;  // this dongle always serves format 2
+    header.config_revision = configRevision;
+    if (uuid != nullptr) std::memcpy(header.source_uuid, uuid, 16U);
+    header.described_source_id = describedSourceId;
+    header.described_boot_id = describedBootId;
+    header.source_role = role;
+    header.source_flags = online ? btp::kSourceOnline : static_cast<std::uint8_t>(0U);
+    header.catalog_index = catalogIndex;
+    header.catalog_count = catalogCount;
+    // topic_count / action_count are left 0 here: put_raw_records backpatches
+    // them to the number of records it actually splices in.
+    const char* safeName = (name != nullptr) ? name : "";
+    header.source_name = btp::ByteView{reinterpret_cast<const std::uint8_t*>(safeName), std::strlen(safeName)};
 
-    bool ok = writer.u32(requestHeader.source_id) && writer.u32(requestHeader.boot_id) &&
-             writer.u32(requestHeader.sequence) && writer.u8(status) && writer.u8(flags) && writer.u16(errorCode) &&
-             writer.u16(kManifestFormatVersion) && writer.u16(0U) /*reserved*/ && writer.u32(configRevision);
-    if (!ok) return 0U;
+    btp::ManifestWriter writer(output, capacity);
+    if (writer.begin(header) != btp::MessageError::Ok) return 0U;
 
-    static const std::uint8_t kZeroUuid[16] = {0};
-    ok = writer.bytes(uuid != nullptr ? uuid : kZeroUuid, 16U) && writer.u32(describedSourceId) &&
-        writer.u32(describedBootId) && writer.u8(role) && writer.u8(online ? 0x01U : 0x00U) &&
-        writer.u16(catalogIndex) && writer.u16(catalogCount);
-    if (!ok) return 0U;
-
-    std::size_t topicCountOffset = 0U;
-    std::size_t actionCountOffset = 0U;
-    if (!writer.reserveU16(&topicCountOffset) || !writer.reserveU16(&actionCountOffset)) return 0U;
-    if (!writer.utf8(name != nullptr ? name : "")) return 0U;
-
-    // source_info block (commands.md 3.12) -- always present in format 2,
-    // NOT_MODIFIED and error responses included. Emitted verbatim (the block
-    // already carries its own info_count); a source with none gets "00 00".
+    // source_info (commands.md 3.12): verbatim when the source has a real
+    // block, otherwise begin()'s empty "00 00" placeholder is left in place by
+    // put_raw_records.
     if (sourceInfo != nullptr && sourceInfoSize >= 2U) {
-        if (!writer.bytes(sourceInfo, sourceInfoSize)) return 0U;
-    } else if (!writer.u16(0U)) {
+        if (writer.put_raw_source_info(btp::ByteView{sourceInfo, sourceInfoSize}) != btp::MessageError::Ok) {
+            return 0U;
+        }
+    }
+
+    const std::uint8_t* actionBlob = (recordsBlob != nullptr) ? recordsBlob + topicRecordsSize : nullptr;
+    const std::size_t actionSize = recordsBlobSize - topicRecordsSize;
+    if (writer.put_raw_records(btp::ByteView{recordsBlob, topicRecordsSize},
+                               btp::ByteView{actionBlob, actionSize}) != btp::MessageError::Ok) {
         return 0U;
     }
 
-    std::uint16_t topicsWritten = 0U;
-    std::uint16_t actionsWritten = 0U;
-    if (recordsBlob != nullptr && recordsBlobSize > 0U) {
-        appendRecordsTruncated(writer, recordsBlob, recordsBlobSize, cachedTopicCount, cachedActionCount,
-                               &topicsWritten, &actionsWritten);
-    }
-    writer.patchU16(topicCountOffset, topicsWritten);
-    writer.patchU16(actionCountOffset, actionsWritten);
-    return writer.size();
+    std::size_t written = 0U;
+    if (writer.finish(&written) != btp::MessageError::Ok) return 0U;
+    return written;
 }
 
 }  // namespace
@@ -393,13 +370,13 @@ std::size_t buildRequest(std::uint32_t targetSourceId, std::uint32_t targetBootI
 }
 
 static bool ingestManifestDataImpl(btp::ByteView payload, std::uint32_t nowMs) noexcept {
-    // The MANIFEST_DATA fixed head (commands.md section 3.3) is now
-    // btp::ManifestReader::header(): the request-reference, the status/role
-    // enums, manifest_format_version {1,2}, the reserved word, the section-6
-    // count limits and the source_name bounds all move into the library. Only
-    // the topic/action records past source_name stay opaque here -- this cache
-    // relays them verbatim (walkRecords / appendRecordsTruncated below), it
-    // never parses a field.
+    // The whole MANIFEST_DATA layout is btp::messages now: header() for the
+    // fixed head (request-reference, status/role enums, format {1,2}, reserved
+    // word, section-6 count limits, source_name bounds); raw_source_info() for
+    // the format-2 source_info block; raw_records() for the topic and action
+    // record runs, each still record_size-framed. This cache relays all three
+    // verbatim -- it never parses a field -- so it keeps the raw spans, not the
+    // decoded structs.
     btp::ManifestReader reader(payload.data, payload.size);
     btp::ManifestHeader header{};
     if (reader.header(&header) != btp::MessageError::Ok) return false;
@@ -409,10 +386,6 @@ static bool ingestManifestDataImpl(btp::ByteView payload, std::uint32_t nowMs) n
     }
 
     const bool notModified = (header.flags & btp::kManifestNotModified) != 0U;
-    // btp::ManifestReader already accepted only format 1 or 2 (format 1 is
-    // treated as an empty source_info block, so a fleet mid-rollout still
-    // populates the cache).
-    const std::uint16_t formatVersion = header.manifest_format_version;
     const std::uint32_t configRevision = header.config_revision;
     const std::uint8_t* uuid = header.source_uuid;
     const std::uint32_t describedSourceId = header.described_source_id;
@@ -424,52 +397,31 @@ static bool ingestManifestDataImpl(btp::ByteView payload, std::uint32_t nowMs) n
 
     if (describedSourceId == 0U || describedBootId == 0U) return false;
 
-    // source_name is a ByteView into `payload`; the source_info block (format 2)
-    // or the records (format 1) begin right after it.
-    const std::uint16_t nameLen = static_cast<std::uint16_t>(header.source_name.size);
-    const std::size_t nameStart = static_cast<std::size_t>(header.source_name.data - payload.data);
+    const std::size_t nameLen = header.source_name.size;
 
-    // source_info block sits between source_name and the records in format 2
-    // (commands.md 3.12): info_count:u16 then that many { key, label, value }
-    // utf8_u16 triples. Walk it to find where the records begin -- info_count
-    // makes its end unambiguous even with records right after it. Format 1
-    // has no block; synthesize an empty one.
-    const std::size_t infoStart = nameStart + nameLen;
-    std::size_t recordsStart = infoStart;
+    // source_info block (commands.md 3.12), info_count prefix included. Empty
+    // for a format-1 source -- this cache then stores and re-emits a bare
+    // "00 00", so a fleet mid-rollout still populates the cache.
+    btp::ByteView rawInfo{};
+    if (reader.raw_source_info(&rawInfo) != btp::MessageError::Ok) return false;
     const std::uint8_t* infoBlob = kEmptySourceInfo;
     std::size_t infoSize = sizeof(kEmptySourceInfo);
-    if (formatVersion >= 2U) {
-        if (infoStart + 2U > payload.size) return false;
-        const std::uint16_t infoCount = read_u16_le(payload.data + infoStart);
-        std::size_t pos = infoStart + 2U;
-        for (std::uint16_t entryIdx = 0U; entryIdx < infoCount; ++entryIdx) {
-            for (int field = 0; field < 3; ++field) {
-                if (pos + 2U > payload.size) return false;
-                const std::uint16_t len = read_u16_le(payload.data + pos);
-                pos += 2U;
-                if (pos + len > payload.size || pos + len < pos) return false;  // overflow-safe
-                pos += len;
-            }
-        }
-        recordsStart = pos;
-        infoSize = recordsStart - infoStart;
-        if (infoSize > kMaxSourceInfoBytes) return false;  // beyond this cache's budget
-        infoBlob = payload.data + infoStart;
+    if (rawInfo.size >= 2U) {
+        if (rawInfo.size > kMaxSourceInfoBytes) return false;  // beyond this cache's budget
+        infoBlob = rawInfo.data;
+        infoSize = rawInfo.size;
     }
-    const std::size_t recordsSize = payload.size - recordsStart;
 
-    if (notModified) {
-        if (recordsSize != 0U || topicCount != 0U || actionCount != 0U) return false;  // malformed NOT_MODIFIED
-    } else {
-        if (recordsSize > kMaxRecordsBytes) return false;  // beyond this cache's budget
-        std::size_t consumed = 0U;
-        if (!walkRecords(payload.data + recordsStart, recordsSize,
-                         static_cast<std::uint32_t>(topicCount) + static_cast<std::uint32_t>(actionCount),
-                         &consumed) ||
-            consumed != recordsSize) {
-            return false;  // record framing does not exactly consume the payload
-        }
+    // topic records then action records. raw_records validates the record_size
+    // framing of each run and requires the payload to end exactly here.
+    if (notModified && (topicCount != 0U || actionCount != 0U)) {
+        return false;  // malformed NOT_MODIFIED (commands.md 3.3)
     }
+    btp::ByteView rawTopics{};
+    btp::ByteView rawActions{};
+    if (reader.raw_records(&rawTopics, &rawActions) != btp::MessageError::Ok) return false;
+    const std::size_t recordsSize = rawTopics.size + rawActions.size;
+    if (!notModified && recordsSize > kMaxRecordsBytes) return false;  // beyond this cache's budget
 
     Entry* entry = findEntry(describedSourceId);
     const bool isNew = (entry == nullptr);
@@ -499,11 +451,15 @@ static bool ingestManifestDataImpl(btp::ByteView payload, std::uint32_t nowMs) n
 
     if (!notModified) {
         const std::size_t copyLen = (nameLen < kMaxNameLength) ? nameLen : kMaxNameLength;
-        std::memcpy(entry->name, payload.data + nameStart, copyLen);
+        std::memcpy(entry->name, header.source_name.data, copyLen);
         entry->name[copyLen] = '\0';
 
-        std::memcpy(entry->records, payload.data + recordsStart, recordsSize);
+        // rawTopics and rawActions are adjacent in the payload, so one copy
+        // from rawTopics.data covers both runs; topicRecordsSize marks the
+        // boundary for put_raw_records when serving.
+        std::memcpy(entry->records, rawTopics.data, recordsSize);
         entry->recordsSize = recordsSize;
+        entry->topicRecordsSize = rawTopics.size;
         entry->topicCount = topicCount;
         entry->actionCount = actionCount;
     }
@@ -607,14 +563,14 @@ std::size_t buildEnumerationResponse(std::size_t index, const btp::Header& reque
         // discover the dongle's own topics alongside the robots'. No special
         // branch anywhere: the dongle became one more source in the catalog.
         std::size_t selfRecordsSize = 0U;
-        std::uint16_t selfTopicCount = 0U;
-        const std::uint8_t* selfRecords = DonglePublisher::topicRecords(&selfRecordsSize, &selfTopicCount);
+        const std::uint8_t* selfRecords = DonglePublisher::topicRecords(&selfRecordsSize, nullptr);
 
         return writeManifestData(requestHeader, kStatusSuccess, flags, kErrorNone,
                                  static_cast<std::uint16_t>(index), static_cast<std::uint16_t>(total),
                                  kSelfConfigRevision, g_selfUuid, BtpTransport::sourceId(), BtpTransport::bootId(),
                                  kSourceRoleDongle, /*online=*/true, kSelfName, g_selfSourceInfo, g_selfSourceInfoSize,
-                                 selfRecords, selfRecordsSize, selfTopicCount, 0U, output, outputCapacity);
+                                 selfRecords, selfRecordsSize, /*topicRecordsSize=*/selfRecordsSize, output,
+                                 outputCapacity);
     }
 
     Entry* sorted[kCapacity];
@@ -626,8 +582,8 @@ std::size_t buildEnumerationResponse(std::size_t index, const btp::Header& reque
     return writeManifestData(requestHeader, kStatusSuccess, flags, kErrorNone, static_cast<std::uint16_t>(index),
                              static_cast<std::uint16_t>(total), entry->configRevision, entry->uuid, entry->sourceId,
                              entry->bootId, entry->role, entry->online, entry->name, entry->sourceInfo,
-                             entry->sourceInfoSize, entry->records, entry->recordsSize, entry->topicCount,
-                             entry->actionCount, output, outputCapacity);
+                             entry->sourceInfoSize, entry->records, entry->recordsSize, entry->topicRecordsSize, output,
+                             outputCapacity);
 }
 
 std::size_t buildTargetedResponse(std::uint32_t targetSourceId, std::uint32_t targetBootId,
@@ -647,15 +603,15 @@ std::size_t buildTargetedResponse(std::uint32_t targetSourceId, std::uint32_t ta
 
     if (!isSelf && entry == nullptr) {
         return writeManifestData(requestHeader, kStatusRejected, kFlagCatalogComplete, kErrorNotFound, 0U, 1U, 0U,
-                                 nullptr, 0U, 0U, 0U, false, "unknown source", nullptr, 0U, nullptr, 0U, 0U, 0U,
-                                 output, outputCapacity);
+                                 nullptr, 0U, 0U, 0U, false, "unknown source", nullptr, 0U, nullptr, 0U, 0U, output,
+                                 outputCapacity);
     }
 
     const std::uint32_t foundBootId = isSelf ? BtpTransport::bootId() : entry->bootId;
     if (targetBootId != 0U && targetBootId != foundBootId) {
         return writeManifestData(requestHeader, kStatusRejected, kFlagCatalogComplete, kErrorStaleTargetBoot, 0U, 1U,
-                                 0U, nullptr, 0U, 0U, 0U, false, "boot mismatch", nullptr, 0U, nullptr, 0U, 0U, 0U,
-                                 output, outputCapacity);
+                                 0U, nullptr, 0U, 0U, 0U, false, "boot mismatch", nullptr, 0U, nullptr, 0U, 0U, output,
+                                 outputCapacity);
     }
 
     const std::uint32_t foundRevision = isSelf ? kSelfConfigRevision : entry->configRevision;
@@ -670,7 +626,7 @@ std::size_t buildTargetedResponse(std::uint32_t targetSourceId, std::uint32_t ta
         return writeManifestData(requestHeader, kStatusSuccess,
                                  static_cast<std::uint8_t>(kFlagNotModified | kFlagCatalogComplete), kErrorNone, 0U,
                                  1U, foundRevision, foundUuid, targetSourceId, foundBootId, foundRole, foundOnline,
-                                 foundName, foundSourceInfo, foundSourceInfoSize, nullptr, 0U, 0U, 0U, output,
+                                 foundName, foundSourceInfo, foundSourceInfoSize, nullptr, 0U, 0U, output,
                                  outputCapacity);
     }
 
@@ -680,19 +636,18 @@ std::size_t buildTargetedResponse(std::uint32_t targetSourceId, std::uint32_t ta
     // dongle's own catalog is served by the existing path, not by a parallel
     // responder object like bally_software's ManifestResponder.
     std::size_t selfRecordsSize = 0U;
-    std::uint16_t selfTopicCount = 0U;
     const std::uint8_t* selfRecords =
-        isSelf ? DonglePublisher::topicRecords(&selfRecordsSize, &selfTopicCount) : nullptr;
+        isSelf ? DonglePublisher::topicRecords(&selfRecordsSize, nullptr) : nullptr;
 
     const std::uint8_t* records = isSelf ? selfRecords : entry->records;
     const std::size_t recordsSize = isSelf ? selfRecordsSize : entry->recordsSize;
-    const std::uint16_t topicCount = isSelf ? selfTopicCount : entry->topicCount;
-    const std::uint16_t actionCount = isSelf ? 0U : entry->actionCount;
+    // isSelf: DonglePublisher emits topic records only, so the whole blob is
+    // the topic run.
+    const std::size_t topicRecordsSize = isSelf ? selfRecordsSize : entry->topicRecordsSize;
 
     return writeManifestData(requestHeader, kStatusSuccess, kFlagCatalogComplete, kErrorNone, 0U, 1U, foundRevision,
                              foundUuid, targetSourceId, foundBootId, foundRole, foundOnline, foundName, foundSourceInfo,
-                             foundSourceInfoSize, records, recordsSize, topicCount, actionCount, output,
-                             outputCapacity);
+                             foundSourceInfoSize, records, recordsSize, topicRecordsSize, output, outputCapacity);
 }
 
 bool lookupTopicMaxRateMillihz(std::uint32_t sourceId, std::uint32_t topicId,
