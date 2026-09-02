@@ -9,9 +9,13 @@
  * @brief Dongle-side BTP identity, sequencing and send helpers, plus
  * COMMAND_REQUEST/COMMAND_RESULT envelope parsing (namespace btp_command).
  *
- * Mirrors the BtpEndpoint/btp_command split already used in bally_software's
- * lib/BtpTransport (same wire layout, same source_id-from-MAC formula), so
- * both firmwares derive identical identity from a MAC with no handshake.
+ * Identity, the outgoing sequence counter and the seal -> fragment -> encode
+ * pipeline are btp::Endpoint (BTP >= 2.7.0), held as one process-wide instance;
+ * this namespace adds the ESP-NOW destination MAC that btp::Endpoint's send
+ * callback has no notion of, plus the peer identity table and btp_command
+ * below. Same wire layout and source_id-from-MAC formula as bally_OS's
+ * lib/BtpTransport, so both firmwares derive identical identity from a MAC with
+ * no handshake.
  * boot_id has no equivalent shortcut: a peer's boot_id can only be learned by
  * authenticating a channel-C BTP frame it actually sent (see
  * rememberAuthenticatedPeer/lookupPeer

@@ -1,11 +1,9 @@
 #include "BtpTransport.h"
 
-#include <btp/fragmentation.hpp>
+#include <btp/endpoint.hpp>
 #include <btp/messages.hpp>
 
-#include <atomic>
 #include <cstring>
-#include <limits>
 
 #if defined(ARDUINO)
 #include <freertos/FreeRTOS.h>
@@ -15,11 +13,51 @@
 #endif
 
 namespace BtpTransport {
+
+// The module's tag-size constant must stay equal to the library's -- callers
+// and tests size sealed buffers off the BtpTransport name, btp::Endpoint does
+// the actual sealing/fragmenting.
+static_assert(kAeadTagSize == btp::kEndpointAeadTagSize,
+              "kAeadTagSize must match btp::kEndpointAeadTagSize");
+
 namespace {
 
-std::atomic<std::uint32_t> g_sourceId{0U};
-std::atomic<std::uint32_t> g_bootId{0U};
-std::atomic<std::uint32_t> g_nextSequence{0U};
+// Identity, the atomic outgoing sequence and the seal -> fragment -> encode
+// pipeline are btp::Endpoint (BTP >= 2.7.0). One process-wide instance, matching
+// the "plain namespace, no owning object" shape the rest of this module keeps.
+btp::Endpoint g_endpoint;
+
+// btp::Endpoint's send callback takes (frame, size); this module's SendFn adds
+// the destination MAC (ESP-NOW is addressed). These thunks carry the MAC and
+// the real callback through btp::Endpoint as its send context.
+struct MacSendAdapter {
+    SendFn fn;
+    void* ctx;
+    const std::uint8_t* mac;
+};
+
+bool macSendThunk(void* context, const std::uint8_t* frame, std::size_t size) noexcept {
+    auto* adapter = static_cast<MacSendAdapter*>(context);
+    return adapter->fn(adapter->ctx, adapter->mac, frame, size);
+}
+
+struct MacSendStatusAdapter {
+    SendWithStatusFn fn;
+    void* ctx;
+    const std::uint8_t* mac;
+    std::uint32_t timeoutMs;
+    bool allDelivered;  // AND of every fragment's delivery verdict
+};
+
+bool macSendStatusThunk(void* context, const std::uint8_t* frame, std::size_t size) noexcept {
+    auto* adapter = static_cast<MacSendStatusAdapter*>(context);
+    bool delivered = false;
+    if (!adapter->fn(adapter->ctx, adapter->mac, frame, size, &delivered, adapter->timeoutMs)) {
+        return false;  // aborts the remaining fragments; send_logical() returns false
+    }
+    adapter->allDelivered = adapter->allDelivered && delivered;
+    return true;
+}
 
 struct PeerIdentity {
     bool used = false;
@@ -70,34 +108,19 @@ bool sameMac(const std::uint8_t* lhs, const std::uint8_t* rhs) noexcept {
 }  // namespace
 
 void configureIdentity(std::uint32_t sourceId, std::uint32_t bootId) noexcept {
-    g_sourceId.store(sourceId, std::memory_order_release);
-    g_bootId.store(bootId, std::memory_order_release);
-    g_nextSequence.store(1U, std::memory_order_release);
+    // configure() also resets the sequence counter to 1 (as the old store did)
+    // and refuses a zero in either field -- BTP reserves 0, and a caller that
+    // passes one used to get frames stamped 0/0; now the endpoint stays
+    // unconfigured and every send fails closed.
+    (void)g_endpoint.configure(sourceId, bootId);
 }
 
-std::uint32_t sourceId() noexcept {
-    return g_sourceId.load(std::memory_order_acquire);
-}
+std::uint32_t sourceId() noexcept { return g_endpoint.source_id(); }
 
-std::uint32_t bootId() noexcept {
-    return g_bootId.load(std::memory_order_acquire);
-}
+std::uint32_t bootId() noexcept { return g_endpoint.boot_id(); }
 
 bool reserveSequence(std::uint32_t* sequenceOut) noexcept {
-    if (sequenceOut == nullptr) return false;
-
-    std::uint32_t current = g_nextSequence.load(std::memory_order_acquire);
-    while (current != 0U) {
-        const std::uint32_t next = current == std::numeric_limits<std::uint32_t>::max()
-                                        ? 0U
-                                        : current + 1U;
-        if (g_nextSequence.compare_exchange_weak(current, next, std::memory_order_acq_rel,
-                                                 std::memory_order_acquire)) {
-            *sequenceOut = current;
-            return true;
-        }
-    }
-    return false;
+    return g_endpoint.reserve_sequence(sequenceOut);
 }
 
 bool encodeSingleFrame(btp::MessageType type,
@@ -111,35 +134,16 @@ bool encodeSingleFrame(btp::MessageType type,
                        std::size_t* bytesWritten,
                        SealFn seal,
                        void* sealContext) noexcept {
-    if (sequence == 0U || seal == nullptr) return false;
-    // Bounded before the tag is even considered, so the addition below can
-    // never wrap (payloadSize is at most a few hundred octets in every real
-    // caller).
-    if (payloadSize > btp::kEspNowMaxPayloadSize) return false;
-    if (payloadSize + kAeadTagSize > btp::kEspNowMaxPayloadSize) return false;
-
-    const btp::Header header{
-        .type = type,
-        .flags = btp::kFlagEncrypted,
-        .source_id = sourceId(),
-        .boot_id = bootId(),
-        .sequence = sequence,
-        .timestamp_us = timestampUs,
-        .object_id = objectId,
-        .fragment_index = 0U,
-        .fragment_count = 1U,
-    };
-
-    // Sealed once, in place of the plaintext -- see SealFn's contract on why
-    // ENCRYPTED has to already be set on `header` above before this call.
-    std::uint8_t sealed[btp::kEspNowMaxPayloadSize];
-    if (!seal(sealContext, header, static_cast<std::uint16_t>(payloadSize), payload, sealed)) {
+    if (sequence == 0U || seal == nullptr || (payload == nullptr && payloadSize != 0U)) {
         return false;
     }
-
-    const btp::Frame frame{header, {sealed, payloadSize + kAeadTagSize}};
-    return btp::encode(frame, btp::TransportProfile::EspNow, output, outputCapacity,
-                       bytesWritten) == btp::Error::Ok;
+    // encode_fragment() with a seal enforces the single-frame ceiling itself
+    // (payload.size + kEndpointAeadTagSize <= kEspNowMaxPayloadSize) and builds
+    // the canonical ENCRYPTED header; a false from `seal` fails the call closed.
+    const btp::LogicalMessage message{type, objectId, timestampUs, {payload, payloadSize}};
+    return g_endpoint.encode_fragment(message, btp::TransportProfile::EspNow, sequence,
+                                      /*fragment_index=*/0U, /*fragment_count=*/1U, output,
+                                      outputCapacity, bytesWritten, seal, sealContext);
 }
 
 bool sendLogical(SendFn send,
@@ -152,65 +156,17 @@ bool sendLogical(SendFn send,
                  std::uint64_t timestampUs,
                  SealFn seal,
                  void* sealContext) noexcept {
-    if (send == nullptr || seal == nullptr || mac == nullptr || (payload == nullptr && payloadSize != 0U)) {
+    if (send == nullptr || seal == nullptr || mac == nullptr ||
+        (payload == nullptr && payloadSize != 0U)) {
         return false;
     }
-    // Bounds the sealed[] buffer below; every real caller stays well under
-    // this (the largest, a fragmented shell command, tops out around 532).
     if (payloadSize > kMaxLogicalPayloadSize) return false;
 
-    std::uint32_t sequence = 0U;
-    if (!reserveSequence(&sequence)) return false;
-
-    // The header sealing is computed over: canonical (unfragmented) shape,
-    // ENCRYPTED already set so the AAD this produces matches the AAD a
-    // receiver reconstructs from the wire flags. fragment_count is filled in
-    // AFTER sealing, from the SEALED size -- see SealFn's contract.
-    const btp::Header sealHeader{
-        .type = type,
-        .flags = btp::kFlagEncrypted,
-        .source_id = sourceId(),
-        .boot_id = bootId(),
-        .sequence = sequence,
-        .timestamp_us = timestampUs,
-        .object_id = objectId,
-        .fragment_index = 0U,
-        .fragment_count = 1U,
-    };
-
-    std::uint8_t sealed[kMaxLogicalPayloadSize + kAeadTagSize];
-    if (!seal(sealContext, sealHeader, static_cast<std::uint16_t>(payloadSize), payload, sealed)) {
-        return false;
-    }
-    const std::size_t sealedSize = payloadSize + kAeadTagSize;
-
-    std::uint8_t count = 0U;
-    if (btp::fragment_count(sealedSize, btp::TransportProfile::EspNow, &count) !=
-        btp::Error::Ok) {
-        return false;
-    }
-
-    btp::Header logicalHeader = sealHeader;
-    logicalHeader.flags = static_cast<std::uint16_t>(
-        btp::kFlagEncrypted | (count > 1U ? btp::kFlagFragmented : 0U));
-    logicalHeader.fragment_count = count;
-
-    for (std::uint8_t index = 0U; index < count; ++index) {
-        btp::Frame fragment{};
-        if (btp::make_fragment(logicalHeader, {sealed, sealedSize}, btp::TransportProfile::EspNow,
-                               index, &fragment) != btp::Error::Ok) {
-            return false;
-        }
-
-        std::uint8_t frame[btp::kEspNowMaxFrameSize];
-        std::size_t frameSize = 0U;
-        if (btp::encode(fragment, btp::TransportProfile::EspNow, frame, sizeof(frame),
-                        &frameSize) != btp::Error::Ok) {
-            return false;
-        }
-        if (!send(context, mac, frame, frameSize)) return false;
-    }
-    return true;
+    MacSendAdapter adapter{send, context, mac};
+    std::uint8_t sealScratch[kMaxLogicalPayloadSize + kAeadTagSize];
+    const btp::LogicalMessage message{type, objectId, timestampUs, {payload, payloadSize}};
+    return g_endpoint.send_logical(message, btp::TransportProfile::EspNow, &macSendThunk, &adapter,
+                                   sealScratch, sizeof(sealScratch), seal, sealContext);
 }
 
 bool sendLogicalWithStatus(SendWithStatusFn sendWithStatus,
@@ -232,60 +188,14 @@ bool sendLogicalWithStatus(SendWithStatusFn sendWithStatus,
     }
     if (payloadSize > kMaxLogicalPayloadSize) return false;
 
-    std::uint32_t sequence = 0U;
-    if (!reserveSequence(&sequence)) return false;
-
-    const btp::Header sealHeader{
-        .type = type,
-        .flags = btp::kFlagEncrypted,
-        .source_id = sourceId(),
-        .boot_id = bootId(),
-        .sequence = sequence,
-        .timestamp_us = timestampUs,
-        .object_id = objectId,
-        .fragment_index = 0U,
-        .fragment_count = 1U,
-    };
-
-    std::uint8_t sealed[kMaxLogicalPayloadSize + kAeadTagSize];
-    if (!seal(sealContext, sealHeader, static_cast<std::uint16_t>(payloadSize), payload, sealed)) {
+    MacSendStatusAdapter adapter{sendWithStatus, context, mac, timeoutMs, /*allDelivered=*/true};
+    std::uint8_t sealScratch[kMaxLogicalPayloadSize + kAeadTagSize];
+    const btp::LogicalMessage message{type, objectId, timestampUs, {payload, payloadSize}};
+    if (!g_endpoint.send_logical(message, btp::TransportProfile::EspNow, &macSendStatusThunk,
+                                 &adapter, sealScratch, sizeof(sealScratch), seal, sealContext)) {
         return false;
     }
-    const std::size_t sealedSize = payloadSize + kAeadTagSize;
-
-    std::uint8_t count = 0U;
-    if (btp::fragment_count(sealedSize, btp::TransportProfile::EspNow, &count) != btp::Error::Ok) {
-        return false;
-    }
-
-    btp::Header logicalHeader = sealHeader;
-    logicalHeader.flags = static_cast<std::uint16_t>(
-        btp::kFlagEncrypted | (count > 1U ? btp::kFlagFragmented : 0U));
-    logicalHeader.fragment_count = count;
-
-    bool allDelivered = true;
-    for (std::uint8_t index = 0U; index < count; ++index) {
-        btp::Frame fragment{};
-        if (btp::make_fragment(logicalHeader, {sealed, sealedSize}, btp::TransportProfile::EspNow,
-                               index, &fragment) != btp::Error::Ok) {
-            return false;
-        }
-
-        std::uint8_t frame[btp::kEspNowMaxFrameSize];
-        std::size_t frameSize = 0U;
-        if (btp::encode(fragment, btp::TransportProfile::EspNow, frame, sizeof(frame),
-                        &frameSize) != btp::Error::Ok) {
-            return false;
-        }
-
-        bool fragmentDelivered = false;
-        if (!sendWithStatus(context, mac, frame, frameSize, &fragmentDelivered, timeoutMs)) {
-            return false;
-        }
-        allDelivered = allDelivered && fragmentDelivered;
-    }
-
-    outDelivered = allDelivered;
+    outDelivered = adapter.allDelivered;
     return true;
 }
 

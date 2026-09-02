@@ -66,7 +66,8 @@ Módulos de comando (um por "modulo" do TinyShell)
 
 Serviços/domínio
   EspNowManager   -> registry de peers e envio/recepção de bytes crus (sem saber o que é BTP)
-  BtpTransport    -> identidade BTP (source_id/boot_id), sequência, envio fragmentado,
+  BtpTransport    -> identidade + sequência + pipeline seal/fragment/encode via btp::Endpoint
+                     (BTP 2.7.0); adiciona o MAC ESP-NOW de destino + tabela de peers +
                      envelope COMMAND_REQUEST/COMMAND_RESULT (namespace btp_command)
   ProtocolRouter  -> wrapper fino sobre btp::Receiver (BTP 2.8.0): decode BTP + CRC +
                      reassembly + sweep de timeout; adiciona mac[6] + arrivalMs do chamador;
@@ -415,11 +416,13 @@ valores de enum novos no codec canônico só pra este tópico.
 
 ### 7.2 Identidade deste dongle (`BtpTransport`)
 
-No boot, `AppRuntime::begin()` chama `BtpTransport::configureIdentity(source_id, boot_id)`:
-`source_id` é derivado do próprio MAC Wi-Fi (mesma fórmula usada em `Bally_OS`, sem
-handshake); `boot_id` é um valor aleatório não nulo por boot (`esp_random()`) — não há
-HELLO/MANIFEST ainda (tópico 16) pra anunciar/persistir isso, e nada aqui depende de
-sobreviver a um reboot.
+No boot, `AppRuntime::begin()` chama `BtpTransport::configureIdentity(source_id, boot_id)`,
+que repassa a um `btp::Endpoint` interno (identidade + contador de sequência atômico +
+pipeline seal/fragment/encode): `source_id` é derivado do próprio MAC Wi-Fi (mesma
+fórmula usada em `Bally_OS`, sem handshake); `boot_id` é um valor aleatório não nulo por
+boot (`esp_random()`) — não há HELLO/MANIFEST ainda (tópico 16) pra anunciar/persistir
+isso, e nada aqui depende de sobreviver a um reboot. Um `source_id`/`boot_id` zero deixa
+o endpoint não configurado e todo envio falha fechado (antes ia com 0/0 no fio).
 
 Como o dongle não tem como descobrir o `boot_id` de um peer sem HELLO, `BtpTransport`
 mantém uma tabela pequena (`rememberPeer`/`lookupPeer`) do último `(source_id, boot_id)`
