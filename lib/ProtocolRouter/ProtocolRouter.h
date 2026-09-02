@@ -1,7 +1,7 @@
 #pragma once
 
 #include <btp/codec.hpp>
-#include <btp/fragmentation.hpp>
+#include <btp/receiver.hpp>
 
 #include <array>
 #include <cstddef>
@@ -9,10 +9,14 @@
 
 /**
  * @brief Decodes BTP datagrams (bytes + size) into routed, type-tagged
- * logical messages: btp::decode() (envelope + CRC-32) then, only for
- * fragmented frames, btp::Reassembler. Everything here is plain C++ with no
- * Arduino/FreeRTOS dependency, so it runs the same way under env:native
- * against BTP's canonical test vectors as it does on-device.
+ * logical messages. The decode + CRC + reassembly core is btp::Receiver
+ * (BTP >= 2.8.0); this class is the thin dongle-side wrapper that adds the
+ * two pieces of caller metadata the library layer has no notion of -- the
+ * sender's MAC and the local arrival instant -- and keeps the
+ * ProtocolRouter:: API the rest of the firmware was written against.
+ * Everything here is plain C++ with no Arduino/FreeRTOS dependency, so it
+ * runs the same way under env:native against BTP's canonical test vectors as
+ * it does on-device.
  *
  * Ownership: the "queue by type, drain from tasks/tick()" part (step 10 of
  * topico 12) is Arduino-only and lives one layer up, in EspNowConfig, which
@@ -93,12 +97,13 @@ public:
     Stats stats() const noexcept;
 
 private:
+    // storageViews_ is declared before receiver_ so member initialization
+    // order hands the btp::Receiver constructor a fully built view table;
+    // reordering these two would pass it uninitialized pointers.
     btp::ReassemblySlot slots_[kSlotCount];
     std::uint8_t storage_[kSlotCount][kMaxPayloadSize];
     std::array<btp::ReassemblyStorage, kSlotCount> storageViews_;
-    btp::Reassembler reassembler_;
-
-    Stats stats_{};
+    btp::Receiver receiver_;
 };
 
 }  // namespace ProtocolRouter

@@ -14,18 +14,17 @@ std::array<btp::ReassemblyStorage, kSlotCount> makeStorageViews(
     return views;
 }
 
-void fillRouted(const std::uint8_t mac[6],
-                const btp::Header& header,
-                btp::ByteView payload,
-                std::uint64_t nowMs,
-                RoutedMessage* out) noexcept {
-    std::memcpy(out->mac, mac, 6U);
-    out->header = header;
-    out->payloadSize = payload.size;
-    if (payload.size > 0U) {
-        std::memcpy(out->payload, payload.data, payload.size);
+Outcome mapOutcome(btp::ReceiveOutcome outcome) noexcept {
+    switch (outcome) {
+        case btp::ReceiveOutcome::Complete: return Outcome::Routed;
+        case btp::ReceiveOutcome::FragmentAccepted: return Outcome::FragmentAccepted;
+        case btp::ReceiveOutcome::DuplicateFragment: return Outcome::DuplicateFragment;
+        case btp::ReceiveOutcome::DroppedCrc: return Outcome::DroppedCrc;
+        case btp::ReceiveOutcome::DroppedDecode: return Outcome::DroppedDecode;
+        case btp::ReceiveOutcome::DroppedReassembly: return Outcome::DroppedReassembly;
+        case btp::ReceiveOutcome::InvalidArgument: return Outcome::DroppedInvalidArgument;
     }
-    out->arrivalMs = nowMs;
+    return Outcome::DroppedInvalidArgument;
 }
 
 }  // namespace
@@ -34,7 +33,8 @@ Router::Router() noexcept
     : slots_(),
       storage_(),
       storageViews_(makeStorageViews(storage_)),
-      reassembler_(slots_, storageViews_.data(), kSlotCount, kReassemblyTimeoutMs) {}
+      receiver_(slots_, storageViews_.data(), kSlotCount, kReassemblyTimeoutMs,
+                btp::TransportProfile::EspNow) {}
 
 Outcome Router::submit(const std::uint8_t mac[6],
                        const std::uint8_t* data,
@@ -42,66 +42,40 @@ Outcome Router::submit(const std::uint8_t mac[6],
                        std::uint64_t nowMs,
                        RoutedMessage* outMessage) noexcept {
     if (mac == nullptr || data == nullptr || size == 0U || outMessage == nullptr) {
-        ++stats_.droppedInvalidArgument;
+        // btp::Receiver reports InvalidArgument on a null datagram too, but it
+        // needs a non-null message_out to be handed one, and it has no notion
+        // of mac; short-circuit.
         return Outcome::DroppedInvalidArgument;
     }
 
-    btp::DecodedFrame decoded{};
-    const btp::Error decodeError = btp::decode(data, size, btp::TransportProfile::EspNow, &decoded);
-    if (decodeError != btp::Error::Ok) {
-        if (decodeError == btp::Error::CrcMismatch) {
-            ++stats_.droppedCrc;
-            return Outcome::DroppedCrc;
-        }
-        ++stats_.droppedDecode;
-        return Outcome::DroppedDecode;
-    }
+    btp::ReceivedMessage received{};
+    const btp::ReceiveOutcome outcome = receiver_.submit(
+        data, size, nowMs, outMessage->payload, kMaxPayloadSize, &received);
 
-    const bool fragmented = (decoded.header.flags & btp::kFlagFragmented) != 0U;
-    if (!fragmented) {
-        // decode()'s validate_header() already requires fragment_index==0 and
-        // fragment_count==1 here, so this datagram already is the whole
-        // logical message; its payload only points into the caller's
-        // transient RX buffer, so copy it out now.
-        fillRouted(mac, decoded.header, decoded.payload, nowMs, outMessage);
-        ++stats_.routed;
-        return Outcome::Routed;
+    if (outcome == btp::ReceiveOutcome::Complete) {
+        // mac and arrivalMs are caller metadata the library never sees; the
+        // header and the reassembled payload copy come from btp::Receiver
+        // (which released the slot already). arrivalMs is stored here only,
+        // never merged into header.timestamp_us.
+        std::memcpy(outMessage->mac, mac, 6U);
+        outMessage->header = received.header;
+        outMessage->payloadSize = received.payload.size;
+        outMessage->arrivalMs = nowMs;
     }
-
-    btp::ReassembledMessage completed{};
-    const btp::ReassemblyEvent event = reassembler_.push(decoded, nowMs, &completed);
-    switch (event) {
-        case btp::ReassemblyEvent::Accepted:
-            ++stats_.fragmentsAccepted;
-            return Outcome::FragmentAccepted;
-        case btp::ReassemblyEvent::Duplicate:
-            ++stats_.duplicateFragments;
-            return Outcome::DuplicateFragment;
-        case btp::ReassemblyEvent::Complete:
-            fillRouted(mac, completed.header, completed.payload, nowMs, outMessage);
-            // Release right away: queueing the *copy* downstream, not the
-            // slot, keeps the small reassembly pool free for other sources
-            // (e.g. two robots fragmenting at once) even if a per-type queue
-            // is momentarily full.
-            reassembler_.release(completed.slot_index);
-            ++stats_.routed;
-            return Outcome::Routed;
-        case btp::ReassemblyEvent::InvalidFragment:
-        case btp::ReassemblyEvent::Conflict:
-        case btp::ReassemblyEvent::MessageTooLarge:
-        case btp::ReassemblyEvent::NoSlot:
-            ++stats_.droppedReassembly;
-            return Outcome::DroppedReassembly;
-        case btp::ReassemblyEvent::InvalidArgument:
-            ++stats_.droppedInvalidArgument;
-            return Outcome::DroppedInvalidArgument;
-    }
-    ++stats_.droppedInvalidArgument;
-    return Outcome::DroppedInvalidArgument;
+    return mapOutcome(outcome);
 }
 
 Stats Router::stats() const noexcept {
-    return stats_;
+    const btp::Receiver::Stats s = receiver_.stats();
+    Stats snapshot{};
+    snapshot.routed = s.completed;
+    snapshot.fragmentsAccepted = s.fragments_accepted;
+    snapshot.duplicateFragments = s.duplicate_fragments;
+    snapshot.droppedDecode = s.dropped_decode;
+    snapshot.droppedCrc = s.dropped_crc;
+    snapshot.droppedReassembly = s.dropped_reassembly;
+    snapshot.droppedInvalidArgument = s.invalid_argument;
+    return snapshot;
 }
 
 }  // namespace ProtocolRouter
