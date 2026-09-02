@@ -1,6 +1,7 @@
 #pragma once
 
 #include <btp/codec.hpp>
+#include <btp/session.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -109,8 +110,13 @@ enum class HelloParseError : std::uint8_t {
     VersionsNotAscending,
 };
 
+// Kept for test_parse_hello_matches_canonical_vector; the live HELLO decode
+// path now runs inside btp::Session (which owns btp::decode_hello +
+// btp::negotiate + the HELLO_RESULT / SESSION_CLOSE_RESULT encoders).
 HelloParseError parseHello(btp::ByteView payload, HelloView* out) noexcept;
 
+// The negotiated communication limits, surfaced by Session::effectiveLimits().
+// Filled from btp::EffectiveLimits after a HELLO is accepted.
 struct EffectiveLimits {
     std::uint32_t maxLogicalPayload = 0U;
     std::uint16_t maxInflightReassemblies = 0U;
@@ -118,29 +124,6 @@ struct EffectiveLimits {
     std::uint32_t maxDedupEntries = 0U;
     std::uint32_t sessionTimeoutMs = 0U;
 };
-
-EffectiveLimits negotiate(const HelloView& hello, const LocalLimits& local) noexcept;
-
-std::size_t buildHelloResultSuccess(std::uint32_t requestSourceId, std::uint32_t requestBootId,
-                                    std::uint32_t replyToSequence, const EffectiveLimits& limits,
-                                    const std::uint8_t localUuid[16], std::uint32_t configRevision,
-                                    std::uint8_t* output, std::size_t outputCapacity) noexcept;
-
-std::size_t buildHelloResultFailure(std::uint32_t requestSourceId, std::uint32_t requestBootId,
-                                    std::uint32_t replyToSequence, std::uint8_t* output,
-                                    std::size_t outputCapacity) noexcept;
-
-struct SessionCloseView {
-    std::uint8_t reason;
-    std::uint32_t drainTimeoutMs;
-};
-
-bool parseSessionClose(btp::ByteView payload, SessionCloseView* out) noexcept;
-
-std::size_t buildSessionCloseResult(std::uint32_t requestSourceId, std::uint32_t requestBootId,
-                                    std::uint32_t replyToSequence, std::uint8_t status,
-                                    std::uint16_t errorCode, std::uint8_t* output,
-                                    std::size_t outputCapacity) noexcept;
 
 struct StatusCounters {
     std::uint64_t uptimeUs = 0;
@@ -224,18 +207,28 @@ void buildReadyLineFromNonce(std::uint64_t nonce, char outReadyLine[kReadyLineCa
 void buildConsoleLine(char outConsoleLine[kConsoleLineCapacity]) noexcept;
 
 /**
- * @brief One session's negotiation state. Pure logic: the caller performs
- * all actual byte I/O (COBS framing, envelope encode/decode via
- * btp::encode/btp::decode + BtpTransport for outgoing sequence/identity) and
- * decides how/where to send an output payload built here.
+ * @brief One serial session's state, on top of btp::Session (BTP >= 2.9.0).
+ *
+ * btp::Session owns the responder state machine -- the Console/AwaitingHello/
+ * Protocolled lifetime, the 2s HELLO deadline, the negotiated inactivity
+ * watchdog, and the HELLO / SESSION_CLOSE handling (via btp::decode_hello,
+ * btp::negotiate and the HELLO_RESULT / SESSION_CLOSE_RESULT encoders). This
+ * wrapper keeps the dongle-specific pieces the library layer has no notion of:
+ * the object_id -> FrameOutcome routing this topic understands, the
+ * console<->protocol ASCII text, and the "leave the Console flip to
+ * pollTimeout()" ordering SerialMux::tick() was written against.
+ *
+ * Still pure logic: the caller performs all byte I/O (COBS framing, envelope
+ * encode/decode, outgoing sequence/identity via BtpTransport) and decides
+ * how/where to send an output payload built here.
  */
 class Session {
 public:
     explicit Session(const LocalLimits& localLimits) noexcept;
 
-    State state() const noexcept { return state_; }
-    bool isConsole() const noexcept { return state_ == State::Console; }
-    bool isProtocolled() const noexcept { return state_ == State::Protocolled; }
+    State state() const noexcept;
+    bool isConsole() const noexcept { return state() == State::Console; }
+    bool isProtocolled() const noexcept { return state() == State::Protocolled; }
 
     void setLocalUuid(const std::uint8_t uuid[16]) noexcept;
 
@@ -244,8 +237,8 @@ public:
     // config_revision field. Kept as a plain setter rather than a
     // ManifestCache dependency here -- SerialSession stays a leaf, native-
     // testable module; the caller (SerialMux) refreshes this before each
-    // HELLO exchange.
-    void setLocalConfigRevision(std::uint32_t configRevision) noexcept { localConfigRevision_ = configRevision; }
+    // HELLO exchange. Pushed into btp::Session via set_local().
+    void setLocalConfigRevision(std::uint32_t configRevision) noexcept;
 
     // Called once a "BTP/1 ENTER ..." line was recognized (or synthesized by
     // a shell command). Arms the HELLO deadline and moves to AwaitingHello.
@@ -293,14 +286,22 @@ public:
     std::uint32_t peerBootId() const noexcept { return peerBootId_; }
 
 private:
+    void refreshLocalHello() noexcept;
+    FrameOutcome classifyProtocolObject(const btp::Header& header) const noexcept;
+
     LocalLimits local_;
+    btp::Hello localHello_;
     EffectiveLimits effective_{};
-    State state_;
-    std::uint64_t deadlineMs_;
+    btp::Session btpSession_;
     std::uint8_t localUuid_[16];
-    std::uint32_t peerSourceId_;
-    std::uint32_t peerBootId_;
     std::uint32_t localConfigRevision_ = 0U;
+    std::uint32_t peerSourceId_ = 0U;
+    std::uint32_t peerBootId_ = 0U;
+    // btp::Session::on_frame() self-expires a stale deadline; the old onFrame()
+    // left that flip to pollTimeout(), which SerialMux::tick() relies on to run
+    // its session-ended cleanup. Latch a TimedOut seen inside onFrame() and
+    // report it on the next pollTimeout().
+    bool timeoutLatched_ = false;
 };
 
 } // namespace SerialSession

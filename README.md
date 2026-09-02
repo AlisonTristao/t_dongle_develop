@@ -18,7 +18,7 @@ para alterar/estender o firmware.
 - Framework Arduino via PlatformIO
 - ESP32-S3 (`esp32-s3-devkitc-1`), C++17
 - [TinyShell](https://github.com/AlisonTristao/TinyShell) — dispatch de módulos/comandos
-- [BTP](https://github.com/AlisonTristao/BTP) (`lib_deps` fixado em `v2.3.0`) — codec/fragmentação
+- [BTP](https://github.com/AlisonTristao/BTP) (`lib_deps` fixado em `v2.9.0`) — codec/fragmentação
   do Binary Telemetry Protocol (fio v2, `version == 0x02`), compartilhado com `Bally_OS`/`TraceView`
 - SQLite (`Sqlite3Esp32`) sobre SD_MMC
 - Adafruit GFX + ST7735 (LCD 160x80)
@@ -68,12 +68,13 @@ Serviços/domínio
   EspNowManager   -> registry de peers e envio/recepção de bytes crus (sem saber o que é BTP)
   BtpTransport    -> identidade BTP (source_id/boot_id), sequência, envio fragmentado,
                      envelope COMMAND_REQUEST/COMMAND_RESULT (namespace btp_command)
-  ProtocolRouter  -> decode BTP + validação de CRC + reassembly compartilhado
-                     (btp::Reassembler); puro C++, sem Arduino, testável em env:native
-  SerialSession   -> estado Console/AwaitingHello/Protocolled da sessão BTP v1 na serial
-                     USB; parse/build de HELLO, HELLO_RESULT, SESSION_CLOSE(_RESULT), STATUS;
-                     reconhece MANIFEST_REQUEST (tópico 16); puro C++, sem Arduino,
-                     testável em env:native
+  ProtocolRouter  -> wrapper fino sobre btp::Receiver (BTP 2.8.0): decode BTP + CRC +
+                     reassembly + sweep de timeout; adiciona mac[6] + arrivalMs do chamador;
+                     puro C++, sem Arduino, testável em env:native
+  SerialSession   -> wrapper sobre btp::Session (BTP 2.9.0): ciclo de vida
+                     Console/AwaitingHello/Protocolled + watchdog de inatividade + HELLO/
+                     SESSION_CLOSE. Local: roteamento por object_id, texto ENTER/READY/CONSOLE,
+                     STATUS v1/v2, classify. Puro C++, sem Arduino, testável em env:native
   ManifestCache   -> cache em memória de MANIFEST_DATA por source_id (tópico 16): guarda os
                      registros de tópico/ação de cada robô verbatim (opacos, delimitados por
                      record_size), monta MANIFEST_DATA para o desktop (alvo único ou
@@ -98,7 +99,7 @@ Serviços/domínio
 Plataforma
   ShellLineEditor (editor de linha, no pacote TinyShell) / ShellOutput (formatação) / StartupConfig (boot)
   Arduino/ESP-IDF: WiFi, esp_now, FreeRTOS, SD_MMC, time
-  BTP (lib externa via git, lib_deps fixado em v2.3.0): codec/fragmentação BTP (fio v2)
+  BTP (lib externa via git, lib_deps fixado em v2.9.0): codec/fragmentação BTP (fio v2)
 ```
 
 Grafo de dependências entre as libs (setas = "depende de"; auditado nesta revisão —
@@ -394,11 +395,11 @@ Cada comando rodado via `ShellConfig::runLine()` pode virar uma linha em `comman
 Todo datagrama trocado com um peer é um frame BTP de fio v2 (`version == 0x02`
 no header; fonte canônica no repositório
 [BTP](https://github.com/AlisonTristao/BTP), integrada aqui via
-`lib_deps = https://github.com/AlisonTristao/BTP.git#v2.3.0`):
+`lib_deps = https://github.com/AlisonTristao/BTP.git#v2.9.0`):
 `btp::Header` (`type`, `flags`, `source_id`, `boot_id`, `sequence`, `timestamp_us`,
 `object_id`, `fragment_index`, `fragment_count`) + payload + CRC-32. `EspNowManager` só
-transporta bytes crus; `ProtocolRouter` decodifica, valida o CRC e faz reassembly
-(`btp::Reassembler`) antes de rotear por `MessageType` (`Telemetry`/`Log`/`Command`/
+transporta bytes crus; `ProtocolRouter` (via `btp::Receiver`) decodifica, valida o CRC e
+faz reassembly antes de rotear por `MessageType` (`Telemetry`/`Log`/`Command`/
 `Terminal`/`Control`) para uma fila própria em `EspNowConfig` (uma por tipo, com contador de
 drop). `source_id`/`boot_id`/`sequence`/`timestamp_us` da origem chegam intactos ao próximo
 estágio; o horário de chegada é só metadado local (`RoutedMessage::arrivalMs`), nunca
@@ -458,7 +459,7 @@ heartbeat.
 4. A saída completa volta ao mesmo MAC como `COMMAND_RESULT` (`SUCCESS`/mensagem = saída do
    shell) — nunca como um novo `COMMAND_REQUEST`, então não há risco de loop resposta-gera-
    resposta por construção do protocolo (tipos diferentes de objeto).
-5. Fragmentação agora é transparente (via `ProtocolRouter`/`btp::Reassembler`): um comando
+5. Fragmentação agora é transparente (via `ProtocolRouter`/`btp::Receiver`): um comando
    remoto pode ocupar vários pacotes ESP-NOW (limite prático ~512 bytes de texto).
 
 Exemplo: um robô manda `dongle -clock` via `send_to` para buscar a hora; o dongle executa e

@@ -36,6 +36,40 @@ char toLowerHex(char c) noexcept {
     return (c >= 'A' && c <= 'F') ? static_cast<char>(c - 'A' + 'a') : c;
 }
 
+// This dongle's own advertisement, fed to btp::Session so it can run
+// btp::negotiate against the desktop's HELLO and stamp HELLO_RESULT's
+// peer_uuid / config_revision. It is never transmitted -- the dongle is the
+// responder and never sends a HELLO -- so the role is nominal; Gateway fits a
+// device that bridges ESP-NOW <-> serial. version_count/versions must contain
+// the one envelope version this firmware speaks so negotiation finds a match.
+btp::Hello makeLocalHello(const LocalLimits& limits, const std::uint8_t uuid[16],
+                          std::uint32_t configRevision) noexcept {
+    btp::Hello hello{};
+    hello.role = static_cast<std::uint8_t>(btp::Role::Gateway);
+    hello.version_count = 1U;
+    hello.versions[0] = 1U;
+    hello.max_logical_payload = limits.maxLogicalPayload;
+    hello.max_inflight_reassemblies = limits.maxInflightReassemblies;
+    hello.max_subscriptions = limits.maxSubscriptions;
+    hello.max_dedup_entries = limits.maxDedupEntries;
+    hello.session_timeout_ms = limits.sessionTimeoutMs;
+    std::memcpy(hello.peer_uuid, uuid, 16U);
+    hello.config_revision = configRevision;
+    return hello;
+}
+
+EffectiveLimits translateLimits(const btp::EffectiveLimits& in) noexcept {
+    EffectiveLimits out{};
+    out.maxLogicalPayload = in.max_logical_payload;
+    out.maxInflightReassemblies = in.max_inflight_reassemblies;
+    out.maxSubscriptions = in.max_subscriptions;
+    out.maxDedupEntries = in.max_dedup_entries;
+    out.sessionTimeoutMs = in.session_timeout_ms;
+    return out;
+}
+
+const std::uint8_t kZeroUuid[16] = {0};
+
 }  // namespace
 
 PriorityClass classify(btp::MessageType type, std::uint16_t objectId) noexcept {
@@ -110,98 +144,6 @@ HelloParseError parseHello(btp::ByteView payload, HelloView* out) noexcept {
 
     *out = view;
     return HelloParseError::Ok;
-}
-
-EffectiveLimits negotiate(const HelloView& hello, const LocalLimits& local) noexcept {
-    EffectiveLimits out{};
-    out.maxLogicalPayload = (hello.maxLogicalPayload < local.maxLogicalPayload)
-        ? hello.maxLogicalPayload : local.maxLogicalPayload;
-    out.maxInflightReassemblies = (hello.maxInflightReassemblies < local.maxInflightReassemblies)
-        ? hello.maxInflightReassemblies : local.maxInflightReassemblies;
-    out.maxSubscriptions = (hello.maxSubscriptions < local.maxSubscriptions)
-        ? hello.maxSubscriptions : local.maxSubscriptions;
-    out.maxDedupEntries = (hello.maxDedupEntries < local.maxDedupEntries)
-        ? hello.maxDedupEntries : local.maxDedupEntries;
-    out.sessionTimeoutMs = (hello.sessionTimeoutMs < local.sessionTimeoutMs)
-        ? hello.sessionTimeoutMs : local.sessionTimeoutMs;
-    return out;
-}
-
-std::size_t buildHelloResultSuccess(std::uint32_t requestSourceId, std::uint32_t requestBootId,
-                                    std::uint32_t replyToSequence, const EffectiveLimits& limits,
-                                    const std::uint8_t localUuid[16], std::uint32_t configRevision,
-                                    std::uint8_t* output, std::size_t outputCapacity) noexcept {
-    if (localUuid == nullptr) {
-        return 0U;
-    }
-    btp::HelloResult result{};
-    result.request = {requestSourceId, requestBootId, replyToSequence};
-    result.status = static_cast<std::uint8_t>(btp::ResultStatus::Success);
-    result.selected_version = 1U;
-    result.error_code = static_cast<std::uint16_t>(btp::ResultError::None);
-    result.max_logical_payload = limits.maxLogicalPayload;
-    result.max_inflight_reassemblies = limits.maxInflightReassemblies;
-    result.max_subscriptions = limits.maxSubscriptions;
-    result.max_dedup_entries = limits.maxDedupEntries;
-    result.session_timeout_ms = limits.sessionTimeoutMs;
-    std::memcpy(result.peer_uuid, localUuid, 16U);
-    result.config_revision = configRevision;
-
-    std::size_t written = 0U;
-    if (btp::encode_hello_result(result, output, outputCapacity, &written) != btp::MessageError::Ok) {
-        return 0U;
-    }
-    return written;
-}
-
-std::size_t buildHelloResultFailure(std::uint32_t requestSourceId, std::uint32_t requestBootId,
-                                    std::uint32_t replyToSequence, std::uint8_t* output,
-                                    std::size_t outputCapacity) noexcept {
-    btp::HelloResult result{};
-    result.request = {requestSourceId, requestBootId, replyToSequence};
-    result.status = static_cast<std::uint8_t>(btp::ResultStatus::Unsupported);
-    result.selected_version = 0U;  // no version selected on failure
-    result.error_code = static_cast<std::uint16_t>(btp::ResultError::UnsupportedVersion);
-    // limits, peer_uuid and config_revision stay zero.
-
-    std::size_t written = 0U;
-    if (btp::encode_hello_result(result, output, outputCapacity, &written) != btp::MessageError::Ok) {
-        return 0U;
-    }
-    return written;
-}
-
-bool parseSessionClose(btp::ByteView payload, SessionCloseView* out) noexcept {
-    if (out == nullptr) {
-        return false;
-    }
-    // btp::decode_session_close enforces the 8-octet size, the zero reserved
-    // octets and the reason enum (0..3) -- the last is stricter than the old
-    // hand-rolled parse, which stored any reason byte; onFrame() only cares
-    // whether the parse succeeded (SUCCESS vs REJECTED in the result).
-    btp::SessionClose close{};
-    if (btp::decode_session_close(payload.data, payload.size, &close) != btp::MessageError::Ok) {
-        return false;
-    }
-    out->reason = close.reason;
-    out->drainTimeoutMs = close.drain_timeout_ms;
-    return true;
-}
-
-std::size_t buildSessionCloseResult(std::uint32_t requestSourceId, std::uint32_t requestBootId,
-                                    std::uint32_t replyToSequence, std::uint8_t status,
-                                    std::uint16_t errorCode, std::uint8_t* output,
-                                    std::size_t outputCapacity) noexcept {
-    btp::ControlResult result{};
-    result.request = {requestSourceId, requestBootId, replyToSequence};
-    result.status = status;
-    result.error_code = errorCode;
-
-    std::size_t written = 0U;
-    if (btp::encode_session_close_result(result, output, outputCapacity, &written) != btp::MessageError::Ok) {
-        return 0U;
-    }
-    return written;
 }
 
 // The module's wire constants must stay equal to the library's -- SerialMux
@@ -322,143 +264,141 @@ void buildConsoleLine(char outConsoleLine[kConsoleLineCapacity]) noexcept {
 
 Session::Session(const LocalLimits& localLimits) noexcept
     : local_(localLimits),
-      state_(State::Console),
-      deadlineMs_(0U),
-      localUuid_{0},
-      peerSourceId_(0U),
-      peerBootId_(0U) {}
+      localHello_(makeLocalHello(localLimits, kZeroUuid, 0U)),
+      btpSession_(localHello_, kHelloDeadlineMs),
+      localUuid_{0} {}
+
+State Session::state() const noexcept {
+    // A TimedOut latched inside onFrame() has not been reported to SerialMux
+    // yet: keep looking Protocolled so tick()'s early "isConsole()" returns do
+    // not skip the pollTimeout() that runs the session-ended cleanup.
+    if (timeoutLatched_) {
+        return State::Protocolled;
+    }
+    switch (btpSession_.state()) {
+        case btp::SessionState::Idle: return State::Console;
+        case btp::SessionState::AwaitingHello: return State::AwaitingHello;
+        case btp::SessionState::Active: return State::Protocolled;
+    }
+    return State::Console;
+}
+
+void Session::refreshLocalHello() noexcept {
+    localHello_ = makeLocalHello(local_, localUuid_, localConfigRevision_);
+    btpSession_.set_local(localHello_);
+}
 
 void Session::setLocalUuid(const std::uint8_t uuid[16]) noexcept {
     if (uuid == nullptr) {
         return;
     }
     std::memcpy(localUuid_, uuid, 16U);
+    refreshLocalHello();
+}
+
+void Session::setLocalConfigRevision(std::uint32_t configRevision) noexcept {
+    localConfigRevision_ = configRevision;
+    refreshLocalHello();
 }
 
 void Session::beginNegotiation(std::uint64_t nowMs) noexcept {
-    state_ = State::AwaitingHello;
-    deadlineMs_ = nowMs + kHelloDeadlineMs;
+    timeoutLatched_ = false;
     peerSourceId_ = 0U;
     peerBootId_ = 0U;
+    // arm() is a no-op unless Idle; the old beginNegotiation() moved to
+    // AwaitingHello from any state, so drop a live session first.
+    btpSession_.reset();
+    btpSession_.arm(nowMs);
+}
+
+Session::FrameOutcome Session::classifyProtocolObject(const btp::Header& header) const noexcept {
+    if (header.type == btp::MessageType::Command &&
+        header.object_id == BtpTransport::btp_command::kCommandRequestObjectId) {
+        return FrameOutcome::CommandRequest;
+    }
+    if (header.type == btp::MessageType::Terminal && header.object_id == kTerminalInObjectId) {
+        return FrameOutcome::TerminalIn;
+    }
+    if (header.type == btp::MessageType::Control && header.object_id == kManifestRequestObjectId) {
+        return FrameOutcome::ManifestRequest;
+    }
+    if (header.type == btp::MessageType::Control && header.object_id == kSubscribeObjectId) {
+        return FrameOutcome::SubscribeRequest;
+    }
+    if (header.type == btp::MessageType::Control && header.object_id == kUnsubscribeObjectId) {
+        return FrameOutcome::UnsubscribeRequest;
+    }
+    // Reserved/unsupported object for this topic (a stray HELLO mid-session,
+    // etc.): ignored, watchdog already renewed by btp::Session.
+    return FrameOutcome::Ignored;
 }
 
 Session::FrameResult Session::onFrame(const btp::DecodedFrame& frame, std::uint64_t nowMs,
                                       std::uint8_t* outPayload, std::size_t outPayloadCapacity) noexcept {
     FrameResult result{};
 
-    if (state_ == State::AwaitingHello) {
-        if (frame.header.type == btp::MessageType::Control && frame.header.object_id == kHelloObjectId) {
-            HelloView hello{};
-            const HelloParseError parseError = parseHello(frame.payload, &hello);
-            if (parseError == HelloParseError::Ok && hello.supportsVersion1) {
-                effective_ = negotiate(hello, local_);
-                peerSourceId_ = frame.header.source_id;
-                peerBootId_ = frame.header.boot_id;
-                const std::size_t written = buildHelloResultSuccess(
-                    frame.header.source_id, frame.header.boot_id, frame.header.sequence,
-                    effective_, localUuid_, localConfigRevision_, outPayload, outPayloadCapacity);
-                if (written > 0U) {
-                    state_ = State::Protocolled;
-                    deadlineMs_ = nowMs + effective_.sessionTimeoutMs;
-                    result.outcome = FrameOutcome::HelloAccepted;
-                    result.outPayloadSize = written;
-                    return result;
-                }
-            }
+    const btp::SessionOutcome outcome =
+        btpSession_.on_frame(frame, nowMs, outPayload, outPayloadCapacity);
 
-            // Malformed HELLO or no common version: fail closed, back to console
-            // (session-and-terminal.md section 2: "closes the session after
-            // transmitting the response").
-            const std::size_t written = buildHelloResultFailure(
-                frame.header.source_id, frame.header.boot_id, frame.header.sequence,
-                outPayload, outPayloadCapacity);
+    switch (outcome.event) {
+        case btp::SessionEvent::None:
+            break;  // FrameOutcome::Ignored
+
+        case btp::SessionEvent::TimedOut:
+            // btp::Session self-expired a stale deadline on this frame; the old
+            // onFrame() never did, leaving the flip to pollTimeout(). Latch it.
+            timeoutLatched_ = true;
+            break;  // FrameOutcome::Ignored for now
+
+        case btp::SessionEvent::HelloAccepted:
+            effective_ = translateLimits(btpSession_.effective_limits());
+            peerSourceId_ = btpSession_.peer_source_id();
+            peerBootId_ = btpSession_.peer_boot_id();
+            result.outcome = FrameOutcome::HelloAccepted;
+            result.outPayloadSize = outcome.reply_size;
+            break;
+
+        case btp::SessionEvent::HelloRejected:
             result.outcome = FrameOutcome::HelloRejected;
-            result.outPayloadSize = written;
+            result.outPayloadSize = outcome.reply_size;
             result.consoleTransition = true;
             buildConsoleLine(result.consoleLine);
-            state_ = State::Console;
-            return result;
-        }
+            break;
 
-        // "O primeiro frame do cliente MUST ser HELLO... nenhuma outra
-        // mensagem antes dele": anything else is ignored and does NOT renew
-        // the 2s HELLO deadline.
-        return result;
+        case btp::SessionEvent::SessionClosed:
+            result.outcome = FrameOutcome::SessionClosed;
+            result.outPayloadSize = outcome.reply_size;
+            result.consoleTransition = true;
+            buildConsoleLine(result.consoleLine);
+            break;
+
+        case btp::SessionEvent::FrameAccepted:
+            result.outcome = classifyProtocolObject(frame.header);
+            break;
+
+        case btp::SessionEvent::Abandoned:
+            break;  // cannot come from on_frame()
     }
 
-    if (state_ != State::Protocolled) {
-        return result; // Console state never decodes frames; nothing to do here.
-    }
-
-    // Protocolled: any validly decoded BTP frame renews the session watchdog,
-    // regardless of whether its object is understood below.
-    deadlineMs_ = nowMs + effective_.sessionTimeoutMs;
-
-    if (frame.header.type == btp::MessageType::Control && frame.header.object_id == kSessionCloseObjectId) {
-        SessionCloseView close{};
-        const bool parsed = parseSessionClose(frame.payload, &close);
-        const std::size_t written = buildSessionCloseResult(
-            frame.header.source_id, frame.header.boot_id, frame.header.sequence,
-            parsed ? 0x00U : 0x01U /*SUCCESS/REJECTED*/, parsed ? 0x0000U : 0x0001U /*NONE/MALFORMED_PAYLOAD*/,
-            outPayload, outPayloadCapacity);
-        result.outcome = FrameOutcome::SessionClosed;
-        result.outPayloadSize = written;
-        result.consoleTransition = true;
-        buildConsoleLine(result.consoleLine);
-        state_ = State::Console;
-        return result;
-    }
-
-    if (frame.header.type == btp::MessageType::Command &&
-        frame.header.object_id == BtpTransport::btp_command::kCommandRequestObjectId) {
-        result.outcome = FrameOutcome::CommandRequest;
-        return result;
-    }
-
-    if (frame.header.type == btp::MessageType::Terminal && frame.header.object_id == kTerminalInObjectId) {
-        result.outcome = FrameOutcome::TerminalIn;
-        return result;
-    }
-
-    if (frame.header.type == btp::MessageType::Control && frame.header.object_id == kManifestRequestObjectId) {
-        result.outcome = FrameOutcome::ManifestRequest;
-        return result;
-    }
-
-    if (frame.header.type == btp::MessageType::Control && frame.header.object_id == kSubscribeObjectId) {
-        result.outcome = FrameOutcome::SubscribeRequest;
-        return result;
-    }
-
-    if (frame.header.type == btp::MessageType::Control && frame.header.object_id == kUnsubscribeObjectId) {
-        result.outcome = FrameOutcome::UnsubscribeRequest;
-        return result;
-    }
-
-    // Reserved/unsupported object for this topic (a stray HELLO mid-session,
-    // etc.): ignored, watchdog already renewed above.
     return result;
 }
 
 bool Session::pollTimeout(std::uint64_t nowMs, char outConsoleLine[kConsoleLineCapacity]) noexcept {
-    if (state_ == State::Console) {
-        return false;
+    if (timeoutLatched_) {
+        timeoutLatched_ = false;
+        buildConsoleLine(outConsoleLine);
+        return true;
     }
-    if (nowMs < deadlineMs_) {
-        return false;
+    if (btpSession_.poll(nowMs).event == btp::SessionEvent::TimedOut) {
+        buildConsoleLine(outConsoleLine);
+        return true;
     }
-    state_ = State::Console;
-    buildConsoleLine(outConsoleLine);
-    return true;
+    return false;
 }
 
 bool Session::onTransportLost() noexcept {
-    if (state_ == State::Console) {
-        return false;
-    }
-    state_ = State::Console;
-    deadlineMs_ = 0U;
-    return true;
+    timeoutLatched_ = false;
+    return btpSession_.reset().event == btp::SessionEvent::Abandoned;
 }
 
 } // namespace SerialSession
