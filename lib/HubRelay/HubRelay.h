@@ -83,7 +83,7 @@ RadioIngress classifyRadio(const std::uint8_t* datagram, std::size_t size) noexc
  * arrived, as long as the target profile admits its size.
  */
 bool reencodeVerbatim(const btp::DecodedFrame& decoded,
-                      btp::TransportProfile transport,
+                      const btp::TransportLimits& transport,
                       std::uint8_t* out,
                       std::size_t outCapacity,
                       std::size_t* bytesWritten) noexcept;

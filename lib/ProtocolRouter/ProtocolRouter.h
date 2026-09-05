@@ -1,7 +1,7 @@
 #pragma once
 
 #include <btp/codec.hpp>
-#include <btp/receiver.hpp>
+#include <btp/node.hpp>
 
 #include <array>
 #include <cstddef>
@@ -70,13 +70,19 @@ struct Stats {
 };
 
 /**
- * @brief One receiver's worth of decode+reassembly state. Multiple sources
- * fragmenting concurrently (two robots at once) share the slot pool below
- * without stepping on each other, since btp::Reassembler keys slots by
- * (source_id, boot_id, sequence); each Router instance is single-consumer
- * (call submit() from one task/context).
+ * @brief One receiver's worth of decode+reassembly state, on top of
+ * btp::Node (BTP >= 2.43.0) -- Node's session/discovery/subscription/command
+ * features are all left disabled (see this file's own topico), so this is,
+ * functionally, still exactly the decode + CRC + reassembly pipeline
+ * btp::Receiver alone provided; Node is used here purely as the owning
+ * shell, for the same "the dongle speaks BTP through btp::Node" consistency
+ * the serial side already has. Multiple sources fragmenting concurrently
+ * (two robots at once) share the slot pool below without stepping on each
+ * other, since btp::Reassembler keys slots by (source_id, boot_id,
+ * sequence); each Router instance is single-consumer (call submit() from one
+ * task/context).
  */
-class Router {
+class Router : private btp::NodeConfig {
 public:
     Router() noexcept;
 
@@ -97,13 +103,36 @@ public:
     Stats stats() const noexcept;
 
 private:
-    // storageViews_ is declared before receiver_ so member initialization
-    // order hands the btp::Receiver constructor a fully built view table;
-    // reordering these two would pass it uninitialized pointers.
+    // NodeConfig override: this Router never sends through its Node (every
+    // application send still goes through BtpTransport, whose Endpoint lives
+    // on the serial side's Node -- see SerialSession::Session's own class
+    // comment on why there is one canonical Endpoint for both transports).
+    // A receive-only node's send() simply returns false, the same outcome an
+    // unset send callback produced before btp::Node existed.
+    bool send(const std::uint8_t*, std::size_t) override { return false; }
+
+    // btp::Node's constructor hands `cfg.transport` to btp::Receiver, which
+    // copies it into ITS OWN member right then, not a live reference read
+    // again later. Base-before-member construction order means the
+    // NodeConfig base above is already live by the time node_ (a later data
+    // member) constructs, so this ordering-only member's constructor -- run
+    // for its side effect, between the two -- is what gets kEspNowTransport
+    // in before node_ captures the wrong (default, zero) value permanently.
+    // See SerialSession::Session's identical TransportInit for the full
+    // reasoning (same btp::Node pitfall, same fix).
+    struct TransportInit {
+        explicit TransportInit(btp::NodeConfig& cfg) noexcept { cfg.transport = btp::kEspNowTransport; }
+    };
+    TransportInit transportInit_;
+
+    // storageViews_ is declared before node_ so member initialization order
+    // hands btp::Node's constructor a fully built view table; reordering
+    // these would pass it uninitialized pointers.
     btp::ReassemblySlot slots_[kSlotCount];
     std::uint8_t storage_[kSlotCount][kMaxPayloadSize];
     std::array<btp::ReassemblyStorage, kSlotCount> storageViews_;
-    btp::Receiver receiver_;
+    std::uint8_t rxBuffer_[kMaxPayloadSize];
+    btp::Node node_;
 };
 
 }  // namespace ProtocolRouter

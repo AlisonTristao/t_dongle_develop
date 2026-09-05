@@ -98,7 +98,7 @@ std::vector<std::uint8_t> encode_frame(const btp::Header& header, const std::vec
     std::vector<std::uint8_t> out(btp::kV1HeaderSize + btp::kV1CrcSize + payload.size());
     const btp::Frame frame{header, {payload.empty() ? nullptr : payload.data(), payload.size()}};
     std::size_t written = 0U;
-    const btp::Error error = btp::encode(frame, btp::TransportProfile::Serial, out.data(), out.size(), &written);
+    const btp::Error error = btp::encode(frame, btp::kSerialTransport, out.data(), out.size(), &written);
     TEST_ASSERT_EQUAL_MESSAGE(static_cast<int>(btp::Error::Ok), static_cast<int>(error), "encode_frame failed");
     out.resize(written);
     return out;
@@ -170,6 +170,32 @@ const std::uint8_t kUuidA[16] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
 const std::uint8_t kLocalUuid[16] = {0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7,
                                      0xB8, 0xB9, 0xBA, 0xBB, 0xBC, 0xBD, 0xBE, 0xBF};
 
+// This dongle's own identity for every test session below. btp::Node::begin()
+// (driven by Session::configureIdentity()) refuses to run with a zero
+// source_id/boot_id, and every send on this session -- including the
+// HELLO_RESULT/SESSION_CLOSE_RESULT replies btp::Node's session responder
+// builds itself -- now goes out through this identity's Endpoint (BtpTransport
+// ::bindEndpoint's whole point), so every test session needs one, exactly as
+// SerialMux::begin() gives the real one in production.
+constexpr std::uint32_t kDongleSourceId = 0xD09D09D0U;
+constexpr std::uint32_t kDongleBootId = 0xB007B007U;
+
+// Session::onFrame() no longer takes a scratch buffer: a reply btp::Node's
+// session responder builds is now a complete, already-encoded frame (own
+// header, own sequence, own CRC), staged on the session via pendingFrame()
+// for the caller to COBS-frame and send as-is (SerialMux::finalizeToConsole/
+// enqueueFrameBytes). Decoding it back here is how a test reaches the
+// payload fields it used to read directly out of onFrame()'s own buffer.
+btp::DecodedFrame decode_pending(SerialSession::Session& session) {
+    std::size_t frameSize = 0U;
+    const std::uint8_t* frame = session.pendingFrame(&frameSize);
+    btp::DecodedFrame decoded{};
+    const btp::Error error = btp::decode(frame, frameSize, btp::kSerialTransport, &decoded);
+    TEST_ASSERT_EQUAL_MESSAGE(static_cast<int>(btp::Error::Ok), static_cast<int>(error),
+                              "session's pendingFrame() did not decode");
+    return decoded;
+}
+
 }  // namespace
 
 void setUp() {}
@@ -182,7 +208,7 @@ void test_parse_hello_matches_canonical_vector() {
     TEST_ASSERT_FALSE_MESSAGE(bytes.empty(), "missing BTP/test-vectors/v1/valid/hello.bin");
 
     btp::DecodedFrame decoded{};
-    const btp::Error error = btp::decode(bytes.data(), bytes.size(), btp::TransportProfile::Serial, &decoded);
+    const btp::Error error = btp::decode(bytes.data(), bytes.size(), btp::kSerialTransport, &decoded);
     TEST_ASSERT_EQUAL(static_cast<int>(btp::Error::Ok), static_cast<int>(error));
     TEST_ASSERT_EQUAL(static_cast<int>(btp::MessageType::Control), static_cast<int>(decoded.header.type));
     TEST_ASSERT_EQUAL_UINT16(SerialSession::kHelloObjectId, decoded.header.object_id);
@@ -212,6 +238,7 @@ void test_session_accepts_hello_and_negotiates_minimum_limits() {
     local.sessionTimeoutMs = 15000U;     // larger than the vector's 5000
 
     SerialSession::Session session(local);
+    session.configureIdentity(kDongleSourceId, kDongleBootId);
     session.setLocalUuid(kLocalUuid);
     TEST_ASSERT_TRUE(session.isConsole());
 
@@ -228,8 +255,7 @@ void test_session_accepts_hello_and_negotiates_minimum_limits() {
     decoded.payload = {helloPayload.data(), helloPayload.size()};
     decoded.crc32 = 0U;
 
-    std::uint8_t outPayload[64];
-    const auto result = session.onFrame(decoded, 1500U, outPayload, sizeof(outPayload));
+    const auto result = session.onFrame(decoded, 1500U);
 
     TEST_ASSERT_EQUAL(static_cast<int>(SerialSession::Session::FrameOutcome::HelloAccepted),
                       static_cast<int>(result.outcome));
@@ -238,6 +264,15 @@ void test_session_accepts_hello_and_negotiates_minimum_limits() {
     TEST_ASSERT_EQUAL_UINT32(0x0C0D0E0FU, session.peerSourceId());
     TEST_ASSERT_EQUAL_UINT32(0x10203040U, session.peerBootId());
 
+    const btp::DecodedFrame reply = decode_pending(session);
+    // The reply frame's own envelope: this dongle's identity, first sequence.
+    TEST_ASSERT_EQUAL_UINT32(kDongleSourceId, reply.header.source_id);
+    TEST_ASSERT_EQUAL_UINT32(kDongleBootId, reply.header.boot_id);
+    TEST_ASSERT_EQUAL_UINT32(1U, reply.header.sequence);
+    TEST_ASSERT_EQUAL(static_cast<int>(btp::MessageType::Control), static_cast<int>(reply.header.type));
+    TEST_ASSERT_EQUAL_UINT16(SerialSession::kHelloResultObjectId, reply.header.object_id);
+
+    const std::uint8_t* outPayload = reply.payload.data;
     // HELLO_RESULT payload layout (session-and-terminal.md section 2).
     TEST_ASSERT_EQUAL_UINT32(0x0C0D0E0FU, read_u32(outPayload)); // request_source_id
     TEST_ASSERT_EQUAL_UINT32(0x10203040U, read_u32(outPayload + 4U)); // request_boot_id
@@ -255,6 +290,7 @@ void test_session_accepts_hello_and_negotiates_minimum_limits() {
 
 void test_session_rejects_hello_without_common_version() {
     SerialSession::Session session((SerialSession::LocalLimits{}));
+    session.configureIdentity(kDongleSourceId, kDongleBootId);
     session.setLocalUuid(kLocalUuid);
     session.beginNegotiation(0U);
 
@@ -267,20 +303,22 @@ void test_session_rejects_hello_without_common_version() {
     decoded.header = helloHeader;
     decoded.payload = {helloPayload.data(), helloPayload.size()};
 
-    std::uint8_t outPayload[64];
-    const auto result = session.onFrame(decoded, 100U, outPayload, sizeof(outPayload));
+    const auto result = session.onFrame(decoded, 100U);
 
     TEST_ASSERT_EQUAL(static_cast<int>(SerialSession::Session::FrameOutcome::HelloRejected),
                       static_cast<int>(result.outcome));
     TEST_ASSERT_TRUE(result.consoleTransition);
     TEST_ASSERT_EQUAL_STRING("BTP/1 CONSOLE\r\n", result.consoleLine);
     TEST_ASSERT_TRUE(session.isConsole());
+
+    const std::uint8_t* outPayload = decode_pending(session).payload.data;
     TEST_ASSERT_EQUAL_UINT8(0x05U, outPayload[12]); // UNSUPPORTED
     TEST_ASSERT_EQUAL_UINT8(0x00U, outPayload[13]); // selected_version = 0
 }
 
 void test_session_hello_deadline_times_out_back_to_console() {
     SerialSession::Session session((SerialSession::LocalLimits{}));
+    session.configureIdentity(kDongleSourceId, kDongleBootId);
     session.setLocalUuid(kLocalUuid);
     session.beginNegotiation(1000U);
 
@@ -296,6 +334,7 @@ void test_session_hello_deadline_times_out_back_to_console() {
 
 void test_session_close_returns_to_console() {
     SerialSession::Session session((SerialSession::LocalLimits{}));
+    session.configureIdentity(kDongleSourceId, kDongleBootId);
     session.setLocalUuid(kLocalUuid);
     session.beginNegotiation(0U);
 
@@ -304,9 +343,8 @@ void test_session_close_returns_to_console() {
     btp::DecodedFrame helloFrame{};
     helloFrame.header = {btp::MessageType::Control, 0U, 5U, 6U, 1U, 0U, SerialSession::kHelloObjectId, 0U, 1U};
     helloFrame.payload = {helloPayload.data(), helloPayload.size()};
-    std::uint8_t scratch[64];
     TEST_ASSERT_EQUAL(static_cast<int>(SerialSession::Session::FrameOutcome::HelloAccepted),
-                      static_cast<int>(session.onFrame(helloFrame, 10U, scratch, sizeof(scratch)).outcome));
+                      static_cast<int>(session.onFrame(helloFrame, 10U).outcome));
 
     std::uint8_t closePayload[8] = {0};
     closePayload[0] = 0x02U; // CLIENT_SHUTDOWN
@@ -317,11 +355,13 @@ void test_session_close_returns_to_console() {
         btp::MessageType::Control, 0U, 5U, 6U, 2U, 0U, SerialSession::kSessionCloseObjectId, 0U, 1U};
     closeFrame.payload = {closePayload, sizeof(closePayload)};
 
-    const auto result = session.onFrame(closeFrame, 20U, scratch, sizeof(scratch));
+    const auto result = session.onFrame(closeFrame, 20U);
     TEST_ASSERT_EQUAL(static_cast<int>(SerialSession::Session::FrameOutcome::SessionClosed),
                       static_cast<int>(result.outcome));
     TEST_ASSERT_TRUE(session.isConsole());
     TEST_ASSERT_EQUAL_STRING("BTP/1 CONSOLE\r\n", result.consoleLine);
+
+    const std::uint8_t* scratch = decode_pending(session).payload.data;
     TEST_ASSERT_EQUAL_UINT32(5U, read_u32(scratch));
     TEST_ASSERT_EQUAL_UINT32(6U, read_u32(scratch + 4U));
     TEST_ASSERT_EQUAL_UINT32(2U, read_u32(scratch + 8U));
@@ -330,6 +370,7 @@ void test_session_close_returns_to_console() {
 
 void test_transport_loss_abandons_active_session_once() {
     SerialSession::Session session((SerialSession::LocalLimits{}));
+    session.configureIdentity(kDongleSourceId, kDongleBootId);
     session.beginNegotiation(100U);
 
     TEST_ASSERT_FALSE(session.isConsole());
@@ -449,6 +490,7 @@ void test_consecutive_delimiters_produce_no_empty_frame() {
 
 void test_stress_interleaved_telemetry_and_terminal_never_cross_classes() {
     SerialSession::Session session((SerialSession::LocalLimits{}));
+    session.configureIdentity(kDongleSourceId, kDongleBootId);
     session.setLocalUuid(kLocalUuid);
     session.beginNegotiation(0U);
 
@@ -457,9 +499,8 @@ void test_stress_interleaved_telemetry_and_terminal_never_cross_classes() {
     btp::DecodedFrame helloFrame{};
     helloFrame.header = {btp::MessageType::Control, 0U, 7U, 8U, 1U, 0U, SerialSession::kHelloObjectId, 0U, 1U};
     helloFrame.payload = {helloPayload.data(), helloPayload.size()};
-    std::uint8_t scratch[64];
     TEST_ASSERT_EQUAL(static_cast<int>(SerialSession::Session::FrameOutcome::HelloAccepted),
-                      static_cast<int>(session.onFrame(helloFrame, 1U, scratch, sizeof(scratch)).outcome));
+                      static_cast<int>(session.onFrame(helloFrame, 1U).outcome));
 
     constexpr int kIterations = 200;
     int terminalOutcomes = 0;
@@ -479,7 +520,7 @@ void test_stress_interleaved_telemetry_and_terminal_never_cross_classes() {
         }
         frame.payload = {payload.data(), payload.size()};
 
-        const auto result = session.onFrame(frame, static_cast<std::uint64_t>(2U + i), scratch, sizeof(scratch));
+        const auto result = session.onFrame(frame, static_cast<std::uint64_t>(2U + i));
 
         if (isTerminal) {
             TEST_ASSERT_EQUAL(static_cast<int>(SerialSession::Session::FrameOutcome::TerminalIn),

@@ -8,7 +8,7 @@ RadioIngress classifyRadio(const std::uint8_t* datagram, std::size_t size) noexc
     ingress.error = btp::Error::InvalidArgument;
 
     btp::DecodedFrame decoded{};
-    const btp::Error error = btp::decode(datagram, size, btp::TransportProfile::EspNow, &decoded);
+    const btp::Error error = btp::decode(datagram, size, btp::kEspNowTransport, &decoded);
     ingress.error = error;
     if (error != btp::Error::Ok) {
         return ingress;
@@ -21,7 +21,7 @@ RadioIngress classifyRadio(const std::uint8_t* datagram, std::size_t size) noexc
 }
 
 bool reencodeVerbatim(const btp::DecodedFrame& decoded,
-                      btp::TransportProfile transport,
+                      const btp::TransportLimits& transport,
                       std::uint8_t* out,
                       std::size_t outCapacity,
                       std::size_t* bytesWritten) noexcept {

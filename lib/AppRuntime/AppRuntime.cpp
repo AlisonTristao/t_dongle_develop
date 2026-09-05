@@ -586,7 +586,13 @@ void AppRuntime::begin() {
     if (bootId == 0) {
         bootId = 1;
     }
-    BtpTransport::configureIdentity(BtpTransport::btp_command::source_id_from_mac(selfMac), bootId);
+    const uint32_t selfSourceId = BtpTransport::btp_command::source_id_from_mac(selfMac);
+    // Identity is configured inside SerialMux::begin() below (not here
+    // directly): its btp::Node is the one whose Endpoint every send on
+    // either transport reserves a sequence from, so its begin() has to run
+    // (and BtpTransport::bindEndpoint() with it) before anything else
+    // touches BtpTransport::sourceId()/bootId() -- see SerialSession::
+    // Session's class comment.
 
     // Topico 29 passo 3: restores channel C's key L from NVS, if a previous
     // "hub -set_key_l" session ever persisted one, so the fleet key survives
@@ -612,7 +618,7 @@ void AppRuntime::begin() {
     ManifestCache::configure(selfUuid, g_dongleSourceInfo, g_dongleSourceInfoSize);
     SerialMux::begin(Serial, [](const char* cmd, const char* source, const char* userId, std::string* out) {
         ShellConfig::runLine(std::string(cmd), source, out, userId);
-    }, selfUuid, ShellOutput::commandPrompt().c_str(), EspNowConfig::sendRawToMac);
+    }, selfUuid, ShellOutput::commandPrompt().c_str(), selfSourceId, bootId, EspNowConfig::sendRawToMac);
 
     logFreeHeap("after_serialmux_begin");
 

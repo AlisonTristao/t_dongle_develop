@@ -265,8 +265,33 @@ void buildConsoleLine(char outConsoleLine[kConsoleLineCapacity]) noexcept {
 Session::Session(const LocalLimits& localLimits) noexcept
     : local_(localLimits),
       localHello_(makeLocalHello(localLimits, kZeroUuid, 0U)),
-      btpSession_(localHello_, kHelloDeadlineMs),
-      localUuid_{0} {}
+      localUuid_{0},
+      transportInit_(*this),
+      node_(*this, slots_, storage_, 1U, btp::kNodeDefaultReassemblyTimeoutMs, rxBuffer_, kSlotBytes,
+            /*seal_scratch=*/nullptr, 0U, /*open_buffer=*/nullptr, 0U, /*scratch_buffer=*/nullptr, 0U) {
+    // Channel B (dongle<->desktop) is never encrypted, so has_seal()/
+    // has_open() stay at NodeConfig's own false default; no override needed.
+    // Copied in once; setLocalUuid()/setLocalConfigRevision() below push
+    // further updates straight into the node's own btp::Session via
+    // refreshLocalHello()'s set_local() call, exactly as this always worked.
+    node_.enable_session(localHello_, kHelloDeadlineMs);
+}
+
+bool Session::send(const std::uint8_t* frame, std::size_t frame_size) {
+    if (frame == nullptr || frame_size > sizeof(pendingFrame_)) {
+        return false;
+    }
+    std::memcpy(pendingFrame_, frame, frame_size);
+    pendingFrameSize_ = frame_size;
+    return true;
+}
+
+const std::uint8_t* Session::pendingFrame(std::size_t* outSize) const noexcept {
+    if (outSize != nullptr) {
+        *outSize = pendingFrameSize_;
+    }
+    return pendingFrame_;
+}
 
 State Session::state() const noexcept {
     // A TimedOut latched inside onFrame() has not been reported to SerialMux
@@ -275,7 +300,7 @@ State Session::state() const noexcept {
     if (timeoutLatched_) {
         return State::Protocolled;
     }
-    switch (btpSession_.state()) {
+    switch (node_.session()->state()) {
         case btp::SessionState::Idle: return State::Console;
         case btp::SessionState::AwaitingHello: return State::AwaitingHello;
         case btp::SessionState::Active: return State::Protocolled;
@@ -285,7 +310,7 @@ State Session::state() const noexcept {
 
 void Session::refreshLocalHello() noexcept {
     localHello_ = makeLocalHello(local_, localUuid_, localConfigRevision_);
-    btpSession_.set_local(localHello_);
+    node_.session()->set_local(localHello_);
 }
 
 void Session::setLocalUuid(const std::uint8_t uuid[16]) noexcept {
@@ -301,14 +326,18 @@ void Session::setLocalConfigRevision(std::uint32_t configRevision) noexcept {
     refreshLocalHello();
 }
 
+void Session::configureIdentity(std::uint32_t sourceId, std::uint32_t bootId) noexcept {
+    this->source_id = sourceId;
+    this->boot_id = bootId;
+    (void)node_.begin(/*arm_and_announce=*/false);
+}
+
 void Session::beginNegotiation(std::uint64_t nowMs) noexcept {
     timeoutLatched_ = false;
-    peerSourceId_ = 0U;
-    peerBootId_ = 0U;
-    // arm() is a no-op unless Idle; the old beginNegotiation() moved to
-    // AwaitingHello from any state, so drop a live session first.
-    btpSession_.reset();
-    btpSession_.arm(nowMs);
+    // arm_session() is a no-op unless Idle; the old beginNegotiation() moved
+    // to AwaitingHello from any state, so drop a live session first.
+    node_.session()->reset();
+    node_.arm_session(nowMs);
 }
 
 Session::FrameOutcome Session::classifyProtocolObject(const btp::Header& header) const noexcept {
@@ -329,55 +358,69 @@ Session::FrameOutcome Session::classifyProtocolObject(const btp::Header& header)
         return FrameOutcome::UnsubscribeRequest;
     }
     // Reserved/unsupported object for this topic (a stray HELLO mid-session,
-    // etc.): ignored, watchdog already renewed by btp::Session.
+    // etc.): ignored, watchdog already renewed by btp::Node's session.
     return FrameOutcome::Ignored;
 }
 
-Session::FrameResult Session::onFrame(const btp::DecodedFrame& frame, std::uint64_t nowMs,
-                                      std::uint8_t* outPayload, std::size_t outPayloadCapacity) noexcept {
+Session::FrameResult Session::onFrame(const btp::DecodedFrame& frame, std::uint64_t nowMs) noexcept {
     FrameResult result{};
+    pendingFrameSize_ = 0U;  // send() (if btp::Node calls it below) sets this
 
-    const btp::SessionOutcome outcome =
-        btpSession_.on_frame(frame, nowMs, outPayload, outPayloadCapacity);
+    btp::ReceivedMessage msg{};
+    const btp::NodeRx rx = node_.receive(frame, nowMs, &msg);
 
-    switch (outcome.event) {
-        case btp::SessionEvent::None:
-            break;  // FrameOutcome::Ignored
+    switch (rx) {
+        case btp::NodeRx::Pending:
+        case btp::NodeRx::NoDatagram:
+            break;  // FrameOutcome::Ignored: nothing decoded to route
 
-        case btp::SessionEvent::TimedOut:
-            // btp::Session self-expired a stale deadline on this frame; the old
-            // onFrame() never did, leaving the flip to pollTimeout(). Latch it.
-            timeoutLatched_ = true;
-            break;  // FrameOutcome::Ignored for now
+        case btp::NodeRx::DroppedFrame:
+            break;  // FrameOutcome::Ignored: CRC/decode/reassembly rejected it
 
-        case btp::SessionEvent::HelloAccepted:
-            effective_ = translateLimits(btpSession_.effective_limits());
-            peerSourceId_ = btpSession_.peer_source_id();
-            peerBootId_ = btpSession_.peer_boot_id();
-            result.outcome = FrameOutcome::HelloAccepted;
-            result.outPayloadSize = outcome.reply_size;
+        case btp::NodeRx::SessionHandled:
+            switch (node_.session_event()) {
+                case btp::SessionEvent::None:
+                    break;  // FrameOutcome::Ignored
+
+                case btp::SessionEvent::TimedOut:
+                    // btp::Session self-expired a stale deadline on this frame;
+                    // the old onFrame() never did, leaving the flip to
+                    // pollTimeout(). Latch it, same as always.
+                    timeoutLatched_ = true;
+                    break;  // FrameOutcome::Ignored for now
+
+                case btp::SessionEvent::HelloAccepted:
+                    result.outcome = FrameOutcome::HelloAccepted;
+                    break;
+
+                case btp::SessionEvent::HelloRejected:
+                    result.outcome = FrameOutcome::HelloRejected;
+                    result.consoleTransition = true;
+                    buildConsoleLine(result.consoleLine);
+                    break;
+
+                case btp::SessionEvent::SessionClosed:
+                    result.outcome = FrameOutcome::SessionClosed;
+                    result.consoleTransition = true;
+                    buildConsoleLine(result.consoleLine);
+                    break;
+
+                case btp::SessionEvent::FrameAccepted:
+                case btp::SessionEvent::Abandoned:
+                    break;  // not produced by receive()'s session path
+            }
             break;
 
-        case btp::SessionEvent::HelloRejected:
-            result.outcome = FrameOutcome::HelloRejected;
-            result.outPayloadSize = outcome.reply_size;
-            result.consoleTransition = true;
-            buildConsoleLine(result.consoleLine);
+        case btp::NodeRx::Complete:
+            result.outcome = classifyProtocolObject(msg.header);
             break;
 
-        case btp::SessionEvent::SessionClosed:
-            result.outcome = FrameOutcome::SessionClosed;
-            result.outPayloadSize = outcome.reply_size;
-            result.consoleTransition = true;
-            buildConsoleLine(result.consoleLine);
+        default:
+            // InitiatorHandled/SubscriptionServed/.../RequestServed: this
+            // session never enables those Node features (see this file's own
+            // header comment), so none of these should occur; treat as
+            // Ignored defensively rather than misroute.
             break;
-
-        case btp::SessionEvent::FrameAccepted:
-            result.outcome = classifyProtocolObject(frame.header);
-            break;
-
-        case btp::SessionEvent::Abandoned:
-            break;  // cannot come from on_frame()
     }
 
     return result;
@@ -389,7 +432,8 @@ bool Session::pollTimeout(std::uint64_t nowMs, char outConsoleLine[kConsoleLineC
         buildConsoleLine(outConsoleLine);
         return true;
     }
-    if (btpSession_.poll(nowMs).event == btp::SessionEvent::TimedOut) {
+    pendingFrameSize_ = 0U;
+    if (node_.tick(nowMs) == btp::SessionEvent::TimedOut) {
         buildConsoleLine(outConsoleLine);
         return true;
     }
@@ -398,7 +442,15 @@ bool Session::pollTimeout(std::uint64_t nowMs, char outConsoleLine[kConsoleLineC
 
 bool Session::onTransportLost() noexcept {
     timeoutLatched_ = false;
-    return btpSession_.reset().event == btp::SessionEvent::Abandoned;
+    return node_.session()->reset().event == btp::SessionEvent::Abandoned;
 }
+
+EffectiveLimits Session::effectiveLimits() const noexcept {
+    return translateLimits(node_.session()->effective_limits());
+}
+
+std::uint32_t Session::peerSourceId() const noexcept { return node_.session()->peer_source_id(); }
+
+std::uint32_t Session::peerBootId() const noexcept { return node_.session()->peer_boot_id(); }
 
 } // namespace SerialSession

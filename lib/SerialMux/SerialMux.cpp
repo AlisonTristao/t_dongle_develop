@@ -323,7 +323,7 @@ bool encodeOwnFrame(btp::MessageType type, std::uint16_t objectId, const std::ui
         static_cast<std::uint64_t>(millis()) * 1000ULL, objectId, 0U, 1U
     };
     const btp::Frame frame{header, {payload, payloadSize}};
-    return btp::encode(frame, btp::TransportProfile::Serial, outFrame, outFrameCapacity, outFrameSize) ==
+    return btp::encode(frame, btp::kSerialTransport, outFrame, outFrameCapacity, outFrameSize) ==
            btp::Error::Ok;
 }
 
@@ -432,7 +432,7 @@ bool relayDown(const btp::DecodedFrame& decoded) noexcept {
 
     std::uint8_t frameBytes[btp::kEspNowMaxFrameSize];
     std::size_t frameSize = 0U;
-    if (!HubRelay::reencodeVerbatim(decoded, btp::TransportProfile::EspNow, frameBytes,
+    if (!HubRelay::reencodeVerbatim(decoded, btp::kEspNowTransport, frameBytes,
                                     sizeof(frameBytes), &frameSize)) {
         ++g_relayDownOversized;
         return false; // oversized for the radio: the child encodes on the EspNow profile (D4)
@@ -452,13 +452,14 @@ bool relayDown(const btp::DecodedFrame& decoded) noexcept {
 // to the console. Matches session-and-terminal.md section 4 exactly: the
 // port owner "stops accepting new work", "discards incomplete reassemblies",
 // "and only then returns to the console".
-void finalizeToConsole(std::uint16_t objectId, const std::uint8_t* payload, std::size_t payloadSize,
-                       const char* consoleLine) noexcept {
-    static std::uint8_t frameBytes[kMaxFrameBytes];  // main-loop only, see enqueueOwn
-    std::size_t frameSize = 0U;
-    if (encodeOwnFrame(btp::MessageType::Control, objectId, payload, payloadSize, frameBytes,
-                       sizeof(frameBytes), &frameSize)) {
-        writeFrameCobs(frameBytes, frameSize);
+//
+// `frame`/`frameSize` is already a complete, already-encoded HELLO_RESULT/
+// SESSION_CLOSE_RESULT frame -- btp::Node's session responder built it
+// (own Endpoint, own sequence) and staged it via SerialSession::Session::
+// pendingFrame(); this just COBS-frames and writes it, no re-encode.
+void finalizeToConsole(const std::uint8_t* frame, std::size_t frameSize, const char* consoleLine) noexcept {
+    if (frame != nullptr && frameSize != 0U) {
+        writeFrameCobs(frame, frameSize);
     }
 
     // PASSO 6 (topico 17): a session ending -- SESSION_CLOSE here, or a
@@ -913,16 +914,18 @@ void dispatchFrame(const btp::DecodedFrame& decoded, std::uint32_t nowMs) noexce
         return;
     }
 
-    std::uint8_t replyPayload[64];
-    const SerialSession::Session::FrameResult result =
-        g_session.onFrame(decoded, nowMs, replyPayload, sizeof(replyPayload));
+    const SerialSession::Session::FrameResult result = g_session.onFrame(decoded, nowMs);
 
     switch (result.outcome) {
         case SerialSession::Session::FrameOutcome::Ignored:
             break;
-        case SerialSession::Session::FrameOutcome::HelloAccepted:
-            enqueueOwn(btp::MessageType::Control, SerialSession::kHelloResultObjectId, replyPayload,
-                      result.outPayloadSize);
+        case SerialSession::Session::FrameOutcome::HelloAccepted: {
+            // Already-encoded by btp::Node's session responder (own Endpoint,
+            // own sequence) -- queue the frame bytes as-is, no re-encode.
+            std::size_t frameSize = 0U;
+            const std::uint8_t* frame = g_session.pendingFrame(&frameSize);
+            enqueueFrameBytes(SerialSession::classify(btp::MessageType::Control, SerialSession::kHelloResultObjectId),
+                              frame, frameSize);
             g_lastStatusMs = nowMs; // first heartbeat kStatusIntervalMs from now, not immediately
             // Fresh BTP terminal session (topico 19): drop any half-typed
             // line/pending bytes from a previous session and re-arm the line
@@ -933,14 +936,19 @@ void dispatchFrame(const btp::DecodedFrame& decoded, std::uint32_t nowMs) noexce
             g_terminalShell.refreshLine(g_terminalOut); // queue the initial prompt now
             flushTerminalPtyOutput();
             break;
-        case SerialSession::Session::FrameOutcome::HelloRejected:
-            finalizeToConsole(SerialSession::kHelloResultObjectId, replyPayload, result.outPayloadSize,
-                              result.consoleLine);
+        }
+        case SerialSession::Session::FrameOutcome::HelloRejected: {
+            std::size_t frameSize = 0U;
+            const std::uint8_t* frame = g_session.pendingFrame(&frameSize);
+            finalizeToConsole(frame, frameSize, result.consoleLine);
             break;
-        case SerialSession::Session::FrameOutcome::SessionClosed:
-            finalizeToConsole(SerialSession::kSessionCloseResultObjectId, replyPayload, result.outPayloadSize,
-                              result.consoleLine);
+        }
+        case SerialSession::Session::FrameOutcome::SessionClosed: {
+            std::size_t frameSize = 0U;
+            const std::uint8_t* frame = g_session.pendingFrame(&frameSize);
+            finalizeToConsole(frame, frameSize, result.consoleLine);
             break;
+        }
         case SerialSession::Session::FrameOutcome::CommandRequest:
             handleCommandRequest(decoded);
             break;
@@ -1118,11 +1126,14 @@ void drainTx() noexcept {
 } // namespace
 
 void begin(Stream& io, RunShellLineFn runShellLine, const std::uint8_t selfUuid[16],
-          const char* terminalPrompt, RelayToRadioFn relayToRadio) noexcept {
+          const char* terminalPrompt, std::uint32_t sourceId, std::uint32_t bootId,
+          RelayToRadioFn relayToRadio) noexcept {
     g_io = &io;
     g_runShellLine = runShellLine;
     g_relayToRadio = relayToRadio;
     g_session.setLocalUuid(selfUuid);
+    g_session.configureIdentity(sourceId, bootId);
+    BtpTransport::bindEndpoint(g_session.endpoint());
 
     for (std::size_t i = 0U; i < kPriorityClassCount; ++i) {
         if (g_queues[i] == nullptr) {
@@ -1157,6 +1168,22 @@ bool isConsoleOwned() noexcept {
 
 bool isProtocolled() noexcept {
     return g_session.isProtocolled();
+}
+
+void writeTerminalResponse(const std::string& text) noexcept {
+    if (!g_session.isProtocolled() || text.empty()) {
+        return;
+    }
+
+    std::string rendered = ShellOutput::renderResponse(text);
+    std::size_t offset = 0U;
+    while (offset < rendered.size()) {
+        const std::size_t chunkSize = std::min(kOutboundPayloadCap, rendered.size() - offset);
+        enqueueOwn(btp::MessageType::Terminal, SerialSession::kTerminalOutObjectId,
+                   reinterpret_cast<const std::uint8_t*>(rendered.data()) + offset,
+                   chunkSize);
+        offset += chunkSize;
+    }
 }
 
 void peekTxCounters(TxCounters& out) noexcept {
@@ -1338,7 +1365,7 @@ bool forwardRelay(const btp::Header& header, const std::uint8_t* payload, std::s
     std::uint8_t frameBytes[kMaxFrameBytes];
     std::size_t frameSize = 0U;
     const btp::Frame frame{header, {payload, payloadSize}};
-    if (btp::encode(frame, btp::TransportProfile::Serial, frameBytes, sizeof(frameBytes), &frameSize) !=
+    if (btp::encode(frame, btp::kSerialTransport, frameBytes, sizeof(frameBytes), &frameSize) !=
         btp::Error::Ok) {
         return false;
     }

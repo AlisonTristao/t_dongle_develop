@@ -218,7 +218,7 @@ void test_router_holds_a_full_size_sealed_channel_c_message() {
 
     std::uint8_t count = 0U;
     TEST_ASSERT_EQUAL(static_cast<int>(btp::Error::Ok),
-                      static_cast<int>(btp::fragment_count(kSealedSize, btp::TransportProfile::EspNow, &count)));
+                      static_cast<int>(btp::fragment_count(kSealedSize, btp::kEspNowTransport, &count)));
     TEST_ASSERT_TRUE(count > 1U);  // 616 does not fit one ESP-NOW fragment (210)
 
     const btp::Header logicalHeader{
@@ -241,12 +241,12 @@ void test_router_holds_a_full_size_sealed_channel_c_message() {
         btp::Frame fragment{};
         TEST_ASSERT_EQUAL(static_cast<int>(btp::Error::Ok),
                           static_cast<int>(btp::make_fragment(logicalHeader, {sealedPayload, kSealedSize},
-                                                              btp::TransportProfile::EspNow, index, &fragment)));
+                                                              btp::kEspNowTransport, index, &fragment)));
 
         std::uint8_t frame[btp::kEspNowMaxFrameSize];
         std::size_t frameSize = 0U;
         TEST_ASSERT_EQUAL(static_cast<int>(btp::Error::Ok),
-                          static_cast<int>(btp::encode(fragment, btp::TransportProfile::EspNow, frame,
+                          static_cast<int>(btp::encode(fragment, btp::kEspNowTransport, frame,
                                                        sizeof(frame), &frameSize)));
 
         const std::uint8_t mac[6] = {0, 1, 2, 3, 4, 5};
@@ -538,7 +538,7 @@ void test_sendLogical_seals_once_and_refragments_on_the_sealed_size() {
         btp::DecodedFrame decoded{};
         TEST_ASSERT_EQUAL(static_cast<int>(btp::Error::Ok),
                           static_cast<int>(btp::decode(sentFrames[i].data(), sentFrames[i].size(),
-                                                       btp::TransportProfile::EspNow, &decoded)));
+                                                       btp::kEspNowTransport, &decoded)));
         TEST_ASSERT_TRUE((decoded.header.flags & btp::kFlagEncrypted) != 0U);
         TEST_ASSERT_TRUE((decoded.header.flags & btp::kFlagFragmented) != 0U);
         TEST_ASSERT_EQUAL_UINT8(2U, decoded.header.fragment_count);
@@ -570,7 +570,7 @@ void test_encodeSingleFrame_seals_and_respects_the_espnow_ceiling() {
 
     btp::DecodedFrame decoded{};
     TEST_ASSERT_EQUAL(static_cast<int>(btp::Error::Ok),
-                      static_cast<int>(btp::decode(output, bytesWritten, btp::TransportProfile::EspNow, &decoded)));
+                      static_cast<int>(btp::decode(output, bytesWritten, btp::kEspNowTransport, &decoded)));
     TEST_ASSERT_EQUAL_UINT32(210U, decoded.payload.size);
     TEST_ASSERT_TRUE((decoded.header.flags & btp::kFlagEncrypted) != 0U);
 
@@ -587,7 +587,7 @@ void test_encodeSingleFrame_seals_and_respects_the_espnow_ceiling() {
                                                      output, sizeof(output), &bytesWritten, fakeSeal, nullptr));
     btp::DecodedFrame decodedEmpty{};
     TEST_ASSERT_EQUAL(static_cast<int>(btp::Error::Ok),
-                      static_cast<int>(btp::decode(output, bytesWritten, btp::TransportProfile::EspNow,
+                      static_cast<int>(btp::decode(output, bytesWritten, btp::kEspNowTransport,
                                                    &decodedEmpty)));
     TEST_ASSERT_EQUAL_UINT32(16U, decodedEmpty.payload.size);
 }

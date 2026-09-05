@@ -23,9 +23,14 @@ static_assert(kAeadTagSize == btp::kEndpointAeadTagSize,
 namespace {
 
 // Identity, the atomic outgoing sequence and the seal -> fragment -> encode
-// pipeline are btp::Endpoint (BTP >= 2.7.0). One process-wide instance, matching
-// the "plain namespace, no owning object" shape the rest of this module keeps.
-btp::Endpoint g_endpoint;
+// pipeline are btp::Endpoint (BTP >= 2.7.0). g_endpoint is a pointer, not the
+// instance itself, so bindEndpoint() can redirect every call in this file to
+// an externally-owned Endpoint (SerialMux's btp::Node, in production) without
+// this module needing to know that type exists. g_defaultEndpoint is what
+// every native test (and this module, before SerialMux::begin() runs) uses
+// unless something rebinds it.
+btp::Endpoint g_defaultEndpoint;
+btp::Endpoint* g_endpoint = &g_defaultEndpoint;
 
 // btp::Endpoint's send callback takes (frame, size); this module's SendFn adds
 // the destination MAC (ESP-NOW is addressed). These thunks carry the MAC and
@@ -112,15 +117,17 @@ void configureIdentity(std::uint32_t sourceId, std::uint32_t bootId) noexcept {
     // and refuses a zero in either field -- BTP reserves 0, and a caller that
     // passes one used to get frames stamped 0/0; now the endpoint stays
     // unconfigured and every send fails closed.
-    (void)g_endpoint.configure(sourceId, bootId);
+    (void)g_endpoint->configure(sourceId, bootId);
 }
 
-std::uint32_t sourceId() noexcept { return g_endpoint.source_id(); }
+void bindEndpoint(btp::Endpoint& endpoint) noexcept { g_endpoint = &endpoint; }
 
-std::uint32_t bootId() noexcept { return g_endpoint.boot_id(); }
+std::uint32_t sourceId() noexcept { return g_endpoint->source_id(); }
+
+std::uint32_t bootId() noexcept { return g_endpoint->boot_id(); }
 
 bool reserveSequence(std::uint32_t* sequenceOut) noexcept {
-    return g_endpoint.reserve_sequence(sequenceOut);
+    return g_endpoint->reserve_sequence(sequenceOut);
 }
 
 bool encodeSingleFrame(btp::MessageType type,
@@ -141,7 +148,7 @@ bool encodeSingleFrame(btp::MessageType type,
     // (payload.size + kEndpointAeadTagSize <= kEspNowMaxPayloadSize) and builds
     // the canonical ENCRYPTED header; a false from `seal` fails the call closed.
     const btp::LogicalMessage message{type, objectId, timestampUs, {payload, payloadSize}};
-    return g_endpoint.encode_fragment(message, btp::TransportProfile::EspNow, sequence,
+    return g_endpoint->encode_fragment(message, btp::kEspNowTransport, sequence,
                                       /*fragment_index=*/0U, /*fragment_count=*/1U, output,
                                       outputCapacity, bytesWritten, seal, sealContext);
 }
@@ -165,7 +172,7 @@ bool sendLogical(SendFn send,
     MacSendAdapter adapter{send, context, mac};
     std::uint8_t sealScratch[kMaxLogicalPayloadSize + kAeadTagSize];
     const btp::LogicalMessage message{type, objectId, timestampUs, {payload, payloadSize}};
-    return g_endpoint.send_logical(message, btp::TransportProfile::EspNow, &macSendThunk, &adapter,
+    return g_endpoint->send_logical(message, btp::kEspNowTransport, &macSendThunk, &adapter,
                                    sealScratch, sizeof(sealScratch), seal, sealContext);
 }
 
@@ -191,7 +198,7 @@ bool sendLogicalWithStatus(SendWithStatusFn sendWithStatus,
     MacSendStatusAdapter adapter{sendWithStatus, context, mac, timeoutMs, /*allDelivered=*/true};
     std::uint8_t sealScratch[kMaxLogicalPayloadSize + kAeadTagSize];
     const btp::LogicalMessage message{type, objectId, timestampUs, {payload, payloadSize}};
-    if (!g_endpoint.send_logical(message, btp::TransportProfile::EspNow, &macSendStatusThunk,
+    if (!g_endpoint->send_logical(message, btp::kEspNowTransport, &macSendStatusThunk,
                                  &adapter, sealScratch, sizeof(sealScratch), seal, sealContext)) {
         return false;
     }

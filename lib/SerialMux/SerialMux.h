@@ -75,8 +75,16 @@ using RelayToRadioFn = bool (*)(const std::uint8_t mac[6], const std::uint8_t* f
 // future test harness), in which case every downstream relay is refused
 // instead of being silently re-originated; production callers (AppRuntime)
 // always pass EspNowConfig::sendRawToMac.
+//
+// sourceId/bootId: this dongle's identity (BtpTransport::configureIdentity's
+// old parameters). begin() sets them on g_session's btp::Node and, once that
+// Node has begun, calls BtpTransport::bindEndpoint(g_session.endpoint()) --
+// see SerialSession::Session's class comment for why the serial session's
+// Node has to be the one Endpoint every send on EITHER transport reserves
+// its sequence from.
 void begin(Stream& io, RunShellLineFn runShellLine, const std::uint8_t selfUuid[16],
-          const char* terminalPrompt, RelayToRadioFn relayToRadio = nullptr) noexcept;
+          const char* terminalPrompt, std::uint32_t sourceId, std::uint32_t bootId,
+          RelayToRadioFn relayToRadio = nullptr) noexcept;
 
 // Tab completion for the BTP terminal session (topico 19, PASSO 1/2): the
 // caller (AppRuntime) passes the same provider it gives serialShell_
@@ -95,6 +103,12 @@ void addTerminalHistory(const char* line) noexcept;
 // callers use this to decide whether a direct Serial print is still allowed.
 bool isConsoleOwned() noexcept;
 bool isProtocolled() noexcept;
+
+// Delivers asynchronous human-readable text to the protocolled terminal.
+// This is used by radio-originated replies that are unrelated to a serial
+// COMMAND_REQUEST, such as the result of an espnow -send_to command typed in
+// the TraceView terminal.
+void writeTerminalResponse(const std::string& text) noexcept;
 
 /**
  * @brief Cumulative counters for the dongle -> desktop hop, read without

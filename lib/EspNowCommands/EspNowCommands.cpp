@@ -279,7 +279,7 @@ uint8_t wrapper_espnow_send_to(int32_t deviceNumber, string command) {
         return failWithCode(AppError::Code::SEND_DELIVERY_FAILED, "status=false");
     }
 
-    printLine("[espnow] status=true (resposta chega como cmd_result)");
+    printLine("[espnow] status=true (resposta e saida chegam como cmd_result)");
     return RESULT_OK;
 }
 

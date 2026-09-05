@@ -94,7 +94,7 @@ std::vector<uint8_t> encode_espnow(const btp::Header& header, const uint8_t* pay
     std::vector<uint8_t> out(btp::kEspNowMaxFrameSize);
     size_t written = 0U;
     const btp::Frame frame{header, {payload, payloadSize}};
-    const btp::Error error = btp::encode(frame, btp::TransportProfile::EspNow, out.data(), out.size(), &written);
+    const btp::Error error = btp::encode(frame, btp::kEspNowTransport, out.data(), out.size(), &written);
     if (error != btp::Error::Ok) {
         return {};
     }
@@ -159,17 +159,17 @@ void test_relay_down_never_rewrites_the_nonce_triple() {
     btp::DecodedFrame decoded{};
     TEST_ASSERT_EQUAL(static_cast<int>(btp::Error::Ok),
                       static_cast<int>(btp::decode(onCable.data(), onCable.size(),
-                                                   btp::TransportProfile::Serial, &decoded)));
+                                                   btp::kSerialTransport, &decoded)));
 
     uint8_t onAir[btp::kEspNowMaxFrameSize];
     size_t onAirSize = 0U;
-    TEST_ASSERT_TRUE(HubRelay::reencodeVerbatim(decoded, btp::TransportProfile::EspNow, onAir,
+    TEST_ASSERT_TRUE(HubRelay::reencodeVerbatim(decoded, btp::kEspNowTransport, onAir,
                                                 sizeof(onAir), &onAirSize));
 
     // The producer's identity triple survived the crossing.
     btp::DecodedFrame relayed{};
     TEST_ASSERT_EQUAL(static_cast<int>(btp::Error::Ok),
-                      static_cast<int>(btp::decode(onAir, onAirSize, btp::TransportProfile::EspNow, &relayed)));
+                      static_cast<int>(btp::decode(onAir, onAirSize, btp::kEspNowTransport, &relayed)));
     TEST_ASSERT_EQUAL_HEX32(kVectorSourceId, relayed.header.source_id);
     TEST_ASSERT_EQUAL_HEX32(kVectorBootId, relayed.header.boot_id);
     TEST_ASSERT_EQUAL_HEX32(kVectorSequence, relayed.header.sequence);
@@ -195,7 +195,7 @@ void test_reoriginating_the_same_payload_would_change_the_nonce() {
     btp::DecodedFrame decoded{};
     TEST_ASSERT_EQUAL(static_cast<int>(btp::Error::Ok),
                       static_cast<int>(btp::decode(onCable.data(), onCable.size(),
-                                                   btp::TransportProfile::Serial, &decoded)));
+                                                   btp::kSerialTransport, &decoded)));
 
     btp::Header reoriginated = decoded.header;
     reoriginated.source_id = kSelfSourceId;  // what sendLogical() stamps
@@ -250,7 +250,7 @@ void test_relay_up_passes_each_fragment_verbatim_and_reassembles_nothing() {
         btp::DecodedFrame onCable{};
         TEST_ASSERT_EQUAL(static_cast<int>(btp::Error::Ok),
                           static_cast<int>(btp::decode(datagram.data(), datagram.size(),
-                                                       btp::TransportProfile::Serial, &onCable)));
+                                                       btp::kSerialTransport, &onCable)));
         TEST_ASSERT_EQUAL_size_t(expectedPayloadSize[i], onCable.payload.size);
     }
 }
@@ -265,11 +265,11 @@ void test_relay_down_passes_each_fragment_verbatim() {
         btp::DecodedFrame decoded{};
         TEST_ASSERT_EQUAL(static_cast<int>(btp::Error::Ok),
                           static_cast<int>(btp::decode(onCable.data(), onCable.size(),
-                                                       btp::TransportProfile::Serial, &decoded)));
+                                                       btp::kSerialTransport, &decoded)));
 
         uint8_t onAir[btp::kEspNowMaxFrameSize];
         size_t onAirSize = 0U;
-        TEST_ASSERT_TRUE(HubRelay::reencodeVerbatim(decoded, btp::TransportProfile::EspNow, onAir,
+        TEST_ASSERT_TRUE(HubRelay::reencodeVerbatim(decoded, btp::kEspNowTransport, onAir,
                                                     sizeof(onAir), &onAirSize));
         TEST_ASSERT_EQUAL_size_t(onCable.size(), onAirSize);
         TEST_ASSERT_EQUAL_UINT8(0, std::memcmp(onCable.data(), onAir, onAirSize));

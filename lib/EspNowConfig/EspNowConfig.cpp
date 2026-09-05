@@ -362,13 +362,17 @@ void handleRoutedCommandResult(const uint8_t mac[6], const btp::Header& header, 
         return;
     }
 
-    // Only meaningful as human-readable console text; the serial BTP session
-    // (when protocolled) owns its own COMMAND_RESULT semantics for whatever
-    // it requested itself -- an ESP-NOW peer's reply to an unrelated
-    // espnow -send_to is not relayed onto that session (see SerialMux.h /
-    // ShellCommandSupport::printLine for the "single writer" rule this
-    // avoids breaking).
     if (!SerialMux::isConsoleOwned()) {
+        if (SerialMux::isProtocolled()) {
+            std::string terminalText = "cmd_result status=";
+            terminalText += BtpTransport::btp_command::status_string(result.status);
+            if (result.message.size > 0 && result.message.data != nullptr) {
+                terminalText += "\n";
+                terminalText.append(reinterpret_cast<const char*>(result.message.data),
+                                    result.message.size);
+            }
+            SerialMux::writeTerminalResponse(terminalText);
+        }
         return;
     }
 
