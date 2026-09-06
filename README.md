@@ -588,19 +588,27 @@ cliente para o robô (`BTP/docs/commands.md` seção 4).
 
 Substitui o antigo terminal de rolagem (o texto já existe na serial e no banco). Layout
 160x80, atualizado em `tick()` a cada loop mas com redesenho throttled
-(`REFRESH_INTERVAL_MS`):
+(`REFRESH_INTERVAL_MS`). Chrome persistente (topo) + uma página de conteúdo por vez,
+ciclada com um toque curto no botão BOOT (`BoardConfig::PIN_BOOT_BUTTON`, livre em
+runtime -- só usado para forçar bootloader no flash):
 
 ```text
-[ banner de mensagem/relógio                     ]
-[  LINK  |   RX   |   TX   ]
-[      STATE (2x largura)  |   ERR   ]
+[ banner de mensagem                         n/4 ]
+[ STATE: último estado do robô                   ]
+[ --- página ativa, uma das 4 abaixo ---          ]
 ```
 
-- **LINK**: resultado do heartbeat (verde=entregue, vermelho=falhou)
-- **RX** / **TX**: pulso a cada mensagem recebida/enviada (`PULSE_HOLD_MS`)
-- **STATE**: último `state changed: OLD -> NEW` visto em uma mensagem RX (extraído por
-  `tryExtractRobotState` em `EspNowConfig.cpp`)
-- **ERR**: contador de pacotes ESP-NOW descartados/sobrescritos por fila cheia
+1. **Atividade** (padrão no boot): RX/TX (pulso a cada mensagem recebida/enviada,
+   `PULSE_HOLD_MS`) + PEERS (contagem online/total dos peers conhecidos)
+2. **Erros**: contadores de drop ESP-NOW discriminados por categoria (RX/decode/CRC/
+   reassembly/queue/auth), via `EspNowConfig::peekRxCounters`
+3. **Sessão**: estado da sessão BTP no USB (Console/Aguardando/Protocolado, via
+   `SerialMux::isConsoleOwned()`/`isProtocolled()`) + status do cartão SD + do banco
+4. **Peers**: lista curta (até `MAX_DISPLAYED_PEERS`) dos peers conhecidos, id curto +
+   online/offline + idade do último contato, via `BtpTransport::enumeratePeers`
+
+**STATE** (persistente, todas as páginas): último `state changed: OLD -> NEW` visto em
+uma mensagem RX (extraído por `tryExtractRobotState` em `EspNowConfig.cpp`).
 
 ## 9. Serial e UX
 

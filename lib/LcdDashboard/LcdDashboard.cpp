@@ -2,7 +2,8 @@
 
 #include <cstdio>
 #include <cstring>
-#include <ctime>
+
+#include "../../include/config.h"
 
 namespace {
 
@@ -11,7 +12,9 @@ constexpr uint16_t kRawBlack = ST77XX_BLACK;
 constexpr uint16_t kRawGridLine = 0xC618; // light gray, structural chrome (not panel-corrected)
 constexpr uint16_t kNeutralGray565 = 0x8410;
 constexpr int16_t kBarHeight = 16;
-constexpr int16_t kClockWidth = 36;
+constexpr int16_t kPageIndicatorWidth = 30;
+constexpr int16_t kStateStripHeight = 12;
+constexpr int16_t kTextLineHeight = 10;
 
 } // namespace
 
@@ -21,32 +24,44 @@ LcdDashboard::LcdDashboard()
       screenW_(0),
       screenH_(0),
       messageRect_{0, 0, 0, 0},
-      clockRect_{0, 0, 0, 0},
-      linkTile_{0, 0, 0, 0},
+      pageIndicatorRect_{0, 0, 0, 0},
+      stateRect_{0, 0, 0, 0},
+      contentRect_{0, 0, 0, 0},
       rxTile_{0, 0, 0, 0},
       txTile_{0, 0, 0, 0},
-      stateTile_{0, 0, 0, 0},
-      errTile_{0, 0, 0, 0},
+      peersTile_{0, 0, 0, 0},
       lastRefreshMs_(0),
-      lastDrawnClock_(""),
+      currentPage_(Page::kActivity),
+      buttonPressedLast_(false),
       messageExpireMs_(0),
       messageActive_(false),
       rxPulseUntilMs_(0),
+      rxCacheValid_(false),
       rxHotDrawn_(false),
       txPulseUntilMs_(0),
       txHasResult_(false),
       txLastOk_(false),
+      txCacheValid_(false),
       txHotDrawnHot_(false),
       txHotDrawnHasResult_(false),
       txHotDrawnOk_(false),
-      droppedTotal_(0),
+      peerRows_{},
+      peerRowCount_(0),
+      peerTotalKnown_(0),
+      peerOnlineCount_(0),
+      peersTileCacheValid_(false),
+      peersTileDrawnOnline_(0),
+      peersTileDrawnTotal_(0),
+      peersPageCacheValid_(false),
+      peersPageDrawnRows_{},
+      peersPageDrawnRowCount_(0),
+      peersPageDrawnTotalKnown_(0),
+      errLive_{0, 0, 0, 0, 0, 0},
       errCacheValid_(false),
-      errCacheTotal_(0),
-      hasHeartbeatResult_(false),
-      heartbeatOk_(false),
-      linkCacheValid_(false),
-      linkCacheHasResult_(false),
-      linkCacheOk_(false) {
+      errDrawn_{0, 0, 0, 0, 0, 0},
+      sessionLive_{false, false, false, 0, 0, false},
+      sessionCacheValid_(false),
+      sessionDrawn_{false, false, false, 0, 0, false} {
 }
 
 bool LcdDashboard::begin(DonglePeripherals& peripherals) {
@@ -58,9 +73,19 @@ bool LcdDashboard::begin(DonglePeripherals& peripherals) {
 
     peripherals.setLcdBacklight(true);
 
-    layoutGrid();
+    layoutChrome();
+    currentPage_ = Page::kActivity;
+    // A flash cycle holds BOOT down to enter the bootloader; sample the real
+    // level here instead of assuming "released", so that release doesn't
+    // read as a spurious first press once the app starts polling.
+    buttonPressedLast_ = (digitalRead(BoardConfig::PIN_BOOT_BUTTON) == LOW);
     resetCaches();
-    drawStaticChrome();
+
+    tft_->fillScreen(kRawWhite);
+    tft_->drawFastHLine(0, kBarHeight, screenW_, kRawGridLine);
+    tft_->drawFastHLine(0, static_cast<int16_t>(stateRect_.y + stateRect_.h), screenW_, kRawGridLine);
+    drawActivityChrome();
+    drawPageIndicator();
 
     ready_ = true;
     lastRefreshMs_ = millis() - REFRESH_INTERVAL_MS;
@@ -72,68 +97,54 @@ void LcdDashboard::clear() {
         return;
     }
 
-    layoutGrid();
+    layoutChrome();
     resetCaches();
-    drawStaticChrome();
+
+    tft_->fillScreen(kRawWhite);
+    tft_->drawFastHLine(0, kBarHeight, screenW_, kRawGridLine);
+    tft_->drawFastHLine(0, static_cast<int16_t>(stateRect_.y + stateRect_.h), screenW_, kRawGridLine);
+    if (currentPage_ == Page::kActivity) {
+        drawActivityChrome();
+    }
+    drawPageIndicator();
 }
 
 bool LcdDashboard::isReady() const {
     return ready_;
 }
 
-void LcdDashboard::layoutGrid() {
+void LcdDashboard::layoutChrome() {
     screenW_ = tft_->width();
     screenH_ = tft_->height();
 
-    clockRect_ = {static_cast<int16_t>(screenW_ - kClockWidth), 0, kClockWidth, kBarHeight};
-    messageRect_ = {0, 0, static_cast<int16_t>(screenW_ - kClockWidth), kBarHeight};
+    pageIndicatorRect_ = {static_cast<int16_t>(screenW_ - kPageIndicatorWidth), 0, kPageIndicatorWidth, kBarHeight};
+    messageRect_ = {0, 0, static_cast<int16_t>(screenW_ - kPageIndicatorWidth), kBarHeight};
 
-    const int16_t gridY = static_cast<int16_t>(kBarHeight + 1);
-    const int16_t gridH = static_cast<int16_t>(screenH_ - gridY);
-    const int16_t rowH = static_cast<int16_t>(gridH / 2);
-    const int16_t lastRowH = static_cast<int16_t>(gridH - rowH);
-    const int16_t colW = static_cast<int16_t>(screenW_ / 3);
-    const int16_t lastColW = static_cast<int16_t>(screenW_ - (colW * 2));
+    const int16_t stateY = static_cast<int16_t>(kBarHeight + 1);
+    stateRect_ = {0, stateY, screenW_, kStateStripHeight};
 
-    linkTile_ = {0, gridY, colW, rowH};
-    rxTile_ = {colW, gridY, colW, rowH};
-    txTile_ = {static_cast<int16_t>(colW * 2), gridY, lastColW, rowH};
+    const int16_t contentY = static_cast<int16_t>(stateRect_.y + stateRect_.h + 1);
+    contentRect_ = {0, contentY, screenW_, static_cast<int16_t>(screenH_ - contentY)};
 
-    const int16_t row2Y = static_cast<int16_t>(gridY + rowH);
-    stateTile_ = {0, row2Y, static_cast<int16_t>(colW * 2), lastRowH};
-    errTile_ = {static_cast<int16_t>(colW * 2), row2Y, lastColW, lastRowH};
-}
-
-void LcdDashboard::drawStaticChrome() {
-    tft_->fillScreen(kRawWhite);
-    tft_->drawFastHLine(0, kBarHeight, screenW_, kRawGridLine);
-    tft_->drawFastHLine(0, stateTile_.y, screenW_, kRawGridLine);
-
-    // top row: 3 equal columns
-    tft_->drawFastVLine(rxTile_.x, linkTile_.y, static_cast<int16_t>(stateTile_.y - linkTile_.y), kRawGridLine);
-    tft_->drawFastVLine(txTile_.x, linkTile_.y, static_cast<int16_t>(stateTile_.y - linkTile_.y), kRawGridLine);
-
-    // bottom row: STATE (double-wide) | ERR
-    tft_->drawFastVLine(errTile_.x, stateTile_.y, static_cast<int16_t>(screenH_ - stateTile_.y), kRawGridLine);
-
-    drawLabel(rxTile_, "RX");
-    drawLabel(txTile_, "TX");
-    drawLabel(stateTile_, "STATE");
-    drawLabel(errTile_, "ERR");
+    const int16_t colW = static_cast<int16_t>(contentRect_.w / 3);
+    const int16_t lastColW = static_cast<int16_t>(contentRect_.w - (colW * 2));
+    rxTile_ = {contentRect_.x, contentRect_.y, colW, contentRect_.h};
+    txTile_ = {static_cast<int16_t>(contentRect_.x + colW), contentRect_.y, colW, contentRect_.h};
+    peersTile_ = {static_cast<int16_t>(contentRect_.x + colW * 2), contentRect_.y, lastColW, contentRect_.h};
 }
 
 void LcdDashboard::resetCaches() {
     // Forces the next tick()/showMessage() to repaint from current values,
-    // without touching running accumulators (droppedTotal_, last TX outcome,
-    // pulse timers) — a clear() shouldn't erase history, just the pixels.
-    lastDrawnClock_ = "";
+    // without touching running accumulators (peer table, error counters,
+    // session/storage status, pulse timers) -- a clear() shouldn't erase
+    // history, just the pixels.
     messageActive_ = false;
-    linkCacheValid_ = false;
+    rxCacheValid_ = false;
+    txCacheValid_ = false;
+    peersTileCacheValid_ = false;
+    peersPageCacheValid_ = false;
     errCacheValid_ = false;
-    rxHotDrawn_ = false;
-    txHotDrawnHot_ = false;
-    txHotDrawnHasResult_ = false;
-    txHotDrawnOk_ = false;
+    sessionCacheValid_ = false;
 }
 
 uint16_t LcdDashboard::toPanelColor(uint16_t desiredColor) const {
@@ -191,7 +202,7 @@ void LcdDashboard::drawActivityDot(const Rect& tile, const char* label, uint16_t
     // (drawLabel: tile.x+3, tile.y+2, ~6px/char, ~8px tall) doesn't reach
     // that far, so it reads as centered in the grid cell; otherwise it
     // falls back to sitting below the label, like before, so the two never
-    // overlap (e.g. "LINK" is wide enough to reach under a fully-centered
+    // overlap (e.g. "PEERS" is wide enough to reach under a fully-centered
     // dot in its narrow tile).
     const Rect area = valueArea(tile);
     const int16_t shorterSide = (area.w < area.h) ? area.w : area.h;
@@ -215,6 +226,69 @@ void LcdDashboard::drawActivityDot(const Rect& tile, const char* label, uint16_t
     tft_->fillRect(clearX, clearY, clearSide, clearSide, kRawWhite);
 
     tft_->fillCircle(cx, cy, radius, color);
+}
+
+void LcdDashboard::drawTextLine(int16_t x, int16_t y, const String& text, uint16_t color) {
+    tft_->setTextSize(1);
+    tft_->setCursor(x, y);
+    tft_->setTextColor(color, kRawWhite);
+    tft_->print(text);
+}
+
+void LcdDashboard::drawPageIndicator() {
+    tft_->fillRect(pageIndicatorRect_.x, pageIndicatorRect_.y, pageIndicatorRect_.w, pageIndicatorRect_.h, kRawWhite);
+
+    char buf[8] = {0};
+    std::snprintf(buf, sizeof(buf), "%u/%u", static_cast<unsigned>(currentPage_) + 1U,
+                  static_cast<unsigned>(Page::kCount));
+
+    drawTextLine(static_cast<int16_t>(pageIndicatorRect_.x + 2),
+                 static_cast<int16_t>(pageIndicatorRect_.y + (pageIndicatorRect_.h - 8) / 2), buf, kRawBlack);
+}
+
+void LcdDashboard::drawActivityChrome() {
+    tft_->drawFastVLine(txTile_.x, contentRect_.y, contentRect_.h, kRawGridLine);
+    tft_->drawFastVLine(peersTile_.x, contentRect_.y, contentRect_.h, kRawGridLine);
+
+    drawLabel(rxTile_, "RX");
+    drawLabel(txTile_, "TX");
+    drawLabel(peersTile_, "PEERS");
+}
+
+void LcdDashboard::pollButton() {
+    const bool pressed = (digitalRead(BoardConfig::PIN_BOOT_BUTTON) == LOW);
+    // tick() only samples this once per REFRESH_INTERVAL_MS (150ms), well
+    // past any mechanical bounce, so a simple level compare across samples
+    // is enough debounce -- no separate timer needed. Advances on the press
+    // edge only; holding the button down doesn't keep cycling pages.
+    if (pressed && !buttonPressedLast_) {
+        const uint8_t next = static_cast<uint8_t>(
+            (static_cast<uint8_t>(currentPage_) + 1U) % static_cast<uint8_t>(Page::kCount));
+        switchToPage(static_cast<Page>(next));
+    }
+    buttonPressedLast_ = pressed;
+}
+
+void LcdDashboard::switchToPage(Page page) {
+    currentPage_ = page;
+    tft_->fillRect(contentRect_.x, contentRect_.y, contentRect_.w, contentRect_.h, kRawWhite);
+
+    // Every page's cache is invalidated on every switch: only the page that
+    // becomes active runs its refresh*() next tick, so this just guarantees
+    // that one does a full repaint onto the blank content area above,
+    // regardless of whether its live values happen to match what was drawn
+    // the last time it was on screen.
+    rxCacheValid_ = false;
+    txCacheValid_ = false;
+    peersTileCacheValid_ = false;
+    peersPageCacheValid_ = false;
+    errCacheValid_ = false;
+    sessionCacheValid_ = false;
+
+    if (page == Page::kActivity) {
+        drawActivityChrome();
+    }
+    drawPageIndicator();
 }
 
 void LcdDashboard::showMessage(const String& text, uint16_t color) {
@@ -257,19 +331,6 @@ void LcdDashboard::notifyTx(bool delivered) {
     txHasResult_ = true;
 }
 
-void LcdDashboard::notifyHeartbeat(bool delivered) {
-    heartbeatOk_ = delivered;
-    hasHeartbeatResult_ = true;
-}
-
-void LcdDashboard::notifyDropped(uint32_t additionalCount) {
-    if (additionalCount == 0) {
-        return;
-    }
-
-    droppedTotal_ += additionalCount;
-}
-
 void LcdDashboard::notifyRobotState(const String& state) {
     if (!ready_) {
         return;
@@ -294,34 +355,60 @@ void LcdDashboard::notifyRobotState(const String& state) {
     }
     const uint16_t color = toPanelColor(logicalColor);
 
-    // Try the bigger size first; fall back to size 1, then truncate with "..."
-    // if the state name is still too wide for the double tile.
-    const Rect area = valueArea(stateTile_);
-    uint8_t size = 2;
-    int16_t x1 = 0;
-    int16_t y1 = 0;
-    uint16_t tw = 0;
-    uint16_t th = 0;
-    tft_->setTextSize(size);
-    tft_->getTextBounds(text, 0, 0, &x1, &y1, &tw, &th);
+    // The strip is one line tall now (it used to be the biggest tile on the
+    // grid) -- try size 1 first and truncate with "..." if the state name is
+    // still too wide for it.
+    tft_->fillRect(stateRect_.x, stateRect_.y, stateRect_.w, stateRect_.h, kRawWhite);
 
-    if (tw > static_cast<uint16_t>(area.w)) {
-        size = 1;
-        tft_->setTextSize(size);
-        tft_->getTextBounds(text, 0, 0, &x1, &y1, &tw, &th);
-
-        if (tw > static_cast<uint16_t>(area.w)) {
-            const int16_t charWidth = 6;
-            const int16_t maxChars = (area.w > 0) ? static_cast<int16_t>(area.w / charWidth) : 0;
-            if (maxChars > 3 && text.length() > static_cast<unsigned>(maxChars)) {
-                text = text.substring(0, maxChars - 3) + "...";
-            } else if (maxChars > 0) {
-                text = text.substring(0, maxChars);
-            }
-        }
+    const int16_t charWidth = 6;
+    const int16_t maxChars = (stateRect_.w > 4) ? static_cast<int16_t>((stateRect_.w - 4) / charWidth) : 0;
+    if (maxChars > 3 && text.length() > static_cast<unsigned>(maxChars)) {
+        text = text.substring(0, maxChars - 3) + "...";
+    } else if (maxChars > 0 && text.length() > static_cast<unsigned>(maxChars)) {
+        text = text.substring(0, maxChars);
     }
 
-    drawCenteredValue(stateTile_, text, color, size);
+    drawTextLine(static_cast<int16_t>(stateRect_.x + 2),
+                 static_cast<int16_t>(stateRect_.y + (stateRect_.h - 8) / 2), text, color);
+}
+
+void LcdDashboard::notifyPeers(const PeerRow* rows, size_t rowCount, size_t totalKnown) {
+    const size_t cappedCount = (rowCount > MAX_DISPLAYED_PEERS) ? MAX_DISPLAYED_PEERS : rowCount;
+    peerRowCount_ = cappedCount;
+    for (size_t i = 0; i < cappedCount; ++i) {
+        peerRows_[i] = rows[i];
+    }
+
+    peerTotalKnown_ = totalKnown;
+    size_t online = 0;
+    for (size_t i = 0; i < cappedCount; ++i) {
+        if (peerRows_[i].online) {
+            ++online;
+        }
+    }
+    peerOnlineCount_ = online;
+}
+
+void LcdDashboard::notifyErrorCounters(uint32_t droppedRx, uint32_t droppedDecode, uint32_t droppedCrc,
+                                       uint32_t droppedReassembly, uint32_t droppedQueueFull, uint32_t droppedAuth) {
+    errLive_.droppedRx = droppedRx;
+    errLive_.droppedDecode = droppedDecode;
+    errLive_.droppedCrc = droppedCrc;
+    errLive_.droppedReassembly = droppedReassembly;
+    errLive_.droppedQueueFull = droppedQueueFull;
+    errLive_.droppedAuth = droppedAuth;
+}
+
+void LcdDashboard::notifySessionStatus(bool protocolled, bool consoleOwned) {
+    sessionLive_.protocolled = protocolled;
+    sessionLive_.consoleOwned = consoleOwned;
+}
+
+void LcdDashboard::notifyStorageStatus(bool sdReady, uint64_t sdUsedMB, uint64_t sdTotalMB, bool dbReady) {
+    sessionLive_.sdReady = sdReady;
+    sessionLive_.sdUsedMB = sdUsedMB;
+    sessionLive_.sdTotalMB = sdTotalMB;
+    sessionLive_.dbReady = dbReady;
 }
 
 void LcdDashboard::tick() {
@@ -335,11 +422,27 @@ void LcdDashboard::tick() {
     }
     lastRefreshMs_ = now;
 
-    refreshClock();
-    refreshLink();
-    refreshDropped();
-    refreshRxTile(now);
-    refreshTxTile(now);
+    pollButton();
+
+    switch (currentPage_) {
+        case Page::kActivity:
+            refreshRxTile(now);
+            refreshTxTile(now);
+            refreshPeersTile();
+            break;
+        case Page::kErrors:
+            refreshErrorsPage();
+            break;
+        case Page::kSession:
+            refreshSessionPage();
+            break;
+        case Page::kPeers:
+            refreshPeersPage();
+            break;
+        default:
+            break;
+    }
+
     refreshMessageExpiry(now);
 }
 
@@ -355,66 +458,12 @@ void LcdDashboard::refreshMessageExpiry(uint32_t now) {
     tft_->fillRect(messageRect_.x, messageRect_.y, messageRect_.w, messageRect_.h, kRawWhite);
 }
 
-void LcdDashboard::refreshClock() {
-    String text = "--:--";
-    const time_t nowEpoch = time(nullptr);
-    if (nowEpoch > 0) {
-        std::tm localTime = {};
-        if (localtime_r(&nowEpoch, &localTime) != nullptr) {
-            char buf[8] = {0};
-            std::strftime(buf, sizeof(buf), "%H:%M", &localTime);
-            text = buf;
-        }
-    }
-
-    if (text == lastDrawnClock_) {
-        return;
-    }
-    lastDrawnClock_ = text;
-
-    tft_->fillRect(clockRect_.x, clockRect_.y, clockRect_.w, clockRect_.h, kRawWhite);
-    tft_->setTextSize(1);
-    tft_->setCursor(static_cast<int16_t>(clockRect_.x + 1), static_cast<int16_t>(clockRect_.y + (clockRect_.h - 8) / 2));
-    tft_->setTextColor(kRawBlack, kRawWhite);
-    tft_->print(text);
-}
-
-void LcdDashboard::refreshLink() {
-    const bool hasResult = hasHeartbeatResult_;
-    const bool ok = heartbeatOk_;
-
-    if (linkCacheValid_ && linkCacheHasResult_ == hasResult && linkCacheOk_ == ok) {
-        return;
-    }
-    linkCacheValid_ = true;
-    linkCacheHasResult_ = hasResult;
-    linkCacheOk_ = ok;
-
-    // No result yet (no peer heard from since boot): neutral. Otherwise a
-    // steady green/red reflecting the latest heartbeat probe outcome.
-    const uint16_t logicalColor = !hasResult ? kNeutralGray565 : (ok ? ST77XX_GREEN : ST77XX_RED);
-    drawActivityDot(linkTile_, "", toPanelColor(logicalColor));
-}
-
-void LcdDashboard::refreshDropped() {
-    const uint32_t total = droppedTotal_;
-    if (errCacheValid_ && errCacheTotal_ == total) {
-        return;
-    }
-    errCacheValid_ = true;
-    errCacheTotal_ = total;
-
-    char buf[12] = {0};
-    std::snprintf(buf, sizeof(buf), "%lu", static_cast<unsigned long>(total));
-    const uint16_t color = toPanelColor((total > 0) ? ST77XX_RED : kNeutralGray565);
-    drawCenteredValue(errTile_, buf, color, 2);
-}
-
 void LcdDashboard::refreshRxTile(uint32_t now) {
     const bool hot = static_cast<int32_t>(rxPulseUntilMs_ - now) > 0;
-    if (hot == rxHotDrawn_) {
+    if (rxCacheValid_ && hot == rxHotDrawn_) {
         return;
     }
+    rxCacheValid_ = true;
     rxHotDrawn_ = hot;
 
     const uint16_t color = toPanelColor(hot ? ST77XX_CYAN : kNeutralGray565);
@@ -426,9 +475,10 @@ void LcdDashboard::refreshTxTile(uint32_t now) {
     const bool hasResult = txHasResult_;
     const bool ok = txLastOk_;
 
-    if (hot == txHotDrawnHot_ && hasResult == txHotDrawnHasResult_ && ok == txHotDrawnOk_) {
+    if (txCacheValid_ && hot == txHotDrawnHot_ && hasResult == txHotDrawnHasResult_ && ok == txHotDrawnOk_) {
         return;
     }
+    txCacheValid_ = true;
     txHotDrawnHot_ = hot;
     txHotDrawnHasResult_ = hasResult;
     txHotDrawnOk_ = ok;
@@ -441,4 +491,156 @@ void LcdDashboard::refreshTxTile(uint32_t now) {
     }
 
     drawActivityDot(txTile_, "TX", toPanelColor(logicalColor));
+}
+
+void LcdDashboard::refreshPeersTile() {
+    const size_t online = peerOnlineCount_;
+    const size_t total = peerTotalKnown_;
+    if (peersTileCacheValid_ && online == peersTileDrawnOnline_ && total == peersTileDrawnTotal_) {
+        return;
+    }
+    peersTileCacheValid_ = true;
+    peersTileDrawnOnline_ = online;
+    peersTileDrawnTotal_ = total;
+
+    char buf[12] = {0};
+    std::snprintf(buf, sizeof(buf), "%u/%u", static_cast<unsigned>(online), static_cast<unsigned>(total));
+
+    uint16_t logicalColor = kNeutralGray565;
+    if (total > 0) {
+        logicalColor = (online == 0) ? ST77XX_RED : ((online < total) ? ST77XX_YELLOW : ST77XX_GREEN);
+    }
+
+    drawCenteredValue(peersTile_, buf, toPanelColor(logicalColor), 2);
+}
+
+void LcdDashboard::refreshErrorsPage() {
+    const ErrorCounters live = errLive_;
+    if (errCacheValid_ && std::memcmp(&live, &errDrawn_, sizeof(ErrorCounters)) == 0) {
+        return;
+    }
+    errCacheValid_ = true;
+    errDrawn_ = live;
+
+    tft_->fillRect(contentRect_.x, contentRect_.y, contentRect_.w, contentRect_.h, kRawWhite);
+
+    const uint32_t total = live.droppedRx + live.droppedDecode + live.droppedCrc + live.droppedReassembly +
+                            live.droppedQueueFull + live.droppedAuth;
+    const uint16_t color = toPanelColor((total > 0) ? ST77XX_RED : kNeutralGray565);
+
+    char line1[24] = {0};
+    char line2[24] = {0};
+    char line3[24] = {0};
+    std::snprintf(line1, sizeof(line1), "RX:%lu  DEC:%lu",
+                  static_cast<unsigned long>(live.droppedRx), static_cast<unsigned long>(live.droppedDecode));
+    std::snprintf(line2, sizeof(line2), "CRC:%lu  REASM:%lu",
+                  static_cast<unsigned long>(live.droppedCrc), static_cast<unsigned long>(live.droppedReassembly));
+    std::snprintf(line3, sizeof(line3), "Q:%lu  AUTH:%lu",
+                  static_cast<unsigned long>(live.droppedQueueFull), static_cast<unsigned long>(live.droppedAuth));
+
+    const int16_t x = static_cast<int16_t>(contentRect_.x + 2);
+    int16_t y = static_cast<int16_t>(contentRect_.y + 2);
+    drawTextLine(x, y, line1, color);
+    y = static_cast<int16_t>(y + kTextLineHeight);
+    drawTextLine(x, y, line2, color);
+    y = static_cast<int16_t>(y + kTextLineHeight);
+    drawTextLine(x, y, line3, color);
+}
+
+void LcdDashboard::refreshSessionPage() {
+    const SessionStatus live = sessionLive_;
+    // Field-by-field (not memcmp): the bool/uint64_t mix leaves compiler-
+    // dependent padding between members, which memcmp would compare too.
+    if (sessionCacheValid_ &&
+        live.protocolled == sessionDrawn_.protocolled &&
+        live.consoleOwned == sessionDrawn_.consoleOwned &&
+        live.sdReady == sessionDrawn_.sdReady &&
+        live.sdUsedMB == sessionDrawn_.sdUsedMB &&
+        live.sdTotalMB == sessionDrawn_.sdTotalMB &&
+        live.dbReady == sessionDrawn_.dbReady) {
+        return;
+    }
+    sessionCacheValid_ = true;
+    sessionDrawn_ = live;
+
+    tft_->fillRect(contentRect_.x, contentRect_.y, contentRect_.w, contentRect_.h, kRawWhite);
+
+    const int16_t x = static_cast<int16_t>(contentRect_.x + 2);
+    int16_t y = static_cast<int16_t>(contentRect_.y + 2);
+
+    const char* btpLabel = live.consoleOwned ? "Console" : (live.protocolled ? "Protocolado" : "Aguardando");
+    const uint16_t btpColor = live.consoleOwned ? kNeutralGray565 : (live.protocolled ? ST77XX_GREEN : ST77XX_YELLOW);
+    char line1[24] = {0};
+    std::snprintf(line1, sizeof(line1), "BTP: %s", btpLabel);
+    drawTextLine(x, y, line1, toPanelColor(btpColor));
+    y = static_cast<int16_t>(y + kTextLineHeight);
+
+    char line2[24] = {0};
+    if (live.sdReady) {
+        std::snprintf(line2, sizeof(line2), "SD %lu/%luMB",
+                      static_cast<unsigned long>(live.sdUsedMB), static_cast<unsigned long>(live.sdTotalMB));
+    } else {
+        std::snprintf(line2, sizeof(line2), "SD ausente");
+    }
+    drawTextLine(x, y, line2, toPanelColor(live.sdReady ? ST77XX_GREEN : kNeutralGray565));
+    y = static_cast<int16_t>(y + kTextLineHeight);
+
+    const char* dbLabel = live.dbReady ? "DB pronto" : "DB indisponivel";
+    drawTextLine(x, y, dbLabel, toPanelColor(live.dbReady ? ST77XX_GREEN : kNeutralGray565));
+}
+
+void LcdDashboard::refreshPeersPage() {
+    const size_t rowCount = peerRowCount_;
+    const size_t totalKnown = peerTotalKnown_;
+    bool sameRows = peersPageCacheValid_ && rowCount == peersPageDrawnRowCount_ &&
+                     totalKnown == peersPageDrawnTotalKnown_;
+    if (sameRows) {
+        // Age is compared in whole seconds (its display resolution): the
+        // millisecond value that feeds notifyPeers() changes on essentially
+        // every call, and redrawing on every such change would flicker the
+        // page for no visible difference.
+        for (size_t i = 0; i < rowCount; ++i) {
+            if (peersPageDrawnRows_[i].sourceId != peerRows_[i].sourceId ||
+                (peersPageDrawnRows_[i].lastSeenAgeMs / 1000U) != (peerRows_[i].lastSeenAgeMs / 1000U) ||
+                peersPageDrawnRows_[i].online != peerRows_[i].online) {
+                sameRows = false;
+                break;
+            }
+        }
+    }
+    if (sameRows) {
+        return;
+    }
+    peersPageCacheValid_ = true;
+    peersPageDrawnRowCount_ = rowCount;
+    peersPageDrawnTotalKnown_ = totalKnown;
+    for (size_t i = 0; i < rowCount; ++i) {
+        peersPageDrawnRows_[i] = peerRows_[i];
+    }
+
+    tft_->fillRect(contentRect_.x, contentRect_.y, contentRect_.w, contentRect_.h, kRawWhite);
+
+    const int16_t x = static_cast<int16_t>(contentRect_.x + 2);
+    int16_t y = static_cast<int16_t>(contentRect_.y + 2);
+
+    if (rowCount == 0) {
+        drawTextLine(x, y, "sem peers", toPanelColor(kNeutralGray565));
+        return;
+    }
+
+    for (size_t i = 0; i < rowCount; ++i) {
+        char line[24] = {0};
+        std::snprintf(line, sizeof(line), "%04lX  %lus",
+                      static_cast<unsigned long>(peerRows_[i].sourceId & 0xFFFFUL),
+                      static_cast<unsigned long>(peerRows_[i].lastSeenAgeMs / 1000U));
+        const uint16_t color = toPanelColor(peerRows_[i].online ? ST77XX_GREEN : kNeutralGray565);
+        drawTextLine(x, y, line, color);
+        y = static_cast<int16_t>(y + kTextLineHeight);
+    }
+
+    if (totalKnown > rowCount) {
+        char more[24] = {0};
+        std::snprintf(more, sizeof(more), "+%lu mais", static_cast<unsigned long>(totalKnown - rowCount));
+        drawTextLine(x, y, more, toPanelColor(kNeutralGray565));
+    }
 }
