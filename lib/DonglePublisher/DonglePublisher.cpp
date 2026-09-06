@@ -12,10 +12,11 @@ static_assert(kMaxPeers == BtpTransport::kPeerIdentityCapacity,
               "hub.peers declares max_element_count from the real peer table size");
 
 // Field type codes, commands.md section 3.3 (same order as telemetry.md
-// section 5's wire types). Only the three this dongle actually uses.
+// section 5's wire types). Only the four this dongle actually uses.
 constexpr std::uint8_t kTypeUint8 = 0x01U;
 constexpr std::uint8_t kTypeUint32 = 0x03U;
 constexpr std::uint8_t kTypeUint64 = 0x04U;
+constexpr std::uint8_t kTypeInt8 = 0x05U;
 
 constexpr std::uint8_t kEncodingPackedLe = 0x05U;
 constexpr std::uint8_t kTopicFlagSubscribable = 0x01U;
@@ -116,7 +117,7 @@ constexpr FieldDesc kUsbFields[] = {
 // hub.peers is a variable-length list, and PACKED_LE has no nested-record
 // type: the only shape that keeps every value individually addressable is one
 // variable array per column, each carrying its own element_count. Peer i is
-// therefore read across the six arrays at element_index i (and at 6i..6i+5 for
+// therefore read across the eight arrays at element_index i (and at 6i..6i+5 for
 // the flat `mac` bytes). That is exactly the (source_id, topic_id, field_id,
 // element_index) binding telemetry.md section 8 defines, so a client can chart
 // one peer's last_seen_ms without any new concept. The alternative --
@@ -134,6 +135,10 @@ constexpr FieldDesc kPeersFields[] = {
     {5U, 4U, "last_seen_ms", kTypeUint32, "ms", 0U, static_cast<std::uint16_t>(kMaxPeers),
      kFieldFlagVariableCount},
     {6U, 5U, "online", kTypeUint8, "1", 0U, static_cast<std::uint16_t>(kMaxPeers),
+     kFieldFlagVariableCount},
+    {7U, 6U, "rssi", kTypeInt8, "dBm", 0U, static_cast<std::uint16_t>(kMaxPeers),
+     kFieldFlagVariableCount},
+    {8U, 7U, "rtt_ms", kTypeUint32, "ms", 0U, static_cast<std::uint16_t>(kMaxPeers),
      kFieldFlagVariableCount},
 };
 
@@ -443,6 +448,14 @@ std::size_t packPeers(const PeerRecord* peers, std::size_t count, std::uint8_t* 
     for (std::size_t i = 0U; ok && i < count; ++i) {
         ok = writer.u8(peers[i].online ? 1U : 0U);
     }
+
+    ok = ok && writer.u16(elementCount);
+    for (std::size_t i = 0U; ok && i < count; ++i) {
+        ok = writer.u8(static_cast<std::uint8_t>(peers[i].rssi));
+    }
+
+    ok = ok && writer.u16(elementCount);
+    for (std::size_t i = 0U; ok && i < count; ++i) ok = writer.u32(peers[i].rttMs);
 
     return ok ? writer.size() : 0U;
 }

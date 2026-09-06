@@ -23,6 +23,14 @@ constexpr std::uint8_t kNoCompletionSlot = 0xFFU;
 constexpr std::size_t kCompletionSlotCount = 4U;
 constexpr std::uint32_t kAsyncCallbackTimeoutMs = 250U;
 
+// Standard 802.11 MAC header: frame control at offset 0-1, then three 6-byte
+// address fields for a management frame at offsets 4, 10, 16. Address2 (10)
+// is the transmitter. Frame control byte 0 == 0xD0 is Version=0, Type=
+// Management(00), Subtype=Action(1101) -- what every ESP-NOW frame is sent
+// as, regardless of the flags in byte 1.
+constexpr std::uint8_t kDot11FrameControlMgmtAction = 0xD0U;
+constexpr std::size_t kDot11Addr2Offset = 10U;
+
 struct TxRequest {
     std::uint8_t mac[6];
     std::uint16_t len;
@@ -335,6 +343,16 @@ bool EspNowManager::begin(uint8_t channel, bool encrypt) {
     esp_now_register_recv_cb(handleReceiveStatic);
     esp_now_register_send_cb(handleSendStatic);
 
+    // See handlePromiscuousRxStatic: this core's ESP-NOW recv callback has no
+    // RSSI, so a promiscuous sniffer runs alongside it to recover one.
+    // Management-frame-only filter, since ESP-NOW's Action frames are all
+    // this dongle ever needs to see on its own fixed channel.
+    wifi_promiscuous_filter_t promiscFilter{};
+    promiscFilter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
+    esp_wifi_set_promiscuous_filter(&promiscFilter);
+    esp_wifi_set_promiscuous_rx_cb(handlePromiscuousRxStatic);
+    esp_wifi_set_promiscuous(true);
+
     if (!startTxScheduler()) {
         esp_now_deinit();
         initialized_ = false;
@@ -360,6 +378,7 @@ bool EspNowManager::begin(uint8_t channel, bool encrypt) {
 void EspNowManager::end() {
     stopTxScheduler();
     if (initialized_) {
+        esp_wifi_set_promiscuous(false);
         esp_now_deinit();
     }
     destroyTxSchedulerStorage();
@@ -661,7 +680,30 @@ void EspNowManager::handleReceiveStatic(const uint8_t* mac, const uint8_t* incom
         return;
     }
 
-    activeInstance_->receiveCallback_(mac, incomingData, static_cast<size_t>(len));
+    const int index = activeInstance_->findDeviceIndexByMac(mac);
+    const int8_t rssi = (index >= 0) ? activeInstance_->devices_[index].lastRssi : int8_t(-128);
+    activeInstance_->receiveCallback_(mac, incomingData, static_cast<size_t>(len), rssi);
+}
+
+// See handlePromiscuousRxStatic's doc comment (EspNowManager.h): this stashes
+// the RSSI of the last Action frame seen from each known peer, so
+// handleReceiveStatic can read it back for that same over-the-air frame.
+void EspNowManager::handlePromiscuousRxStatic(void* buf, wifi_promiscuous_pkt_type_t type) {
+    if (activeInstance_ == nullptr || type != WIFI_PKT_MGMT || buf == nullptr) {
+        return;
+    }
+
+    const auto* pkt = static_cast<const wifi_promiscuous_pkt_t*>(buf);
+    if (pkt->rx_ctrl.sig_len < kDot11Addr2Offset + 6U ||
+        pkt->payload[0] != kDot11FrameControlMgmtAction) {
+        return;
+    }
+
+    const uint8_t* sourceMac = pkt->payload + kDot11Addr2Offset;
+    const int index = activeInstance_->findDeviceIndexByMac(sourceMac);
+    if (index >= 0) {
+        activeInstance_->devices_[index].lastRssi = static_cast<int8_t>(pkt->rx_ctrl.rssi);
+    }
 }
 
 // Dispatch low-level send result to user callback.

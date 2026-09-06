@@ -69,7 +69,7 @@ constexpr std::uint16_t kPeersTopicId = kHubTopicBlockBase + 0x03U;  // hub.peer
 // *and* a bump of ManifestCache::kSelfConfigRevision (commands.md section
 // 3.3), otherwise a client can retain and decode the old layout as if it were
 // still current.
-constexpr std::uint16_t kSchemaVersion = 2U;
+constexpr std::uint16_t kSchemaVersion = 4U;
 
 // Peers this dongle can describe at once. Must equal
 // BtpTransport::kPeerIdentityCapacity -- static_assert'ed in the .cpp -- and
@@ -195,6 +195,16 @@ struct PeerRecord {
     // rememberAuthenticatedPeer's own
     // comment) is still the field to judge mere freshness by.
     bool online;
+    // Wire field `rssi`: RSSI in dBm of the last authenticated channel-C
+    // frame from this peer (EspNowManager's promiscuous sniffer; -128 when
+    // never observed). Wire type kTypeInt8 (telemetry.md's signed 8-bit),
+    // sign-extended back to a real negative number by btp::SampleValue::f64
+    // on the reading end -- no bit-reinterpretation trick needed.
+    std::int8_t rssi;
+    // Wire field `rtt_ms`: round-trip time of the last completed
+    // btp_command::kPingActionId probe to this peer (BtpTransport::
+    // notePingSent/notePingReply); 0 before the first one completes.
+    std::uint32_t rttMs;
 };
 
 /** Everything one publish cycle needs, gathered in one call (see
@@ -218,14 +228,15 @@ constexpr std::size_t kLinkPayloadSize = kSchemaVersionPrefixSize + 12U * 4U;  /
 constexpr std::size_t kUsbPayloadSize =
     kSchemaVersionPrefixSize + 6U * 8U + kUsbDropClassCount * 8U + 5U * 8U;  // 122
 
-// hub.peers is six variable arrays, each prefixed by its own
+// hub.peers is eight variable arrays, each prefixed by its own
 // `element_count:uint16_le` (telemetry.md 4.1). Per peer that is
 // 1 (channel) + 4 (source_id) + 4 (boot_id) + 6 (mac) + 4 (last_seen_ms)
-// + 1 (online) = 20 octets, on top of a fixed 2 + 6*2 = 14.
-constexpr std::size_t kPeersPayloadOverhead = kSchemaVersionPrefixSize + 6U * 2U;  // 14
-constexpr std::size_t kPeersPayloadBytesPerPeer = 20U;
+// + 1 (online) + 1 (rssi) + 4 (rtt_ms) = 25 octets, on top of a fixed
+// 2 + 8*2 = 18.
+constexpr std::size_t kPeersPayloadOverhead = kSchemaVersionPrefixSize + 8U * 2U;  // 18
+constexpr std::size_t kPeersPayloadBytesPerPeer = 25U;
 constexpr std::size_t kMaxPeersPayloadSize =
-    kPeersPayloadOverhead + kPeersPayloadBytesPerPeer * kMaxPeers;  // 334
+    kPeersPayloadOverhead + kPeersPayloadBytesPerPeer * kMaxPeers;  // 418
 
 // ---------------------------------------------------------------------------
 // Serialization (pure, no state -- what env:native covers)

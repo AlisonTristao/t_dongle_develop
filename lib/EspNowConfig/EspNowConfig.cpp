@@ -362,6 +362,13 @@ void handleRoutedCommandResult(const uint8_t mac[6], const btp::Header& header, 
         return;
     }
 
+    if (result.action_id == BtpTransport::btp_command::kPingActionId) {
+        // A ping's only purpose is the RTT it completes -- never surfaced as
+        // a cmd_result line, unlike every other COMMAND_RESULT below.
+        BtpTransport::notePingReply(mac, result.reply_to_sequence, millis());
+        return;
+    }
+
     if (!SerialMux::isConsoleOwned()) {
         if (SerialMux::isProtocolled()) {
             std::string terminalText = "cmd_result status=";
@@ -531,7 +538,8 @@ void dispatchRouted(const uint8_t mac[6], const ProtocolRouter::RoutedMessage& r
 // their authenticated reference names this dongle; failed opens are channel B
 // and their original raw fragments relay upstream. No destination decision
 // ever reads a payload byte before that authentication.
-void processRxDatagramInternal(const uint8_t mac[6], const uint8_t* data, size_t len) {
+void processRxDatagramInternal(const uint8_t mac[6], const uint8_t* data, size_t len,
+                                int8_t rssi) {
     if (g_lcdDashboard != nullptr) {
         g_lcdDashboard->notifyRx();
     }
@@ -627,7 +635,7 @@ void processRxDatagramInternal(const uint8_t mac[6], const uint8_t* data, size_t
         // cannot spoof online or overwrite the source_id -> MAC route.
         if (mac != nullptr) {
             BtpTransport::rememberAuthenticatedPeer(mac, routed.header.source_id,
-                                                    routed.header.boot_id, nowMs);
+                                                    routed.header.boot_id, nowMs, rssi);
             BtpTransport::notePeerLinkResult(mac, true);
 
             if (g_manager != nullptr && g_manager->deviceIndexByMac(mac) < 0) {
@@ -669,7 +677,7 @@ void processRxDatagramInternal(const uint8_t mac[6], const uint8_t* data, size_t
     dispatchRouted(mac, routed);
 }
 
-void onDataRecv(const uint8_t* mac, const uint8_t* data, size_t len) {
+void onDataRecv(const uint8_t* mac, const uint8_t* data, size_t len, int8_t rssi) {
     if (mac == nullptr || data == nullptr || len == 0) {
         return;
     }
@@ -680,6 +688,7 @@ void onDataRecv(const uint8_t* mac, const uint8_t* data, size_t len) {
         const size_t copyLen = (len < sizeof(event.data)) ? len : sizeof(event.data);
         std::memcpy(event.data, data, copyLen);
         event.len = copyLen;
+        event.rssi = rssi;
 
         if (xQueueSend(g_rxQueue, &event, 0) == pdTRUE) {
             return;
@@ -868,7 +877,7 @@ bool dequeueRxDatagram(RxDatagramEvent& outEvent, uint32_t timeoutMs) {
 }
 
 void processRxDatagram(const RxDatagramEvent& event) {
-    processRxDatagramInternal(event.mac, event.data, event.len);
+    processRxDatagramInternal(event.mac, event.data, event.len, event.rssi);
 }
 
 size_t drainRoutedQueues(size_t maxItemsPerQueue) {
@@ -1005,13 +1014,72 @@ void heartbeatTick() {
 
     const bool linkOk = gotStatus && delivered;
 
-    // Topico 27: the same verdict, kept per peer as well. Until now it only
-    // lit the LCD's LINK tile -- a single global bit on a screen nobody can
-    // plot; hub.peers publishes it per peer as `online`.
+    // Topico 27/41: the per-peer verdict feeds hub.peers' `online` flag and
+    // the LCD's PEERS tile/page (both via BtpTransport::enumeratePeers's
+    // age-window check, not this single-peer probe result directly -- see
+    // AppRuntime::processAsyncWarnings). The old LINK tile that showed just
+    // this one bit is gone.
     BtpTransport::notePeerLinkResult(targetMac, linkOk);
+}
 
-    if (g_lcdDashboard != nullptr) {
-        g_lcdDashboard->notifyHeartbeat(linkOk);
+void pingTick() {
+    if (g_manager == nullptr) {
+        return;
+    }
+
+    BtpTransport::PeerSnapshot peers[BtpTransport::kPeerIdentityCapacity]{};
+    const std::size_t peerCount =
+        BtpTransport::enumeratePeers(peers, BtpTransport::kPeerIdentityCapacity);
+    if (peerCount == 0U) {
+        return;
+    }
+    static std::size_t nextPeer = 0U;  // owned only by this task, like heartbeatTick's
+    if (nextPeer >= peerCount) {
+        nextPeer = 0U;
+    }
+    const BtpTransport::PeerSnapshot target = peers[nextPeer];
+    nextPeer = (nextPeer + 1U) % peerCount;
+
+    uint32_t sequence = 0;
+    if (!BtpTransport::reserveSequence(&sequence)) {
+        return;
+    }
+
+    uint8_t payload[BtpTransport::btp_command::kRequestPrefixSize] = {0};
+    payload[0] = static_cast<uint8_t>(target.sourceId);
+    payload[1] = static_cast<uint8_t>(target.sourceId >> 8);
+    payload[2] = static_cast<uint8_t>(target.sourceId >> 16);
+    payload[3] = static_cast<uint8_t>(target.sourceId >> 24);
+    payload[4] = static_cast<uint8_t>(target.bootId);
+    payload[5] = static_cast<uint8_t>(target.bootId >> 8);
+    payload[6] = static_cast<uint8_t>(target.bootId >> 16);
+    payload[7] = static_cast<uint8_t>(target.bootId >> 24);
+    payload[8] = static_cast<uint8_t>(BtpTransport::btp_command::kPingActionId);
+    payload[9] = static_cast<uint8_t>(BtpTransport::btp_command::kPingActionId >> 8);
+    payload[10] = static_cast<uint8_t>(BtpTransport::btp_command::kPingActionVersion);
+    payload[11] = static_cast<uint8_t>(BtpTransport::btp_command::kPingActionVersion >> 8);
+    // bytes 12-19 (flags, reserved, parameters_size) are already zero: a ping
+    // carries no parameters.
+
+    const uint32_t nowMs = millis();
+    const uint64_t timestampUs = static_cast<uint64_t>(nowMs) * 1000ULL;
+    // encodeSingleFrame (not sendLogical) because the sequence embedded in
+    // the frame has to be the exact one notePingSent records: sendLogical
+    // reserves its own internally and never reports it back, which would
+    // leave the pending record correlated against the wrong number and the
+    // reply never matching. A fixed 20-octet ping payload always fits one
+    // frame, same as heartbeatTick's STATUS probe.
+    uint8_t frame[btp::kV1MinimumFrameSize + BtpTransport::kAeadTagSize];
+    size_t frameSize = 0;
+    if (!BtpTransport::encodeSingleFrame(btp::MessageType::Command,
+                                         BtpTransport::btp_command::kCommandRequestObjectId,
+                                         sequence, timestampUs, payload, sizeof(payload), frame,
+                                         sizeof(frame), &frameSize, RadioSeal::seal, nullptr)) {
+        return;
+    }
+
+    if (sendRawToMac(target.mac, frame, frameSize)) {
+        BtpTransport::notePingSent(target.mac, sequence, nowMs);
     }
 }
 

@@ -177,9 +177,16 @@ void AppRuntime::espNowHeartbeatWorkerTask(void*) {
     // Blocking send-with-status lives here, off the main loop, so a slow/absent
     // peer never stalls the shell. See HEARTBEAT_INTERVAL_MS in EspNowConfig.h.
     const TickType_t periodTicks = pdMS_TO_TICKS(HEARTBEAT_INTERVAL_MS);
+    uint32_t tick = 0;
 
     while (true) {
         EspNowConfig::heartbeatTick();
+        // See PING_TICK_EVERY_N_HEARTBEATS: the ping RTT probe rides this
+        // same task, just not on every one of its ticks.
+        if ((tick % PING_TICK_EVERY_N_HEARTBEATS) == 0U) {
+            EspNowConfig::pingTick();
+        }
+        ++tick;
         vTaskDelay(periodTicks);
     }
 }
@@ -343,35 +350,29 @@ void AppRuntime::startHeartbeatWorker() {
     }
 }
 
-// Turns the drop counters the RX worker accumulates into per-category console
-// lines, so "the robot is connected but nothing works" has a visible cause
-// (plano 36 fase 4.4). SOLE consumer of the takeDropped*Count() family: each
-// call advances a watermark, so a second reader elsewhere would steal half
-// the deltas -- flushPendingEspNowOutput used to report a lump `rx_dropped=`
-// sum here and no longer does.
-//
-// Console-owned only, same constraint as every other diagnostic line this
+// Feeds the LCD dashboard (topico 41: Errors/Peers/Session pages) every
+// tick, unconditionally -- the screen has no other way to show this and has
+// to stay live with a robot connected (the common case), not just from a
+// bare USB console. Also turns the drop counters the RX worker accumulates
+// into per-category console lines, so "the robot is connected but nothing
+// works" has a visible cause (plano 36 fase 4.4), but that part is
+// console-owned only, same constraint as every other diagnostic line this
 // firmware prints: a BTP-protocolled session owns the port exclusively
 // (PASSO 11), and the counters that matter most while protocolled
 // (droppedDecode/Reassembly/Crc/QueueFull) are already in the hub.link topic
 // a desktop can plot. droppedAuth and the manifest-reject counters are not on
 // the wire yet -- `hub -manifest` and `espnow -stats` are where a protocolled
 // session reads those.
+//
+// SOLE consumer of takeDroppedDecodeCount/ReassemblyCount/QueueFullCount/
+// AuthCount: each call advances a watermark, so a second reader elsewhere
+// would steal half the deltas.
 void AppRuntime::processAsyncWarnings(bool& needPromptRefresh) {
-    // Delta since last tick for the five wire-schema drop counters + the
-    // auth-fail counter. Drained here unconditionally (watermark must keep
-    // moving even while protocolled) and fed to the LCD's ERR tile.
-    const uint32_t rxq    = EspNowConfig::takeDroppedRxCount();
+    // Delta since last tick, needed below for the throttled console lines.
     const uint32_t decode = EspNowConfig::takeDroppedDecodeCount();
-    const uint32_t crc    = EspNowConfig::takeDroppedCrcCount();
     const uint32_t reasm  = EspNowConfig::takeDroppedReassemblyCount();
     const uint32_t queue  = EspNowConfig::takeDroppedQueueFullCount();
     const uint32_t auth   = EspNowConfig::takeDroppedAuthCount();
-
-    const uint32_t lcdTotal = rxq + decode + crc + reasm + queue + auth;
-    if (lcdTotal > 0) {
-        lcdDashboard_.notifyDropped(lcdTotal);
-    }
 
     // Manifest-path rejections and the heap-starved-RX drop are cumulative
     // totals with no delta accessor -- keep our own watermarks.
@@ -388,13 +389,35 @@ void AppRuntime::processAsyncWarnings(bool& needPromptRefresh) {
     lastIngestFailed = ingestFailTotal;
     lastSyncFallback = syncFb;
 
+    const uint32_t nowMs = millis();
+
+    // Cumulative (non-draining) reads for the LCD: safe to call alongside the
+    // take*() drains above, and pushed regardless of console/BTP ownership.
+    EspNowConfig::RxCounters rx{};
+    EspNowConfig::peekRxCounters(rx);
+    const uint32_t droppedAuthTotal = EspNowConfig::peekDroppedAuthCount();
+    lcdDashboard_.notifyErrorCounters(rx.droppedRx, rx.droppedDecode, rx.droppedCrc, rx.droppedReassembly,
+                                      rx.droppedQueueFull, droppedAuthTotal);
+
+    BtpTransport::PeerSnapshot peers[BtpTransport::kPeerIdentityCapacity];
+    const size_t peerCount = BtpTransport::enumeratePeers(peers, BtpTransport::kPeerIdentityCapacity);
+    LcdDashboard::PeerRow lcdPeers[LcdDashboard::MAX_DISPLAYED_PEERS];
+    const size_t lcdPeerCount =
+        (peerCount < LcdDashboard::MAX_DISPLAYED_PEERS) ? peerCount : LcdDashboard::MAX_DISPLAYED_PEERS;
+    for (size_t i = 0; i < lcdPeerCount; ++i) {
+        lcdPeers[i].sourceId = peers[i].sourceId;
+        lcdPeers[i].lastSeenAgeMs = nowMs - peers[i].lastAuthenticatedMs;
+        lcdPeers[i].online = (lcdPeers[i].lastSeenAgeMs < kPeerOnlineWindowMs);
+    }
+    lcdDashboard_.notifyPeers(lcdPeers, lcdPeerCount, peerCount);
+
+    lcdDashboard_.notifySessionStatus(SerialMux::isProtocolled(), SerialMux::isConsoleOwned());
+    lcdDashboard_.notifyStorageStatus(donglePeripherals_.isSdReady(), donglePeripherals_.sdUsedMB(),
+                                      donglePeripherals_.sdTotalMB(), databaseReady_);
+
     if (!SerialMux::isConsoleOwned()) {
         return;
     }
-
-    EspNowConfig::RxCounters rx{};
-    EspNowConfig::peekRxCounters(rx);
-    const uint32_t nowMs = millis();
 
     struct WarnCategory {
         const char* label;
@@ -404,11 +427,8 @@ void AppRuntime::processAsyncWarnings(bool& needPromptRefresh) {
     };
     static uint32_t emitAuth = 0, emitReasm = 0, emitDecode = 0, emitQueue = 0,
                     emitConsume = 0, emitIngest = 0, emitSync = 0;
-    // rxq is deliberately absent: a full raw-datagram queue is a burst event
-    // the LCD tile and "queue_full" (routed) already cover, and itemizing it
-    // adds noise without a distinct fix.
     const WarnCategory cats[] = {
-        {"auth_drop chave-L", auth, EspNowConfig::peekDroppedAuthCount(), &emitAuth},
+        {"auth_drop chave-L", auth, droppedAuthTotal, &emitAuth},
         {"reassembly_drop", reasm, rx.droppedReassembly, &emitReasm},
         {"decode_drop", decode, rx.droppedDecode, &emitDecode},
         {"queue_full", queue, rx.droppedQueueFull, &emitQueue},
@@ -722,6 +742,8 @@ void AppRuntime::begin() {
             // plano 36 fase 2.A: "ouvi algo dele ha pouco", nao o linkOk do
             // heartbeat (que so vale para o ultimo peer). Ver kPeerOnlineWindowMs.
             out.peers[i].online = (ageMs < kPeerOnlineWindowMs);
+            out.peers[i].rssi = peers[i].rssi;
+            out.peers[i].rttMs = peers[i].rttMs;
         }
         out.peerCount = peerCount;
     });

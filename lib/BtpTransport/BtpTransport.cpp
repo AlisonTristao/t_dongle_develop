@@ -71,6 +71,11 @@ struct PeerIdentity {
     std::uint32_t bootId = 0U;
     std::uint32_t lastAuthenticatedMs = 0U;
     bool linkOk = false;
+    std::int8_t rssi = -128;
+    bool pingPending = false;
+    std::uint32_t pingSequence = 0U;
+    std::uint32_t pingSentMs = 0U;
+    std::uint32_t rttMs = 0U;
 };
 
 PeerIdentity g_peers[kPeerIdentityCapacity];
@@ -207,7 +212,8 @@ bool sendLogicalWithStatus(SendWithStatusFn sendWithStatus,
 }
 
 void rememberAuthenticatedPeer(const std::uint8_t mac[6], std::uint32_t sourceId,
-                               std::uint32_t bootId, std::uint32_t nowMs) noexcept {
+                               std::uint32_t bootId, std::uint32_t nowMs,
+                               std::int8_t rssi) noexcept {
     if (mac == nullptr || sourceId == 0U || bootId == 0U) return;
 
     const PeerTableGuard guard;
@@ -217,6 +223,7 @@ void rememberAuthenticatedPeer(const std::uint8_t mac[6], std::uint32_t sourceId
             g_peers[index].sourceId = sourceId;
             g_peers[index].bootId = bootId;
             g_peers[index].lastAuthenticatedMs = nowMs;
+            g_peers[index].rssi = rssi;
             return;
         }
     }
@@ -228,6 +235,7 @@ void rememberAuthenticatedPeer(const std::uint8_t mac[6], std::uint32_t sourceId
             g_peers[index].sourceId = sourceId;
             g_peers[index].bootId = bootId;
             g_peers[index].lastAuthenticatedMs = nowMs;
+            g_peers[index].rssi = rssi;
             // A recycled slot must not inherit the previous occupant's
             // heartbeat verdict: nothing has been probed at this MAC yet.
             g_peers[index].linkOk = false;
@@ -243,6 +251,7 @@ void rememberAuthenticatedPeer(const std::uint8_t mac[6], std::uint32_t sourceId
     g_peers[0].sourceId = sourceId;
     g_peers[0].bootId = bootId;
     g_peers[0].lastAuthenticatedMs = nowMs;
+    g_peers[0].rssi = rssi;
     g_peers[0].linkOk = false;
 }
 
@@ -254,6 +263,41 @@ void notePeerLinkResult(const std::uint8_t mac[6], bool delivered) noexcept {
     for (std::size_t index = 0U; index < kPeerIdentityCapacity; ++index) {
         if (g_peers[index].used && sameMac(g_peers[index].mac, mac)) {
             g_peers[index].linkOk = delivered;
+            return;
+        }
+    }
+}
+
+void notePingSent(const std::uint8_t mac[6], std::uint32_t sequence, std::uint32_t nowMs) noexcept {
+    if (mac == nullptr) return;
+
+    const PeerTableGuard guard;
+
+    for (std::size_t index = 0U; index < kPeerIdentityCapacity; ++index) {
+        if (g_peers[index].used && sameMac(g_peers[index].mac, mac)) {
+            g_peers[index].pingPending = true;
+            g_peers[index].pingSequence = sequence;
+            g_peers[index].pingSentMs = nowMs;
+            return;
+        }
+    }
+}
+
+void notePingReply(const std::uint8_t mac[6], std::uint32_t replyToSequence,
+                   std::uint32_t nowMs) noexcept {
+    if (mac == nullptr) return;
+
+    const PeerTableGuard guard;
+
+    for (std::size_t index = 0U; index < kPeerIdentityCapacity; ++index) {
+        if (g_peers[index].used && sameMac(g_peers[index].mac, mac)) {
+            if (g_peers[index].pingPending && g_peers[index].pingSequence == replyToSequence) {
+                // Unsigned wrap makes this the correct elapsed time even
+                // across the ~49-day millis() rollover (same reasoning as
+                // AppRuntime's lastSeenAgeMs).
+                g_peers[index].rttMs = nowMs - g_peers[index].pingSentMs;
+                g_peers[index].pingPending = false;
+            }
             return;
         }
     }
@@ -272,6 +316,8 @@ std::size_t enumeratePeers(PeerSnapshot* out, std::size_t maxOut) noexcept {
         out[written].bootId = g_peers[index].bootId;
         out[written].lastAuthenticatedMs = g_peers[index].lastAuthenticatedMs;
         out[written].linkOk = g_peers[index].linkOk;
+        out[written].rssi = g_peers[index].rssi;
+        out[written].rttMs = g_peers[index].rttMs;
         ++written;
     }
     return written;

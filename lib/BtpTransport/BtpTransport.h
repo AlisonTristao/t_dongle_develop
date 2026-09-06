@@ -195,11 +195,15 @@ constexpr std::size_t kPeerIdentityCapacity = 16U;
 /** Records an identity only after a channel-C frame from this MAC has passed
  * AEAD-L authentication. Public BTP headers from opaque channel-B traffic are
  * deliberately insufficient: they may still be relayed, but must never
- * create a routing binding or renew the official online clock. */
+ * create a routing binding or renew the official online clock.
+ * @param rssi RSSI (dBm) of this frame, from EspNowManager's promiscuous
+ * sniffer (see EspNowManager.h); -128 when unavailable. Defaulted so callers
+ * that only care about identity (e.g. tests) do not need to know about it. */
 void rememberAuthenticatedPeer(const std::uint8_t mac[6],
                                std::uint32_t sourceId,
                                std::uint32_t bootId,
-                               std::uint32_t nowMs) noexcept;
+                               std::uint32_t nowMs,
+                               std::int8_t rssi = -128) noexcept;
 
 /** Records the outcome of the heartbeat probe this dongle last addressed to
  * this MAC (EspNowConfig::heartbeatTick). Until topico 27 that verdict only
@@ -208,6 +212,20 @@ void rememberAuthenticatedPeer(const std::uint8_t mac[6],
  * creates an entry: a MAC we have never received a BTP frame from has no
  * identity to attach the result to. */
 void notePeerLinkResult(const std::uint8_t mac[6], bool delivered) noexcept;
+
+/** Arms a pending RTT measurement for a ping (btp_command::kPingActionId)
+ * COMMAND_REQUEST this dongle just sent to this MAC. Only one ping may be
+ * pending per peer at a time -- a new call simply replaces whatever was
+ * pending, same "latest wins" reasoning as rememberAuthenticatedPeer.
+ * Never creates an entry: a MAC with no identity yet has nowhere to attach
+ * a pending ping to. */
+void notePingSent(const std::uint8_t mac[6], std::uint32_t sequence, std::uint32_t nowMs) noexcept;
+
+/** Matches an incoming COMMAND_RESULT's reply_to_sequence against this MAC's
+ * pending ping (see notePingSent). A mismatch or no pending ping is silently
+ * ignored: a stale/duplicate reply must not overwrite rttMs with garbage. */
+void notePingReply(const std::uint8_t mac[6], std::uint32_t replyToSequence,
+                   std::uint32_t nowMs) noexcept;
 
 /** One row of the peer table, for enumeration. */
 struct PeerSnapshot {
@@ -219,6 +237,12 @@ struct PeerSnapshot {
     std::uint32_t lastAuthenticatedMs;
     /** Last notePeerLinkResult() verdict; false when never probed. */
     bool linkOk;
+    /** RSSI (dBm) of the last authenticated channel-C frame from this MAC;
+     * -128 when never observed (see rememberAuthenticatedPeer). */
+    std::int8_t rssi;
+    /** Round-trip time (ms) of the last completed ping (notePingSent ->
+     * notePingReply); 0 before the first one completes. */
+    std::uint32_t rttMs;
 };
 
 /**
@@ -259,6 +283,10 @@ constexpr std::uint16_t kCommandRequestObjectId = 0x0001U;
 constexpr std::uint16_t kCommandResultObjectId = 0x0002U;
 constexpr std::uint16_t kShellActionId = 0x0001U;
 constexpr std::uint16_t kShellActionVersion = 0x0001U;
+// Mirrors bally_OS's CommandProcessor: a no-op action answered at RX time,
+// purely so a COMMAND_REQUEST/COMMAND_RESULT round trip can measure RTT.
+constexpr std::uint16_t kPingActionId = 0x0002U;
+constexpr std::uint16_t kPingActionVersion = 0x0001U;
 constexpr std::size_t kRequestPrefixSize = 20U;
 constexpr std::size_t kResultPrefixSize = 26U;
 constexpr std::size_t kMaxShellCommandSize = 512U;

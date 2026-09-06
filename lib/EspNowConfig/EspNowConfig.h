@@ -45,6 +45,14 @@ class LcdDashboard;
 #define HEARTBEAT_SEND_TIMEOUT_MS 150 // must stay under HEARTBEAT_INTERVAL_MS
 #endif
 
+// pingTick() rides the same worker task as heartbeatTick(), but only every
+// Nth tick: an RTT number is a UI convenience (hub.peers itself publishes at
+// 2 Hz, DonglePublisher.cpp), not a control-loop signal, so it does not need
+// the heartbeat's own 5x/s cadence duplicated on top of it.
+#ifndef PING_TICK_EVERY_N_HEARTBEATS
+#define PING_TICK_EVERY_N_HEARTBEATS 5
+#endif
+
 namespace EspNowConfig {
 
 /** One raw ESP-NOW datagram, exactly as received from the radio (no BTP
@@ -53,6 +61,7 @@ struct RxDatagramEvent {
 	uint8_t mac[6];
 	uint8_t data[EspNowManager::MAX_DATA_LEN];
 	size_t len;
+	int8_t rssi;
 };
 
 void attachCallbacks(
@@ -198,6 +207,16 @@ void peekTxSchedulerCounters(EspNowManager::TxSchedulerCounters& out);
  * layer. `online` is the AND of both signals settling on "yes".
  */
 void heartbeatTick();
+
+/**
+ * @brief Sends one Command/COMMAND_REQUEST ping (btp_command::kPingActionId)
+ * to the next authenticated peer in round robin, the same rotation
+ * heartbeatTick uses. Fire-and-forget: arms BtpTransport::notePingSent and
+ * moves on, unlike heartbeatTick's blocking send-with-status -- the actual
+ * RTT is completed later, asynchronously, when handleRoutedCommandResult
+ * sees the matching COMMAND_RESULT and calls BtpTransport::notePingReply.
+ */
+void pingTick();
 
 /**
  * @brief Topico 28: writes one already-encoded BTP frame to a peer MAC,

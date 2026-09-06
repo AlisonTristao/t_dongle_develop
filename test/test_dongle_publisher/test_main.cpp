@@ -94,7 +94,7 @@ DonglePublisher::UsbCounters sampleUsb() {
 
 DonglePublisher::PeerRecord makePeer(uint32_t sourceId, uint32_t bootId,
                                      uint8_t macTail, uint32_t ageMs,
-                                     bool online) {
+                                     bool online, int8_t rssi, uint32_t rttMs) {
     DonglePublisher::PeerRecord p = {};
     p.sourceId = sourceId;
     p.bootId = bootId;
@@ -102,6 +102,8 @@ DonglePublisher::PeerRecord makePeer(uint32_t sourceId, uint32_t bootId,
     std::memcpy(p.mac, mac, sizeof(mac));
     p.lastSeenAgeMs = ageMs;
     p.online = online;
+    p.rssi = rssi;
+    p.rttMs = rttMs;
     return p;
 }
 
@@ -218,15 +220,15 @@ void test_usb_keeps_dropped_by_class_split_never_summed() {
 // hub.peers
 // ---------------------------------------------------------------------------
 
-// Six parallel arrays, each self-prefixed with its own element_count
+// Eight parallel arrays, each self-prefixed with its own element_count
 // (telemetry.md section 4.1). The MAC array counts OCTETS, not peers, because
 // PACKED_LE has no fixed-width blob type -- that asymmetry is easy to get
 // wrong in both the encoder and a hand-written decoder, so it is pinned.
 void test_peers_payload_layout_is_exact() {
     const DonglePublisher::PeerRecord peers[3] = {
-        makePeer(0xA1A1A1A1U, 0x0B0B0B0BU, 0x11U, 250U, true),
-        makePeer(0xB2B2B2B2U, 0x0C0C0C0CU, 0x22U, 4000U, false),
-        makePeer(0xC3C3C3C3U, 0x0D0D0D0DU, 0x33U, 0U, true),
+        makePeer(0xA1A1A1A1U, 0x0B0B0B0BU, 0x11U, 250U, true, -40, 12U),
+        makePeer(0xB2B2B2B2U, 0x0C0C0C0CU, 0x22U, 4000U, false, -67, 345U),
+        makePeer(0xC3C3C3C3U, 0x0D0D0D0DU, 0x33U, 0U, true, -91, 0U),
     };
     uint8_t buffer[DonglePublisher::kMaxPeersPayloadSize] = {0};
 
@@ -236,7 +238,7 @@ void test_peers_payload_layout_is_exact() {
         DonglePublisher::kPeersPayloadOverhead +
             DonglePublisher::kPeersPayloadBytesPerPeer * 3U,
         written);
-    TEST_ASSERT_EQUAL_UINT32(14U + 20U * 3U, written);  // 74, spelled out
+    TEST_ASSERT_EQUAL_UINT32(18U + 25U * 3U, written);  // 93, spelled out
 
     size_t at = 0U;
     TEST_ASSERT_EQUAL_UINT16(DonglePublisher::kSchemaVersion, readU16(buffer));
@@ -287,6 +289,22 @@ void test_peers_payload_layout_is_exact() {
     TEST_ASSERT_EQUAL_UINT8(1U, buffer[at + 2U]);
     at += 3U;
 
+    // rssi: kTypeInt8, sign-extended on read -- the wire byte is still just
+    // the two's-complement bit pattern.
+    TEST_ASSERT_EQUAL_UINT16(3U, readU16(buffer + at));
+    at += 2U;
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(-40), buffer[at + 0U]);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(-67), buffer[at + 1U]);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(-91), buffer[at + 2U]);
+    at += 3U;
+
+    TEST_ASSERT_EQUAL_UINT16(3U, readU16(buffer + at));
+    at += 2U;
+    for (size_t i = 0U; i < 3U; ++i) {
+        TEST_ASSERT_EQUAL_UINT32(peers[i].rttMs, readU32(buffer + at + i * 4U));
+    }
+    at += 12U;
+
     TEST_ASSERT_EQUAL_UINT32(written, at);
 }
 
@@ -299,8 +317,8 @@ void test_peers_with_no_peers_is_a_valid_empty_payload() {
         DonglePublisher::packPeers(nullptr, 0U, buffer, sizeof(buffer));
     TEST_ASSERT_EQUAL_UINT32(DonglePublisher::kPeersPayloadOverhead, written);
     TEST_ASSERT_EQUAL_UINT16(DonglePublisher::kSchemaVersion, readU16(buffer));
-    // All six element_counts are zero, and the six of them are the whole body.
-    for (size_t i = 0U; i < 6U; ++i) {
+    // All eight element_counts are zero, and the eight of them are the whole body.
+    for (size_t i = 0U; i < 8U; ++i) {
         TEST_ASSERT_EQUAL_UINT16(0U, readU16(buffer + 2U + i * 2U));
     }
 }
@@ -311,14 +329,16 @@ void test_peers_at_capacity_fits_the_declared_maximum() {
         peers[i] = makePeer(0x1000U + static_cast<uint32_t>(i),
                             0x2000U + static_cast<uint32_t>(i),
                             static_cast<uint8_t>(i), static_cast<uint32_t>(i),
-                            (i % 2U) == 0U);
+                            (i % 2U) == 0U,
+                            static_cast<int8_t>(-1 - static_cast<int>(i)),
+                            static_cast<uint32_t>(i) * 10U);
     }
     uint8_t buffer[DonglePublisher::kMaxPeersPayloadSize] = {0};
 
     const size_t written = DonglePublisher::packPeers(
         peers, DonglePublisher::kMaxPeers, buffer, sizeof(buffer));
     TEST_ASSERT_EQUAL_UINT32(DonglePublisher::kMaxPeersPayloadSize, written);
-    TEST_ASSERT_EQUAL_UINT32(334U, written);  // 14 + 20*16, spelled out
+    TEST_ASSERT_EQUAL_UINT32(418U, written);  // 18 + 25*16, spelled out
 
     // The declared ceiling is the real ceiling: a full list still fits in one
     // ESP-NOW-profile logical payload's worth of relay budget upstream.
@@ -333,7 +353,8 @@ void test_peers_beyond_capacity_is_clamped_not_overflowed() {
     DonglePublisher::PeerRecord peers[DonglePublisher::kMaxPeers + 4U];
     for (size_t i = 0U; i < DonglePublisher::kMaxPeers + 4U; ++i) {
         peers[i] = makePeer(static_cast<uint32_t>(0x9000U + i), 1U,
-                            static_cast<uint8_t>(i), 0U, true);
+                            static_cast<uint8_t>(i), 0U, true,
+                            static_cast<int8_t>(-1 - static_cast<int>(i)), 0U);
     }
     uint8_t buffer[DonglePublisher::kMaxPeersPayloadSize] = {0};
 
@@ -364,13 +385,13 @@ void test_channel_is_arrival_order_and_sourceid_is_the_address() {
 
     // Boot 1: A came up first.
     const DonglePublisher::PeerRecord bootOne[2] = {
-        makePeer(robotA, 1U, 0x11U, 10U, true),
-        makePeer(robotB, 1U, 0x22U, 20U, true),
+        makePeer(robotA, 1U, 0x11U, 10U, true, -50, 0U),
+        makePeer(robotB, 1U, 0x22U, 20U, true, -50, 0U),
     };
     // Boot 2: same fleet, B came up first. Nothing about the robots changed.
     const DonglePublisher::PeerRecord bootTwo[2] = {
-        makePeer(robotB, 2U, 0x22U, 15U, true),
-        makePeer(robotA, 2U, 0x11U, 25U, true),
+        makePeer(robotB, 2U, 0x22U, 15U, true, -50, 0U),
+        makePeer(robotA, 2U, 0x11U, 25U, true, -50, 0U),
     };
 
     uint8_t one[DonglePublisher::kMaxPeersPayloadSize] = {0};
@@ -490,7 +511,7 @@ bool captureEmit(uint16_t topicId, const uint8_t* payload, size_t size) {
 void fillSnapshot(DonglePublisher::Snapshot& out) {
     out.link = sampleLink();
     out.usb = sampleUsb();
-    out.peers[0] = makePeer(0xA1A1A1A1U, 1U, 0x11U, 5U, true);
+    out.peers[0] = makePeer(0xA1A1A1A1U, 1U, 0x11U, 5U, true, -50, 0U);
     out.peerCount = 1U;
 }
 }  // namespace

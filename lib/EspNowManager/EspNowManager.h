@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <esp_now.h>
+#include <esp_wifi.h>
 #include <RadioTxScheduler.h>
 
 /**
@@ -37,10 +38,17 @@ public:
         uint8_t mac[6];
         char name[DEVICE_NAME_SIZE];
         char description[DEVICE_DESCRIPTION_SIZE];
+        // Last RSSI (dBm) seen from this peer via the promiscuous-mode
+        // sniffer (see handlePromiscuousRxStatic) -- -128 means "never
+        // observed". Not part of the persisted peer record (DatabaseStore
+        // only copies mac/name/description out of this struct).
+        int8_t lastRssi = -128;
     };
 
-    /** Callback for incoming raw datagrams (bytes + size, as received from the radio). */
-    using ReceiveCallback = void (*)(const uint8_t* mac, const uint8_t* data, size_t len);
+    /** Callback for incoming raw datagrams (bytes + size, as received from the radio, plus
+     * the last known RSSI in dBm for that peer -- see handlePromiscuousRxStatic). */
+    using ReceiveCallback = void (*)(const uint8_t* mac, const uint8_t* data, size_t len,
+                                     int8_t rssi);
     /** Callback for delivery result notifications. */
     using SendCallback = void (*)(const uint8_t* mac, esp_now_send_status_t status);
 
@@ -224,6 +232,19 @@ private:
 
     /** Static adapter for ESP-NOW send callback. */
     static void handleSendStatic(const uint8_t* mac, esp_now_send_status_t status);
+
+    /**
+     * @brief Wi-Fi promiscuous-mode RX sniffer, running alongside ESP-NOW.
+     *
+     * This Arduino-ESP32 core's esp_now_recv_cb_t predates
+     * esp_now_recv_info_t, so ESP-NOW's own receive callback carries no
+     * RSSI. ESP-NOW rides on ordinary 802.11 Action frames though, so a
+     * promiscuous sniffer on the same fixed channel sees the identical
+     * over-the-air frame and does get rx_ctrl.rssi. This just records the
+     * RSSI against the sending peer's MAC (deviceInfo::lastRssi);
+     * handleReceiveStatic reads it back for that same frame.
+     */
+    static void handlePromiscuousRxStatic(void* buf, wifi_promiscuous_pkt_type_t type);
 
     /** Adds one peer to ESP-NOW runtime table. */
     bool addPeerToEspNow(const uint8_t mac[6]) const;
