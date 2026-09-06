@@ -84,6 +84,7 @@ bool LcdDashboard::begin(DonglePeripherals& peripherals) {
     tft_->fillScreen(kRawWhite);
     tft_->drawFastHLine(0, kBarHeight, screenW_, kRawGridLine);
     tft_->drawFastHLine(0, static_cast<int16_t>(stateRect_.y + stateRect_.h), screenW_, kRawGridLine);
+    drawDefaultState();
     drawActivityChrome();
     drawPageIndicator();
 
@@ -103,6 +104,7 @@ void LcdDashboard::clear() {
     tft_->fillScreen(kRawWhite);
     tft_->drawFastHLine(0, kBarHeight, screenW_, kRawGridLine);
     tft_->drawFastHLine(0, static_cast<int16_t>(stateRect_.y + stateRect_.h), screenW_, kRawGridLine);
+    drawDefaultState();
     if (currentPage_ == Page::kActivity) {
         drawActivityChrome();
     }
@@ -244,6 +246,13 @@ void LcdDashboard::drawPageIndicator() {
 
     drawTextLine(static_cast<int16_t>(pageIndicatorRect_.x + 2),
                  static_cast<int16_t>(pageIndicatorRect_.y + (pageIndicatorRect_.h - 8) / 2), buf, kRawBlack);
+}
+
+void LcdDashboard::drawDefaultState() {
+    tft_->fillRect(stateRect_.x, stateRect_.y, stateRect_.w, stateRect_.h, kRawWhite);
+    drawTextLine(static_cast<int16_t>(stateRect_.x + 2),
+                 static_cast<int16_t>(stateRect_.y + (stateRect_.h - 8) / 2),
+                 "estado: --", toPanelColor(kNeutralGray565));
 }
 
 void LcdDashboard::drawActivityChrome() {

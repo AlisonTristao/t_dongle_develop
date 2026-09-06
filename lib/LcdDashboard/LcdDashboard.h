@@ -223,6 +223,10 @@ private:
     void switchToPage(Page page);
     void drawPageIndicator();
     void drawActivityChrome();
+    // Placeholder for the STATE strip until the first notifyRobotState()
+    // call -- otherwise that row is just blank until a robot says something,
+    // which reads as broken chrome rather than "nothing heard yet".
+    void drawDefaultState();
 
     void refreshMessageExpiry(uint32_t now);
     void refreshRxTile(uint32_t now);
