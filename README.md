@@ -607,8 +607,11 @@ runtime -- só usado para forçar bootloader no flash):
 4. **Peers**: lista curta (até `MAX_DISPLAYED_PEERS`) dos peers conhecidos, id curto +
    online/offline + idade do último contato, via `BtpTransport::enumeratePeers`
 
-**STATE** (persistente, todas as páginas): último `state changed: OLD -> NEW` visto em
-uma mensagem RX (extraído por `tryExtractRobotState` em `EspNowConfig.cpp`).
+**STATE** (persistente, todas as páginas): último estado do robô, decodificado do tópico
+de telemetria `robot.state` (topic_id `0x0002`, ver `handleRobotStateTelemetry` em
+`EspNowConfig.cpp`) -- não mais da linha de log "state changed: OLD -> NEW", que é
+`logType::INFO` e fica sujeita a fome de fila no `TxScheduler` do robô (fila `Debug`,
+a de menor prioridade) atrás de tráfego de telemetria.
 
 ## 9. Serial e UX
 

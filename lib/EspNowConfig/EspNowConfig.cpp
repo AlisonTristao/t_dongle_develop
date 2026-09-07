@@ -9,6 +9,8 @@
 #include "RadioSeal.h"
 #include "bally_channels.h"
 
+#include <btp/telemetry.hpp>
+
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -242,33 +244,68 @@ void primeManifestIfNeeded(const uint8_t mac[6], const btp::Header& header) {
     ManifestCache::notePrimeSent();  // plano 36 fase 0a
 }
 
-// "state changed: SETUP -> WAIT" style lines emitted by the robot's Logger.
-// Checked only on LOG payloads (never TELEMETRY, which stays opaque bytes).
-bool tryExtractRobotState(const char* text, String& outState) {
-    if (text == nullptr || text[0] == '\0') {
-        return false;
+// robot.state (bally_OS TelemetryPublisher, topic_id=0x0002, schema v1):
+// schema_version:u16_le + one PACKED_LE uint8 field holding the robot's
+// StateMachine::stateName value. Replaced the old "state changed: OLD ->
+// NEW" LOG-text scraping (topico 41): that line is logType::INFO, which
+// TxScheduler::classify() puts in the lowest-priority Debug queue on the
+// robot, behind Telemetry -- it was starving out under normal traffic. This
+// topic has its own Telemetry-priority queue and is published ungated on
+// every real transition, so it actually arrives.
+//
+// robotStateName mirrors bally_OS's StateMachine::stateToString -- no shared
+// header between the two repos for this one enum, so keep the two switches
+// in sync by hand if StateMachine::stateName grows a member.
+constexpr uint16_t kRobotStateTopicId = 0x0002U;
+constexpr uint16_t kRobotStateSchemaVersion = 1U;
+constexpr btp::FieldSpec kRobotStateFields[] = {
+    {1U, 0U, static_cast<uint8_t>(btp::WireType::Uint8), 0U, 1U, 1U, 1.0, 0.0},
+};
+
+const char* robotStateName(uint8_t value) {
+    switch (value) {
+        case 0: return "NONE";
+        case 1: return "SETUP";
+        case 2: return "WAIT";
+        case 3: return "CALIBRATE";
+        case 4: return "DEBUG";
+        case 5: return "RUN";
+        case 6: return "FINISH";
+        case 7: return "TELEMETRY";
+        case 8: return "ERROR";
+        default: return "UNKNOWN";
+    }
+}
+
+// Decodes one robot.state sample and forwards its label to the LCD's STATE
+// strip. Any structural mismatch (wrong schema version, short payload, a
+// field that fails to decode) is silently ignored -- a bad sample here must
+// never crash or block the raw relay that always runs alongside this.
+void handleRobotStateTelemetry(const ProtocolRouter::RoutedMessage& routed) {
+    if (g_lcdDashboard == nullptr) {
+        return;
     }
 
-    const String line(text);
-    String lower = line;
-    lower.toLowerCase();
-    if (lower.indexOf("state changed") < 0) {
-        return false;
+    btp::SampleReader reader(routed.payload, routed.payloadSize, kRobotStateFields, 1U,
+                              btp::kEncodingPackedLe);
+    if (reader.schema_version() != kRobotStateSchemaVersion) {
+        return;
     }
 
-    const int32_t arrowPos = line.lastIndexOf("->");
-    if (arrowPos < 0) {
-        return false;
+    uint8_t stateValue = 0;
+    bool haveState = false;
+    btp::SampleValue value{};
+    while (reader.next(&value) == btp::SampleStep::Item) {
+        if (!value.is_null) {
+            stateValue = static_cast<uint8_t>(value.u64(0));
+            haveState = true;
+        }
+    }
+    if (reader.finish() != btp::MessageError::Ok || !haveState) {
+        return;
     }
 
-    String state = line.substring(arrowPos + 2);
-    state.trim();
-    if (state.length() == 0) {
-        return false;
-    }
-
-    outState = state;
-    return true;
+    g_lcdDashboard->notifyRobotState(robotStateName(stateValue));
 }
 
 void macToText(const uint8_t mac[6], char out[18]) {
@@ -730,13 +767,6 @@ void handleLogItem(const ProtocolRouter::RoutedMessage& routed) {
     char text[ProtocolRouter::kMaxPayloadSize + 1] = {0};
     copyPayloadAsText(routed, text, sizeof(text));
 
-    if (g_lcdDashboard != nullptr) {
-        String robotState;
-        if (tryExtractRobotState(text, robotState)) {
-            g_lcdDashboard->notifyRobotState(robotState);
-        }
-    }
-
     // Plain human console: unchanged behavior, print as before. Protocolled
     // session (topico 13): relay the original LOG frame verbatim to the
     // desktop instead -- printing here would leak raw console text onto a
@@ -759,6 +789,10 @@ void handleLogItem(const ProtocolRouter::RoutedMessage& routed) {
 // is a no-op (counted, not queued) -- same net effect as topico 12's
 // drain-and-discard placeholder.
 void handleTelemetryItem(const ProtocolRouter::RoutedMessage& routed) {
+    if (routed.header.object_id == kRobotStateTopicId) {
+        handleRobotStateTelemetry(routed);
+    }
+
     SerialMux::forwardRelay(routed.header, routed.payload, routed.payloadSize);
 }
 
